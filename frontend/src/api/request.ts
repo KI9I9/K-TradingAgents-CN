@@ -360,7 +360,10 @@ const createAxiosInstance = (): AxiosInstance => {
           case 502:
           case 503:
           case 504:
-            showErrorMessage('服务暂时不可用，请稍后重试')
+            // 可选功能探测由调用方处理，避免将局部不可用提示为全局故障。
+            if (!config?.skipErrorHandler) {
+              showErrorMessage('服务暂时不可用，请稍后重试')
+            }
             break
 
           default:

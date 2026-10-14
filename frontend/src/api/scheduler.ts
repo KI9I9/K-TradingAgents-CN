@@ -48,7 +48,7 @@ export interface JobProgress {
   job_id: string
   execution_id?: string  // 🔥 执行记录ID，用于终止操作
   progress: number
-  status: 'running' | 'cancelling' | 'suspended' | 'success' | 'failed' | 'cancelled' | 'unknown'
+  status: 'running' | 'cancelling' | 'suspended' | 'success' | 'failed' | 'cancelled' | 'skipped' | 'partial' | 'unknown'
   message?: string
   current_item?: string
   total_items?: number

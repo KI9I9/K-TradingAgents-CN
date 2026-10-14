@@ -170,6 +170,14 @@
                     </template>
                   </el-alert>
                 </div>
+                <el-alert
+                  v-if="displayTaskProgress[task.id]?.status === 'skipped'"
+                  title="本次同步已跳过"
+                  :description="displayTaskProgress[task.id]?.message"
+                  type="info"
+                  :closable="false"
+                  show-icon
+                />
                 <!-- 任务进度显示 -->
                 <div v-if="displayTaskProgress[task.id]" class="task-progress">
                   <el-progress
@@ -358,6 +366,14 @@
                     </template>
                   </el-alert>
                 </div>
+                <el-alert
+                  v-if="displayTaskProgress[task.id]?.status === 'skipped'"
+                  title="本次同步已跳过"
+                  :description="displayTaskProgress[task.id]?.message"
+                  type="info"
+                  :closable="false"
+                  show-icon
+                />
                 <!-- 任务进度显示 -->
                 <div v-if="displayTaskProgress[task.id]" class="task-progress">
                   <el-progress
@@ -546,6 +562,14 @@
                     </template>
                   </el-alert>
                 </div>
+                <el-alert
+                  v-if="displayTaskProgress[task.id]?.status === 'skipped'"
+                  title="本次同步已跳过"
+                  :description="displayTaskProgress[task.id]?.message"
+                  type="info"
+                  :closable="false"
+                  show-icon
+                />
                 <!-- 任务进度显示 -->
                 <div v-if="displayTaskProgress[task.id]" class="task-progress">
                   <el-progress
@@ -647,7 +671,7 @@ const taskTriggering = ref<Record<string, boolean>>({})
 const progressPollingTimer = ref<NodeJS.Timeout | null>(null)
 
 const ACTIVE_PROGRESS_STATUSES = new Set<JobProgress['status']>(['running', 'cancelling', 'suspended'])
-const TERMINAL_PROGRESS_STATUSES = new Set<JobProgress['status']>(['success', 'failed', 'cancelled', 'unknown'])
+const TERMINAL_PROGRESS_STATUSES = new Set<JobProgress['status']>(['success', 'failed', 'cancelled', 'skipped', 'partial', 'unknown'])
 
 // 京东云版只显示 Tushare / AKShare 数据源任务
 const JDYUN_ALLOWED_SOURCES = new Set(['tushare', 'akshare', 'multi_source'])
@@ -1423,8 +1447,8 @@ const startProgressPolling = () => {
   progressPollingTimer.value = setInterval(async () => {
     let hasRunningTask = false
     
-    // 只轮询已启用的相关任务
-    const relevantTasks = allTasks.value.filter(isRelevantTask).filter(t => !t.paused)
+    // 暂停定时调度不影响手动执行，仍需刷新其进度。
+    const relevantTasks = allTasks.value.filter(isRelevantTask)
     
     for (const task of relevantTasks) {
       await loadTaskProgress(task.id)

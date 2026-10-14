@@ -104,6 +104,7 @@ class SchedulerService:
         """
         self.scheduler = scheduler
         self.db = None
+        self._manual_tasks = set()
 
         # 添加事件监听器，监控任务执行
         self._setup_event_listeners()
@@ -257,7 +258,8 @@ class SchedulerService:
             是否成功
         """
         try:
-            self.scheduler.pause_job(job_id)
+            from app.services.scheduler_runtime import save_enabled
+            await save_enabled(self.scheduler, self._get_db(), job_id, False)
             logger.info(f"⏸️ 任务 {job_id} 已暂停")
             
             # 记录操作历史
@@ -279,7 +281,8 @@ class SchedulerService:
             是否成功
         """
         try:
-            self.scheduler.resume_job(job_id)
+            from app.services.scheduler_runtime import save_enabled
+            await save_enabled(self.scheduler, self._get_db(), job_id, True)
             logger.info(f"▶️ 任务 {job_id} 已恢复")
 
             # 记录操作历史
@@ -345,7 +348,7 @@ class SchedulerService:
         """
         手动触发任务执行
 
-        注意：如果任务处于暂停状态，会先临时恢复任务，执行一次后不会自动暂停
+        手动执行不改变任务的定时启用状态。
 
         Args:
             job_id: 任务ID
@@ -373,12 +376,8 @@ class SchedulerService:
 
             # 检查任务是否被暂停（next_run_time 为 None 表示暂停）
             was_paused = job.next_run_time is None
-            if was_paused:
-                logger.warning(f"⚠️ 任务 {job_id} 处于暂停状态，临时恢复以执行一次")
-                self.scheduler.resume_job(job_id)
-                # 重新获取 job 对象（恢复后状态已改变）
-                job = self.scheduler.get_job(job_id)
-                logger.info(f"✅ 任务 {job_id} 已临时恢复")
+            # 手动执行与定时开关独立，保持原来的暂停状态。
+            current_execution_id = None
 
             # 如果提供了 kwargs，合并到任务的 kwargs 中
             # 🔥 初始化 merged_kwargs，避免在 kwargs 为空时未定义
@@ -622,8 +621,11 @@ class SchedulerService:
                                 logger.info(f"🗑️ [手动触发] 已清除旧的Redis进度缓存: {progress_key}（新任务从头开始）")
                         except Exception as redis_error:
                             logger.warning(f"⚠️ [手动触发] 清除Redis缓存失败（不影响任务执行）: {redis_error}")
-            except Exception as record_error:
-                logger.warning(f"⚠️ 保存执行记录kwargs失败（不影响任务执行）: {record_error}")
+            except HTTPException:
+                raise
+            except Exception:
+                # 没有可靠执行记录时不启动任务，避免产生不可追踪的后台执行。
+                raise
             
             # 🔥 立即执行任务（不等待APScheduler调度）
             # 这样可以确保任务立即执行，而不是等待下一个调度周期
@@ -673,18 +675,27 @@ class SchedulerService:
                 logger.info(f"⚡ 立即执行任务 {job_id} (协程函数, kwargs={filtered_kwargs})")
                 
                 # 检查任务函数是否是协程
-                if inspect.iscoroutinefunction(func):
-                    # 协程函数，立即执行（在后台）
-                    asyncio.create_task(func(**filtered_kwargs))
-                    logger.info(f"✅ 任务 {job_id} 已立即执行（协程函数，后台执行中）")
-                else:
-                    # 同步函数，使用线程池执行
-                    import concurrent.futures
-                    logger.info(f"⚡ 立即执行任务 {job_id} (同步函数, kwargs={filtered_kwargs})")
-                    # 使用线程池执行同步函数
-                    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    executor.submit(func, **filtered_kwargs)
-                    logger.info(f"✅ 任务 {job_id} 已提交到线程池执行")
+                from app.services.scheduler_runtime import run_manual, finalize_execution
+
+                async def finish_manual(**result):
+                    await finalize_execution(self._get_db(), job_id, current_execution_id, **result)
+                    # 删除本次进度缓存，后续查询直接读取已收尾的数据库记录。
+                    try:
+                        import json
+                        from app.core.database import get_redis_sync_client
+                        from app.core.redis_client import RedisKeys
+                        redis_sync = get_redis_sync_client()
+                        if redis_sync:
+                            key = RedisKeys.SCHEDULER_JOB_PROGRESS.format(job_id=job_id)
+                            cached = redis_sync.get(key)
+                            if not cached or json.loads(cached).get('execution_id') in (None, current_execution_id):
+                                redis_sync.delete(key)
+                    except Exception as exc:
+                        logger.warning(f"任务收尾后清理进度缓存失败: {exc}")
+
+                task = asyncio.create_task(run_manual(func, filtered_kwargs, finish_manual))
+                self._manual_tasks.add(task)
+                task.add_done_callback(self._manual_tasks.discard)
                 
                 # 🔥 立即执行成功，不需要再调用 job.modify(next_run_time=now)
                 # 因为这会触发 APScheduler 再次调度任务，导致重复执行
@@ -714,6 +725,8 @@ class SchedulerService:
             logger.info(f"📝 任务 {job_id} 已触发，执行记录将在任务开始时由 update_job_progress 创建或更新")
 
             return True
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"❌ 触发任务 {job_id} 失败: {e}")
             import traceback

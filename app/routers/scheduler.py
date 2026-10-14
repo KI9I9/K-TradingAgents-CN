@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
 
 
-SCHEDULER_STOPPING_STATUSES = {"cancelling", "cancelled", "failed", "success", "suspended"}
+SCHEDULER_STOPPING_STATUSES = {"cancelling", "cancelled", "failed", "success", "suspended", "skipped", "partial"}
 
 
 def _serialize_scheduler_time(value: Any) -> Optional[str]:

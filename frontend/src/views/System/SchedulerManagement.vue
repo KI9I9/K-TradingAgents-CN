@@ -1275,6 +1275,7 @@ const showExecutionDetail = (execution: JobExecution) => {
 const formatExecutionStatus = (status: string) => {
   const statusMap: Record<string, string> = {
     running: '执行中',
+    skipped: '已跳过',
     success: '成功',
     failed: '失败',
     partial: '部分成功',  // 🔥 新增：部分成功状态

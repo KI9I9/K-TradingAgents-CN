@@ -979,7 +979,12 @@ async def lifespan(app: FastAPI):
         )
         logger.info("🔄 Skill 审核过期清理已配置（每 30 分钟）")
 
-        scheduler.start()
+        # 先暂停派发，恢复用户的持久化开关后再开始调度。
+        scheduler.start(paused=True)
+        from app.services.scheduler_runtime import restore_preferences
+        from app.core.database import get_mongo_db
+        await restore_preferences(scheduler, get_mongo_db())
+        scheduler.resume()
 
         # 设置调度器实例到服务中，以便API可以管理任务
         set_scheduler_instance(scheduler)

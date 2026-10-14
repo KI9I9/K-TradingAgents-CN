@@ -439,8 +439,7 @@ class BaoStockSyncService:
                         f"数据源可能还没有当天的数据。建议在 18:00 之后执行增量同步。"
                     )
                     logger.info(skip_message)
-                    stats.errors.append(skip_message)
-                    return stats
+                    return {"success": True, "skipped": True, "message": skip_message}
 
             # 从数据库获取股票列表
             collection = self.db.stock_basic_info
@@ -1336,6 +1335,8 @@ async def run_baostock_historical_sync(**kwargs):
         
         if sync_result.success:
             stats = sync_result.result
+            if isinstance(stats, dict):
+                return stats
             logger.info(f"🎯 BaoStock历史数据同步完成: {stats.historical_records}条记录, {len(stats.errors)}个错误")
             return stats
         else:

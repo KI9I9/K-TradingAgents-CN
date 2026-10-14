@@ -1,0 +1,26 @@
+FROM python:3.11-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 UV_HTTP_TIMEOUT=120 \
+    TZ=Asia/Shanghai HOME=/app/runtime
+WORKDIR /app
+
+# 字体与 Pango 支持项目中的文档模块；编译工具供缺少预编译包的依赖使用。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git curl ca-certificates libffi-dev libpango-1.0-0 \
+    libpangoft2-1.0-0 fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv==0.8.22
+
+COPY pyproject.toml README.md ./
+COPY tradingagents ./tradingagents
+RUN uv pip install --system --no-cache .
+
+COPY --chown=1000:1000 . .
+RUN useradd --uid 1000 --home-dir /app/runtime --no-create-home appuser \
+    && mkdir -p data logs runtime results reports uploads config \
+    && chown -R 1000:1000 /app
+USER appuser
+
+# 后端已内置线程池 Worker 与调度器，保持单个进程以免重复执行调度任务。
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
