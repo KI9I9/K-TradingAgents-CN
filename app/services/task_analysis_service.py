@@ -2200,6 +2200,9 @@ class TaskAnalysisService:
             "us": "us"
         }
         market_type = market_type_map.get(market_type, "cn")
+        # 交易市场仍为 cn，但 ETF 任务的数据校验必须读取基金集合。
+        if task.task_type == AnalysisTaskType.ETF_ANALYSIS:
+            market_type = "etf"
         
         # 如果没有指定分析日期，使用当前日期
         if not analysis_date:

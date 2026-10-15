@@ -468,15 +468,20 @@ async def precheck_analysis(
 
         # ── 2. 检查基础数据同步 ──
         db = get_mongo_db()
-        basics_count = await db["stock_basic_info"].count_documents({})
+        # 与提交分析时使用同一证券类型识别，兼容仅传 symbol 的客户端。
+        is_etf = bool(symbol and StockUtils.identify_security_type(symbol.strip()) == SecurityType.FUND)
+        basics_collection = "etf_basic_info" if is_etf else "stock_basic_info"
+        security_label = "ETF" if is_etf else "股票"
+        basics_count = await db[basics_collection].count_documents({})
         if basics_count == 0:
             return {
                 "can_submit": False,
                 "reason": "no_basics",
-                "message": "股票基础数据尚未同步，请先执行数据同步",
+                "message": f"{security_label}基础数据尚未同步，请先执行数据同步",
                 "redirect": "/settings/sync",
                 "details": {
                     "enabled_real_sources": enabled_real_sources,
+                    "basics_collection": basics_collection,
                     "basics_count": 0,
                 },
             }
@@ -487,17 +492,18 @@ async def precheck_analysis(
             sym = symbol.strip()
             # 同时匹配 code 和 symbol 字段
             query = {"$or": [{"code": sym}, {"symbol": sym}]}
-            doc = await db["stock_basic_info"].find_one(query)
+            doc = await db[basics_collection].find_one(query)
             target_exists = doc is not None
 
         if symbol and not target_exists:
             return {
                 "can_submit": False,
                 "reason": "stock_not_found",
-                "message": f"股票 {symbol} 的基础数据未同步，请先同步该股票数据",
+                "message": f"{security_label} {symbol} 的基础数据未同步，请先同步该{security_label}数据",
                 "redirect": "/settings/sync",
                 "details": {
                     "enabled_real_sources": enabled_real_sources,
+                    "basics_collection": basics_collection,
                     "basics_count": basics_count,
                     "symbol": symbol,
                 },
@@ -510,6 +516,7 @@ async def precheck_analysis(
             "message": "数据就绪，可以开始分析",
             "details": {
                 "enabled_real_sources": enabled_real_sources,
+                "basics_collection": basics_collection,
                 "basics_count": basics_count,
                 "symbol": symbol,
                 "target_exists": target_exists,
