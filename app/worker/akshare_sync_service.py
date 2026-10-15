@@ -1131,6 +1131,10 @@ class AKShareSyncService:
                 
                 # 🔥 更新已处理数量（批次处理函数会返回实际处理的股票数量）
                 processed_count = batch_stats.get("processed_count", processed_count + len(batch))
+                if batch_stats.get("stopped"):
+                    stats["stopped"] = True
+                    was_cancelled = True
+                    break
 
                 # 进度日志
                 progress_percent = int((processed_count / original_total_symbols) * 100) if original_total_symbols > 0 else 0
@@ -1147,6 +1151,7 @@ class AKShareSyncService:
 
             # 🔥 如果任务被取消，更新状态为取消
             if was_cancelled:
+                stats["cancelled"] = True
                 logger.warning(f"🛑 任务 {job_id} 已被取消，更新状态...")
                 try:
                     from app.services.scheduler_service import update_job_progress
@@ -1279,6 +1284,7 @@ class AKShareSyncService:
                 logger.warning(f"🛑 历史数据同步任务已被取消: {e}")
                 was_cancelled = True
                 stats["stopped"] = True
+                stats["cancelled"] = True
                 
                 # 更新状态为取消
                 if job_id:
@@ -1510,7 +1516,10 @@ class AKShareSyncService:
                         processed_items=processed_count
                     )
                 except Exception as progress_error:
-                    # 🔥 进度更新失败不应该影响任务执行
+                    from app.services.scheduler_service import TaskCancelledException
+                    if isinstance(progress_error, TaskCancelledException):
+                        raise
+                    # 普通进度更新失败不影响同步，但取消请求必须交给外层收尾。
                     logger.debug(f"⚠️ 更新进度失败（继续执行）: {progress_error}")
 
         return batch_stats
@@ -2080,10 +2089,15 @@ class AKShareSyncService:
             try:
                 # 🔥 查询执行记录，检查 cancel_requested 标记和任务状态
                 # 不仅检查 running 状态，也检查 failed/cancelled/suspended 状态
+                # 优先检查活动执行，避免较新的跳过记录遮蔽旧任务的取消请求。
                 execution = sync_db.scheduler_executions.find_one(
-                    {"job_id": job_id},
+                    {"job_id": job_id, "status": {"$in": ["running", "cancelling"]}},
                     sort=[("timestamp", -1)]
                 )
+                if execution is None:
+                    execution = sync_db.scheduler_executions.find_one(
+                        {"job_id": job_id}, sort=[("timestamp", -1)]
+                    )
 
                 if not execution:
                     return False
