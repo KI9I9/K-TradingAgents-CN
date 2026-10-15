@@ -126,7 +126,14 @@ def _fetch_etf_spot_list_akshare() -> List[Dict[str, Any]]:
     """从 AKShare 获取 ETF 实时行情列表（阻塞调用）"""
     try:
         import akshare as ak
-        df = ak.fund_etf_spot_em()
+        # 东方财富不可用时，通过 AKShare 的新浪 ETF 列表补齐真实基础信息。
+        try:
+            df = ak.fund_etf_spot_em()
+        except Exception as exc:
+            logger.warning(f"东方财富 ETF 列表不可用，尝试新浪: {exc}")
+            df = None
+        if df is None or df.empty:
+            df = ak.fund_etf_category_sina(symbol="ETF基金")
         if df is None or df.empty:
             return []
 
@@ -157,7 +164,7 @@ def _fetch_etf_spot_list_akshare() -> List[Dict[str, Any]]:
             })
         return rows
     except Exception as e:
-        logger.warning(f"AKShare fund_etf_spot_em 获取失败: {e}")
+        logger.warning(f"AKShare ETF 基础列表获取失败: {e}")
         return []
 
 
@@ -885,6 +892,8 @@ class EtfSyncService:
                 valuation_map = await loop.run_in_executor(None, partial(_fetch_etf_nav_map_tushare, target_codes, 15))
                 share_map = await loop.run_in_executor(None, partial(_fetch_etf_share_map_tushare, target_codes, 30))
             if not rows:
+                stats["error_count"] = 1
+                stats["errors"].append({"error": f"{source} 未获取到所请求 ETF 的基础信息，请检查数据源连接或切换数据源"})
                 await self._report_job_progress(
                     job_id,
                     stage_start,

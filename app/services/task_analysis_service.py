@@ -2193,6 +2193,8 @@ class TaskAnalysisService:
             "A股": "cn",
             "港股": "hk",
             "美股": "us",
+            "ETF": "etf",
+            "etf": "etf",
             "cn": "cn",
             "hk": "hk",
             "us": "us"

@@ -69,6 +69,7 @@ class DataValidationService:
         Returns:
             DataValidationResult: 校验结果
         """
+        market_type = str(market_type).strip().lower()
         db = self._get_db()
         symbol6 = str(symbol).zfill(6)
         missing_data = []
@@ -128,7 +129,8 @@ class DataValidationService:
                     missing_data.append("基础信息")
                     return DataValidationResult(
                         is_valid=False,
-                        message=f"股票 {symbol6} 的基础信息不存在，请先同步股票基础数据",
+                        message=(f"ETF {symbol6} 的基础信息不存在，请先同步 ETF 基础数据"
+                                 if market_type == "etf" else f"股票 {symbol6} 的基础信息不存在，请先同步股票基础数据"),
                         missing_data=missing_data,
                         details=details
                     )
@@ -171,7 +173,9 @@ class DataValidationService:
                     )
             
             # 3. 检查财务数据（可选）
-            if check_financial_data:
+            if market_type == "etf":
+                details["financial_data"] = {"skipped": True, "reason": "ETF 不适用上市公司财务报表检查"}
+            elif check_financial_data:
                 financial_valid, financial_msg, financial_details = await self._check_financial_data(
                     db, symbol6, market_type, analysis_date_str
                 )
@@ -224,6 +228,7 @@ class DataValidationService:
         try:
             # 根据市场类型选择集合
             collection_map = {
+                "etf": "etf_basic_info",
                 "cn": "stock_basic_info",
                 "hk": "stock_basic_info_hk",
                 "us": "stock_basic_info_us"
@@ -268,6 +273,7 @@ class DataValidationService:
         try:
             # 根据市场类型选择日行情集合（优先级依次降低）
             collection_candidates = {
+                "etf": ["etf_daily_quotes"],
                 "cn": ["stock_daily_quotes", "stock_daily_history", "market_quotes"],
                 "hk": ["stock_daily_quotes_hk", "stock_daily_history_hk", "market_quotes_hk"],
                 "us": ["stock_daily_quotes_us", "stock_daily_history_us", "market_quotes_us"],
@@ -400,6 +406,7 @@ class DataValidationService:
         try:
             # 根据市场类型选择集合
             collection_map = {
+                "etf": "etf_daily_quotes",
                 "cn": "stock_daily_quotes",  # 统一历史数据集合
                 "hk": "stock_daily_quotes_hk",
                 "us": "stock_daily_quotes_us"
@@ -414,6 +421,10 @@ class DataValidationService:
                 "stock_daily_quotes"  # 通用集合
             ]
             
+            # ETF 只读取自身日线，避免误用同代码的股票数据。
+            if market_type == "etf":
+                collections_to_try = ["etf_daily_quotes"]
+
             data_found = False
             data_count = 0
             earliest_date = None

@@ -1078,7 +1078,7 @@ async def get_sync_status(
 async def validate_stock_data(
     symbol: str = Query(..., description="股票代码（6位）"),
     analysis_date: Optional[str] = Query(None, description="分析日期（YYYY-MM-DD），默认为今天"),
-    market_type: str = Query("cn", description="市场类型：cn/hk/us"),
+    market_type: str = Query("cn", description="市场类型：cn/hk/us/etf"),
     check_basic_info: bool = Query(True, description="是否检查基础信息"),
     check_historical_data: bool = Query(True, description="是否检查历史数据"),
     check_financial_data: bool = Query(False, description="是否检查财务数据"),

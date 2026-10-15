@@ -1275,7 +1275,7 @@ const handleValidateData = async () => {
   // 确定市场类型（用于API调用）
   const marketTypeMap: Record<string, string> = {
     'A股': 'cn',
-    'ETF': 'cn'  // ETF 为 A 股场内基金
+    'ETF': 'etf'  // ETF 使用独立的数据集合进行校验
   }
   const marketType = marketTypeMap[analysisForm.market] || 'cn'
 
@@ -1294,7 +1294,7 @@ const handleValidateData = async () => {
       {
         check_basic_info: true,
         check_historical_data: true,
-        check_financial_data: true,
+        check_financial_data: analysisForm.market !== 'ETF',
         check_realtime_quotes: true
       }
     )
