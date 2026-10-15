@@ -948,6 +948,8 @@ class AKShareSyncService:
             "total_processed": 0,
             "success_count": 0,
             "error_count": 0,
+            "skipped_count": 0,
+            "no_data_count": 0,
             "total_records": 0,
             "start_time": datetime.utcnow(),
             "end_time": None,
@@ -1126,6 +1128,8 @@ class AKShareSyncService:
                 # 更新统计
                 stats["success_count"] += batch_stats["success_count"]
                 stats["error_count"] += batch_stats["error_count"]
+                stats["skipped_count"] += batch_stats.get("skipped_count", 0)
+                stats["no_data_count"] += batch_stats.get("no_data_count", 0)
                 stats["total_records"] += batch_stats["total_records"]
                 stats["errors"].extend(batch_stats["errors"])
                 
@@ -1406,6 +1410,8 @@ class AKShareSyncService:
         batch_stats = {
             "success_count": 0,
             "error_count": 0,
+            "skipped_count": 0,
+            "no_data_count": 0,
             "total_records": 0,
             "errors": [],
             "processed_count": processed_count  # 🔥 保存当前已处理数量
@@ -1434,8 +1440,13 @@ class AKShareSyncService:
                         # 全量同步：最近1年
                         symbol_start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
 
-                # 获取历史数据
-                hist_data = await self.provider.get_historical_data(symbol, symbol_start_date, end_date, period)
+                # 数据已覆盖目标日期时不再请求；仍执行下方进度与取消检查。
+                up_to_date = datetime.strptime(symbol_start_date, '%Y-%m-%d') > datetime.strptime(end_date, '%Y-%m-%d')
+                hist_data = None
+                if up_to_date:
+                    batch_stats["skipped_count"] += 1
+                else:
+                    hist_data = await self.provider.get_historical_data(symbol, symbol_start_date, end_date, period)
 
                 if hist_data is not None and not hist_data.empty:
                     # 保存到统一历史数据集合
@@ -1458,13 +1469,9 @@ class AKShareSyncService:
                     batch_stats["success_count"] += 1
                     batch_stats["total_records"] += saved_count
                     logger.debug(f"✅ {symbol}历史数据同步成功: {saved_count}条记录")
-                else:
-                    batch_stats["error_count"] += 1
-                    batch_stats["errors"].append({
-                        "code": symbol,
-                        "error": "历史数据为空",
-                        "context": "_process_historical_batch"
-                    })
+                elif not up_to_date:
+                    # 接口正常返回空数据与网络失败分别统计，不推断一定已补齐。
+                    batch_stats["no_data_count"] += 1
 
             except Exception as e:
                 batch_stats["error_count"] += 1
@@ -1484,6 +1491,10 @@ class AKShareSyncService:
                     
                     # 🔥 构建进度消息
                     progress_message = f"正在同步历史数据 ({processed_count}/{original_total_symbols})"
+                    progress_message += (
+                        f" | 本批次：无需更新 {batch_stats['skipped_count']}，"
+                        f"接口无数据 {batch_stats['no_data_count']}"
+                    )
                     
                     # 🔥 如果有错误，在消息中包含错误信息
                     if batch_stats.get("error_count", 0) > 0:

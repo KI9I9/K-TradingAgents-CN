@@ -4,6 +4,8 @@ AKShare统一数据提供器
 """
 import asyncio
 import logging
+import time
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Union
 import pandas as pd
@@ -35,6 +37,9 @@ class AKShareProvider(BaseStockDataProvider):
         self.connected = False
         self._stock_list_cache = None  # 缓存股票列表，避免重复获取
         self._cache_time = None  # 缓存时间
+        self._history_circuit_lock = threading.Lock()
+        self._history_failure_count = 0
+        self._history_retry_after = 0.0
         self._event_loop_closed = False  # 🔥 事件循环关闭标志（用于检测 Ctrl+C 退出）
         self._initialize_akshare()
     
@@ -1655,135 +1660,87 @@ class AKShareProvider(BaseStockDataProvider):
 
         return hist_df
 
+    @staticmethod
+    def _is_history_network_error(error):
+        """仅对连接、超时和 HTTP 服务错误回退，避免掩盖解析及编程错误。"""
+        from requests.exceptions import ConnectionError, Timeout, HTTPError
+        return isinstance(error, (ConnectionError, Timeout, HTTPError, AKShareNetworkError)) or any(
+            token in str(error).lower()
+            for token in ('connection aborted', 'remotedisconnected', 'connection closed', 'timed out')
+        )
+
+    async def _history_fallback(self, code, start_date, end_date, period):
+        """正常空结果与请求失败分别处理；备用源失败不能冒充无新增数据。"""
+        errors = []
+        for name, loader in [
+            ('新浪', self._get_historical_data_sina_fallback),
+            ('腾讯', self._get_historical_data_tx_fallback),
+        ]:
+            try:
+                frame = await loader(code, start_date, end_date, period)
+                if frame is not None and not frame.empty:
+                    logger.info(f"✅ {code} {name}历史接口回退成功: {len(frame)}条记录")
+                    return self._standardize_historical_columns(frame, code)
+            except Exception as error:
+                if not self._is_history_network_error(error):
+                    raise
+                errors.append(error)
+                logger.warning(f"⚠️ {code} {name}历史接口请求失败: {error}")
+        if errors:
+            raise AKShareNetworkError(f"{code} 备用历史接口网络连接失败，未取得数据") from errors[-1]
+        logger.info(f"ℹ️ {code} 备用历史接口正常返回，但指定区间无数据")
+        return pd.DataFrame()
+
     async def get_historical_data(
-        self,
-        code: str,
-        start_date: str,
-        end_date: str,
-        period: str = "daily"
+        self, code: str, start_date: str, end_date: str, period: str = "daily"
     ) -> Optional[pd.DataFrame]:
-        """
-        获取历史行情数据
-
-        Args:
-            code: 股票代码
-            start_date: 开始日期 (YYYY-MM-DD)
-            end_date: 结束日期 (YYYY-MM-DD)
-            period: 周期 (daily, weekly, monthly)
-
-        Returns:
-            历史行情数据DataFrame
-        """
+        """获取历史行情；连续两轮东财连接失败后，日线临时回退五分钟。"""
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        if start_dt > end_dt:
+            return pd.DataFrame()
         if not self.connected:
-            return None
+            raise AKShareNetworkError('AKShare 数据提供器尚未就绪')
+        if (end_dt - start_dt).days > 730:
+            return await self._get_historical_data_in_batches(code, start_date, end_date, period)
 
-        try:
-            logger.debug(f"📊 获取{code}历史数据: {start_date} 到 {end_date}")
+        # 使用单调时钟和线程锁，兼容主循环与线程池的调用。
+        with self._history_circuit_lock:
+            use_fallback = period == 'daily' and time.monotonic() < self._history_retry_after
+        if use_fallback:
+            return await self._history_fallback(code, start_date, end_date, period)
 
-            # 转换周期格式
-            period_map = {
-                "daily": "daily",
-                "weekly": "weekly",
-                "monthly": "monthly"
-            }
-            ak_period = period_map.get(period, "daily")
-
-            # 格式化日期
-            start_date_formatted = start_date.replace('-', '')
-            end_date_formatted = end_date.replace('-', '')
-
-            # 检查时间跨度，如果超过2年，分批获取
-            from datetime import datetime, timedelta
-            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-            days_diff = (end_dt - start_dt).days
-
-            # 如果时间跨度超过2年（730天），分批获取
-            if days_diff > 730:
-                logger.info(f"⚠️ {code} 时间跨度过大({days_diff}天)，分批获取数据...")
-                return await self._get_historical_data_in_batches(
-                    code, start_date, end_date, period
+        for attempt in range(3):
+            try:
+                frame = await asyncio.to_thread(
+                    self.ak.stock_zh_a_hist,
+                    symbol=code, period=period,
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''), adjust='qfq',
                 )
-
-            primary_error = None
-
-            # 获取历史数据（带重试）
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    def fetch_historical_data():
-                        return self.ak.stock_zh_a_hist(
-                            symbol=code,
-                            period=ak_period,
-                            start_date=start_date_formatted,
-                            end_date=end_date_formatted,
-                            adjust="qfq"  # 前复权
-                        )
-
-                    hist_df = await asyncio.to_thread(fetch_historical_data)
-
-                    if hist_df is None or hist_df.empty:
-                        logger.warning(f"⚠️ {code}历史数据为空")
-                        return None
-
-                    # 标准化列名
-                    hist_df = self._standardize_historical_columns(hist_df, code)
-
-                    logger.debug(f"✅ {code}历史数据获取成功: {len(hist_df)}条记录")
-                    return hist_df
-
-                except RuntimeError as runtime_error:
-                    # 🔥 检测事件循环关闭错误（Ctrl+C 退出时）
-                    if "shutdown" in str(runtime_error).lower() or "closed" in str(runtime_error).lower():
-                        logger.warning(f"⚠️ [AKShare API调用] 事件循环已关闭，停止获取数据: {code}")
-                        self._event_loop_closed = True
-                        return None
-                    # 其他 RuntimeError，继续重试
-                    primary_error = runtime_error
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2
-                        logger.warning(f"⚠️ {code} 第{attempt + 1}次尝试失败（RuntimeError），{wait_time}秒后重试: {runtime_error}")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        raise
-                except Exception as retry_error:
-                    primary_error = retry_error
-                    if attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2  # 2秒、4秒、6秒
-                        logger.warning(f"⚠️ {code} 第{attempt + 1}次尝试失败，{wait_time}秒后重试: {retry_error}")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        raise
-
-        except Exception as e:
-            error_msg = str(e)
-            # 🔥 检测事件循环关闭错误
-            if "shutdown" in error_msg.lower() or "event loop is closed" in error_msg.lower():
-                logger.warning(f"⚠️ [AKShare] 事件循环已关闭，停止获取 {code} 的历史数据")
-                self._event_loop_closed = True
-                return None
-            elif "Connection aborted" in error_msg or "RemoteDisconnected" in error_msg:
-                logger.warning(f"⚠️ {code} 东财历史接口网络异常，尝试回退到新浪/腾讯历史接口")
-                fallback_strategies = [
-                    ("新浪", self._get_historical_data_sina_fallback),
-                    ("腾讯", self._get_historical_data_tx_fallback),
-                ]
-                for fallback_name, fallback_loader in fallback_strategies:
-                    try:
-                        fallback_df = await fallback_loader(code, start_date, end_date, period)
-                        if fallback_df is not None and not fallback_df.empty:
-                            logger.info(f"✅ {code} {fallback_name}历史接口回退成功: {len(fallback_df)}条记录")
-                            fallback_df = self._standardize_historical_columns(fallback_df, code)
-                            return fallback_df
-                    except Exception as fallback_error:
-                        logger.warning(f"⚠️ {code} {fallback_name}历史接口回退失败: {fallback_error}")
-
-                message = f"{code} 网络连接中断，建议稍后重试或减小时间范围"
-                logger.error(f"❌ {message}")
-                raise AKShareNetworkError(message) from (primary_error or e)
+            except Exception as error:
+                if not self._is_history_network_error(error):
+                    raise
+                if attempt < 2:
+                    await asyncio.sleep((attempt + 1) * 2)
+                    continue
+                if period != 'daily':
+                    raise AKShareNetworkError(f'{code} 东财历史接口网络连接失败') from error
+                with self._history_circuit_lock:
+                    self._history_failure_count += 1
+                    if self._history_failure_count >= 2:
+                        self._history_retry_after = time.monotonic() + 300
+                        logger.warning('⚠️ 东财历史接口连续失败，日线请求改用备用接口五分钟')
+                logger.warning(f'⚠️ {code} 东财历史接口网络异常，尝试备用历史接口')
+                return await self._history_fallback(code, start_date, end_date, period)
             else:
-                logger.error(f"❌ 获取{code}历史数据失败: {e}")
-            return None
+                if period == 'daily':
+                    with self._history_circuit_lock:
+                        self._history_failure_count = 0
+                        self._history_retry_after = 0.0
+                if frame is None or frame.empty:
+                    return pd.DataFrame()
+                return self._standardize_historical_columns(frame, code)
 
     async def _get_historical_data_in_batches(
         self,

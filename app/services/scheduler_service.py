@@ -2522,6 +2522,29 @@ async def mark_job_completed(job_id: str, stats: Optional[Dict[str, Any]] = None
                 "progress_message": "任务完成"
             }
 
+        # AKShare 历史同步区分已覆盖、空返回和失败，避免无更新任务误报失败。
+        if job_id == "akshare_historical_sync" and stats and "skipped_count" in stats:
+            saved = stats.get("success_count", 0)
+            covered = stats.get("skipped_count", 0)
+            empty = stats.get("no_data_count", 0)
+            failed = stats.get("error_count", 0)
+            total = stats.get("total_processed", 0)
+            if total > 0 and failed == 0 and empty == 0 and saved + covered >= total:
+                status = "success"
+            elif saved + covered > 0:
+                status = "partial"
+            elif failed:
+                status = "failed"
+            else:
+                status = "skipped"
+            message = f"同步结束：更新 {saved}，无需更新 {covered}，接口无数据 {empty}，失败 {failed}"
+            update_data.update(
+                status=status, progress_message=message, error_message=message,
+                skipped_count=covered, no_data_count=empty,
+                success_count=saved, error_count=failed,
+                errors=stats.get("errors", []),
+            )
+
         result = sync_db.scheduler_executions.update_one(
             {"_id": execution["_id"]},
             {"$set": update_data}
