@@ -4,7 +4,7 @@ AKShare数据同步服务
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 import pymongo
 
@@ -925,7 +925,8 @@ class AKShareSyncService:
         incremental: bool = True,
         period: str = "daily",
         resume_from_index: int = None,  # 🔥 恢复执行：从哪个位置继续
-        manual_mode: bool = False
+        manual_mode: bool = False,
+        manual_trigger: bool = False
     ) -> Dict[str, Any]:
         """
         同步历史数据
@@ -937,6 +938,7 @@ class AKShareSyncService:
             incremental: 是否增量同步
             period: 数据周期 (daily/weekly/monthly)
             manual_mode: 是否为手动 API 调用；手动模式不读取或写回调度任务状态
+            manual_trigger: 是否由调度页面手动触发；保留调度状态跟踪
 
         Returns:
             同步结果统计
@@ -963,13 +965,17 @@ class AKShareSyncService:
             # 因为数据库连接（Motor）绑定到事件循环，而线程池的线程有独立的事件循环
             self.db = bind_loop_safe_mongo_db(self)
             
-            # 1. 确定全局结束日期
+            # 按北京时间确定默认结束日期，手动补历史数据不必等待当日收盘。
+            current_time = datetime.now(timezone(timedelta(hours=8)))
             if not end_date:
-                end_date = datetime.now().strftime('%Y-%m-%d')
+                target_date = current_time
+                if incremental and (manual_trigger or manual_mode) and current_time.hour < 18:
+                    target_date -= timedelta(days=1)
+                    logger.info(f"📅 手动增量同步：18:00 前默认同步截至昨日 {target_date:%Y-%m-%d}")
+                end_date = target_date.strftime('%Y-%m-%d')
 
-            # 🔥 增量同步时间检查：如果增量同步且结束日期是今天，且当前时间在18:00之前，则跳过同步
-            if incremental and end_date == datetime.now().strftime('%Y-%m-%d'):
-                current_time = datetime.now()
+            # 定时任务以及显式请求当日数据时，仍保留 18:00 前的保护。
+            if incremental and end_date == current_time.strftime('%Y-%m-%d'):
                 cutoff_time = current_time.replace(hour=18, minute=0, second=0, microsecond=0)
                 
                 if current_time < cutoff_time:
@@ -2456,7 +2462,8 @@ async def run_akshare_historical_sync(incremental: bool = True, **kwargs):
                 "period": kwargs.get("period", "daily"),
                 "start_date": kwargs.get("start_date"),
                 "end_date": kwargs.get("end_date"),
-                "symbols": kwargs.get("symbols")
+                "symbols": kwargs.get("symbols"),
+                "manual_trigger": manual_trigger
             },
             job_id=job_id,
             rate_limit_per_minute=kwargs.get("rate_limit_per_minute", 200),  # AKShare速率限制
