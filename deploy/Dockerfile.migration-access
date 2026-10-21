@@ -1,0 +1,8 @@
+# Code-only access update; wrapper checks the existing candidate image ID.
+FROM k-tradingagents-backend:arm64-d3ca3ec-cutover-pending-20261017-v1
+LABEL migration.launch.patch="final-cutover-gate-https-18088-20261018-v2"
+COPY --chown=1000:1000 overlay/ /app/
+USER appuser
+RUN cd /app/deploy && python -B -m unittest test_migration_launch
+ENTRYPOINT ["python", "-B", "/app/deploy/migration_production_entrypoint.py"]
+CMD []

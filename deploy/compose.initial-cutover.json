@@ -1,0 +1,8 @@
+{
+  "services": {
+    "mongodb": {"restart": "no"},
+    "redis": {"restart": "no"},
+    "backend": {"restart": "no"},
+    "frontend": {"restart": "no"}
+  }
+}

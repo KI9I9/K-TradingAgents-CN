@@ -120,7 +120,7 @@ class MultiSourceBasicsSyncService:
     async def get_status(self) -> Dict[str, Any]:
         """获取同步状态"""
         if self._last_status and self._last_status.get("status") == "queued":
-            return self._last_status
+            return await self._with_inventory(get_mongo_db(), self._last_status)
 
         db = get_mongo_db()
         doc = await db[STATUS_COLLECTION].find_one({"job": JOB_KEY})
@@ -158,9 +158,29 @@ class MultiSourceBasicsSyncService:
             
             # 更新内存缓存
             self._last_status = doc
-            return doc
+            return await self._with_inventory(db, doc)
         
-        return {"job": JOB_KEY, "status": "never_run"}
+        return await self._with_inventory(db, {"job": JOB_KEY, "status": "never_run"})
+
+    @staticmethod
+    def _successful_summary(stats: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if stats.get("status") not in {"success", "success_with_errors"}:
+            return None
+        fields = ("status", "started_at", "finished_at", "total", "inserted",
+                  "updated", "errors", "data_sources_used")
+        return {key: stats[key] for key in fields if key in stats}
+
+    async def _with_inventory(self, db: AsyncIOMotorDatabase, status: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(status)
+        # One stock may have separate records for several data sources.
+        try:
+            result["existing_records"] = await db[COLLECTION_NAME].count_documents({}, maxTimeMS=3000)
+        except Exception as error:
+            logger.warning("读取基本信息库存失败: %s", type(error).__name__)
+            result["existing_records"] = None
+        if not result.get("last_success"):
+            result["last_success"] = self._successful_summary(result)
+        return result
 
     async def _persist_status(self, db: AsyncIOMotorDatabase, stats: Dict[str, Any]) -> None:
         """持久化同步状态"""
@@ -173,9 +193,23 @@ class MultiSourceBasicsSyncService:
             "job": JOB_KEY
         }
 
+        values = dict(stats)
+        values.pop("existing_records", None)
+        summary = self._successful_summary(stats)
+        if summary:
+            values["last_success"] = summary
+        elif stats.get("status") == "running":
+            # Capture an older successful record before the first upgraded run
+            # overwrites it. Later failures leave the saved summary untouched.
+            previous = await db[STATUS_COLLECTION].find_one(filter_query)
+            if previous and not previous.get("last_success"):
+                previous_summary = self._successful_summary(previous)
+                if previous_summary:
+                    values["last_success"] = previous_summary
+
         await db[STATUS_COLLECTION].update_one(
             filter_query,
-            {"$set": stats},
+            {"$set": values},
             upsert=True
         )
 
@@ -268,44 +302,13 @@ class MultiSourceBasicsSyncService:
         manager,
         preferred_sources: Optional[List[str]],
     ) -> Tuple[Any, Optional[str]]:
-        async def _fetch_once(sources: Optional[List[str]], attempt_label: str) -> Tuple[Any, Optional[str]]:
-            start = time.perf_counter()
-            logger.info(
-                "📥 [多数据源基础信息同步] 开始获取股票列表: attempt=%s, preferred_sources=%s, timeout=%ss",
-                attempt_label,
-                sources or [],
-                STOCK_LIST_FETCH_TIMEOUT_SECONDS,
-            )
-            stock_df, source_used = await asyncio.wait_for(
-                asyncio.to_thread(manager.get_stock_list_with_fallback, sources, True),
-                timeout=STOCK_LIST_FETCH_TIMEOUT_SECONDS,
-            )
-            elapsed = time.perf_counter() - start
-            logger.info(
-                "📥 [多数据源基础信息同步] 股票列表获取完成: attempt=%s, source=%s, records=%s, elapsed=%.2fs",
-                attempt_label,
-                source_used,
-                0 if stock_df is None else len(stock_df),
-                elapsed,
-            )
-            return stock_df, source_used
-
-        try:
-            return await _fetch_once(preferred_sources, "primary")
-        except asyncio.TimeoutError:
-            logger.warning(
-                "⏱ [多数据源基础信息同步] 股票列表获取超时: preferred_sources=%s, timeout=%ss",
-                preferred_sources or [],
-                STOCK_LIST_FETCH_TIMEOUT_SECONDS,
-            )
-            retry_sources = [source for source in (preferred_sources or []) if source != "qmt"]
-            if retry_sources:
-                logger.warning(
-                    "↩️ [多数据源基础信息同步] 重试股票列表获取，并将 QMT 延后: retry_sources=%s",
-                    retry_sources,
-                )
-                return await _fetch_once(retry_sources, "retry_without_qmt")
-            raise
+        from tradingagents.utils.bounded_data_fetch import fetch_async
+        # The child constructs its own manager with the same runtime settings.
+        # Do not retry a timed-out thread: cancelling it cannot stop SDK requests.
+        return await fetch_async(
+            "stock_list", {"preferred_sources": preferred_sources},
+            timeout=STOCK_LIST_FETCH_TIMEOUT_SECONDS,
+        )
 
     async def _run_full_sync_impl(
         self,
@@ -352,8 +355,9 @@ class MultiSourceBasicsSyncService:
 
             # Step 3: 获取最新交易日期和财务数据
             step_start = time.perf_counter()
-            latest_trade_date = await asyncio.to_thread(
-                manager.find_latest_trade_date_with_fallback, preferred_sources
+            from tradingagents.utils.bounded_data_fetch import fetch_async
+            latest_trade_date = await fetch_async(
+                "trade_date", {"preferred_sources": preferred_sources}, timeout=30,
             )
             stats.last_trade_date = latest_trade_date
             logger.info(
@@ -366,8 +370,9 @@ class MultiSourceBasicsSyncService:
             daily_source = ""
             if latest_trade_date:
                 step_start = time.perf_counter()
-                daily_df, daily_source = await asyncio.to_thread(
-                    manager.get_daily_basic_with_fallback, latest_trade_date, preferred_sources
+                daily_df, daily_source = await fetch_async(
+                    "daily_basic", {"trade_date": latest_trade_date, "preferred_sources": preferred_sources},
+                    timeout=45,
                 )
                 if daily_df is not None and not daily_df.empty:
                     for _, row in daily_df.iterrows():
@@ -535,7 +540,11 @@ class MultiSourceBasicsSyncService:
 
         except Exception as e:
             stats.status = "failed"
-            stats.message = str(e)
+            stats.message = (
+                "获取股票列表超时，同步已停止；已有数据保留。"
+                if isinstance(e, (asyncio.TimeoutError, TimeoutError))
+                else str(e) or type(e).__name__
+            )
             stats.finished_at = datetime.now().isoformat()
             try:
                 await self._persist_status(db, stats.__dict__.copy())

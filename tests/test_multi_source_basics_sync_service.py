@@ -38,10 +38,17 @@ def test_run_full_sync_uses_system_industry_mapping_for_batch_docs():
 
     status_collection = MagicMock()
     status_collection.update_one = AsyncMock(return_value=None)
+    status_collection.find_one = AsyncMock(return_value=None)
     fake_db = MagicMock()
     fake_db.__getitem__.return_value = status_collection
 
-    with patch("app.services.multi_source_basics_sync_service.get_mongo_db", return_value=fake_db), \
+    async def _bounded_fake(operation, arguments, **kwargs):
+        if operation == "stock_list":
+            return _FakeManager().get_stock_list_with_fallback()
+        return None
+
+    with patch("tradingagents.utils.bounded_data_fetch.fetch_async",new=AsyncMock(side_effect=_bounded_fake)), \
+         patch("app.services.multi_source_basics_sync_service.get_mongo_db", return_value=fake_db), \
          patch("app.services.data_sources.manager.DataSourceManager", return_value=_FakeManager()), \
          patch("app.services.official_industry_service.fetch_industry_mapping", new=AsyncMock(return_value={"300750": "电气设备"})):
         result = asyncio.run(service.run_full_sync(preferred_sources=["akshare"]))

@@ -72,6 +72,11 @@ class AKShareProvider(BaseStockDataProvider):
                     修复AKShare stock_news_em()函数缺少headers的问题
                     如果可用，使用 curl_cffi 模拟真实浏览器 TLS 指纹
                     """
+                    # requests 默认以及 SDK 显式 timeout=None 都会禁用超时。
+                    # socket.setdefaulttimeout 不能代替 requests 的请求级超时。
+                    if kwargs.get('timeout') is None:
+                        kwargs['timeout'] = 10
+
                     # 添加请求延迟，避免被反爬虫封禁
                     # 只对东方财富网的请求添加延迟
                     if 'eastmoney.com' in url:
@@ -1695,6 +1700,28 @@ class AKShareProvider(BaseStockDataProvider):
         self, code: str, start_date: str, end_date: str, period: str = "daily"
     ) -> Optional[pd.DataFrame]:
         """获取历史行情；连续两轮东财连接失败后，日线临时回退五分钟。"""
+        from tradingagents.utils.bounded_data_fetch import IS_WORKER, fetch_async, DataFetchNetworkError
+        if not IS_WORKER:
+            with self._history_circuit_lock:
+                circuit = {'failures': self._history_failure_count, 'retry_after': self._history_retry_after}
+            try:
+                frame, circuit = await fetch_async(
+                    'akshare_history',
+                    {'code': code, 'start_date': start_date, 'end_date': end_date, 'period': period, 'circuit': circuit},
+                    timeout=180,
+                )
+            except DataFetchNetworkError as error:
+                if error.circuit:
+                    with self._history_circuit_lock:
+                        self._history_failure_count = error.circuit['failures']
+                        self._history_retry_after = error.circuit['retry_after']
+                raise AKShareNetworkError('AKShare 历史接口网络请求失败，未取得新数据') from error
+            except TimeoutError as error:
+                raise AKShareNetworkError('AKShare 单股历史请求超过期限，已终止请求；已有数据保留') from error
+            with self._history_circuit_lock:
+                self._history_failure_count = circuit['failures']
+                self._history_retry_after = circuit['retry_after']
+            return frame
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
         end_dt = datetime.strptime(end_date, '%Y-%m-%d')
         if start_dt > end_dt:

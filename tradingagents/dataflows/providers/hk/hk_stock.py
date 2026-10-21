@@ -54,7 +54,7 @@ class HKStockProvider:
                 proxies['https'] = https_proxy
             if proxies:
                 session.proxies.update(proxies)
-                logger.info(f"🌐 使用代理访问 Yahoo Finance: {proxies}")
+                logger.info(f'🌐 使用代理访问 Yahoo Finance: [omitted]')
             else:
                 logger.info("🌐 未配置代理，直接访问 Yahoo Finance")
 
@@ -67,7 +67,7 @@ class HKStockProvider:
             logger.info(f"🪪 使用UA: {ua}")
             return session
         except Exception as e:
-            logger.warning(f"⚠️ 创建代理会话失败，使用默认会话: {e}")
+            logger.warning(f'⚠️ 创建代理会话失败，使用默认会话: {type(e).__name__}')
             return requests.Session()
 
     def _wait_for_rate_limit(self):
@@ -123,14 +123,14 @@ class HKStockProvider:
                         data = data.reset_index()
                         data['Symbol'] = symbol
 
-                        logger.info(f"✅ 港股数据获取成功: {symbol}, {len(data)}条记录")
+                        logger.info(f'✅ 港股数据获取成功: {symbol}, [omitted]条记录')
                         return data
                     else:
                         logger.warning(f"⚠️ 港股数据为空: {symbol} (尝试 {attempt + 1}/{self.max_retries})")
 
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"❌ 港股数据获取失败 (尝试 {attempt + 1}/{self.max_retries}): {error_msg}")
+                    logger.error(f'❌ 港股数据获取失败 (尝试 {attempt + 1}/{self.max_retries}): [omitted]')
 
                     # 检查是否是频率限制错误
                     if "Rate limited" in error_msg or "Too Many Requests" in error_msg:
@@ -148,7 +148,7 @@ class HKStockProvider:
             return None
 
         except Exception as e:
-            logger.error(f"❌ 港股数据获取异常: {e}")
+            logger.error(f'❌ 港股数据获取异常: {type(e).__name__}')
             return None
 
     def get_stock_info(self, symbol: str) -> Dict[str, Any]:
@@ -193,7 +193,7 @@ class HKStockProvider:
                 }
 
         except Exception as e:
-            logger.error(f"❌ 获取港股信息失败: {e}")
+            logger.error(f'❌ 获取港股信息失败: {type(e).__name__}')
             return {
                 'symbol': symbol,
                 'name': f'港股{symbol}',
@@ -252,7 +252,7 @@ class HKStockProvider:
                 return None
 
         except Exception as e:
-            logger.error(f"❌ 获取港股实时价格失败: {e}")
+            logger.error(f'❌ 获取港股实时价格失败: {type(e).__name__}')
             return None
 
     def _normalize_hk_symbol(self, symbol: str) -> str:
@@ -521,7 +521,7 @@ class HKStockProvider:
             return result
 
         except Exception as e:
-            logger.error(f"❌ 格式化港股数据失败: {e}", exc_info=True)
+            logger.error(f'❌ 格式化港股数据失败: {type(e).__name__}', exc_info=False)
             return f"❌ 港股数据格式化失败: {symbol}"
 
 

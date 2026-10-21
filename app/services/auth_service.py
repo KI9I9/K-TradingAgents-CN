@@ -43,24 +43,24 @@ class AuthService:
         try:
             logger.debug(f"🔍 开始验证token")
             logger.debug(f"📝 Token长度: {len(token)}")
-            logger.debug(f"🔑 JWT密钥: {settings.JWT_SECRET[:10]}...")
+            logger.debug(f'🔑 JWT密钥: [omitted]...')
             logger.debug(f"🔧 JWT算法: {settings.JWT_ALGORITHM}")
 
             payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
             logger.debug(f"✅ Token解码成功")
-            logger.debug(f"📋 Payload: {payload}")
+            logger.debug(f'📋 Payload: [omitted]')
 
             token_data = TokenData(
                 sub=payload.get("sub"),
                 exp=int(payload.get("exp", time.time())),
                 session_id=payload.get("session_id")  # 解析 session_id
             )
-            logger.debug(f"🎯 Token数据: sub={token_data.sub}, exp={token_data.exp}, session_id={token_data.session_id[:16] if token_data.session_id else 'None'}...")
+            logger.debug(f'🎯 Token数据: sub=[omitted], exp=[omitted], session_id=[omitted]...')
 
             # 检查是否过期
             current_time = int(time.time())
             if token_data.exp < current_time:
-                logger.warning(f"⏰ Token已过期: exp={token_data.exp}, now={current_time}")
+                logger.warning(f'⏰ Token已过期: exp=[omitted], now={current_time}')
                 return None
 
             logger.debug(f"✅ Token验证成功")
@@ -70,8 +70,8 @@ class AuthService:
             logger.warning("⏰ Token已过期")
             return None
         except jwt.InvalidTokenError as e:
-            logger.warning(f"❌ Token无效: {str(e)}")
+            logger.warning(f'❌ Token无效: {type(e).__name__}')
             return None
         except Exception as e:
-            logger.error(f"❌ Token验证异常: {str(e)}")
+            logger.error(f'❌ Token验证异常: {type(e).__name__}')
             return None

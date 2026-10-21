@@ -1,0 +1,88 @@
+# Restore/count-review stage only. No backend/frontend service can be started here.
+# Do not run until the user approves the final snapshot/restore window and the
+# remaining archive/volume/inventory gates are completed.
+name: k-tradingagents-osaka-review
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+services:
+  mongodb:
+    image: mongo@sha256:65e9d974435d072874cf08922f26ecdf7d45b54662ce632509750b5c23ba5c5f
+    platform: linux/arm64
+    restart: 'no'
+    read_only: true
+    tmpfs: ['/tmp:rw,nosuid,nodev,size=128m']
+    cap_drop: [ALL]
+    # Only for the official entrypoint's ownership setup and privilege drop.
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    # Keep target TTL cleanup paused during restore/count comparison only.
+    command: [mongod, --bind_ip_all, --setParameter, ttlMonitorEnabled=false]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME_FILE: /run/secrets/mongo-root-username
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo-root-password
+      TZ: Asia/Shanghai
+    secrets:
+      - mongo-root-username
+      - mongo-root-password
+      - mongo-tools.json
+    volumes:
+      - review_mongodb_data:/data/db
+      - review_mongodb_config:/data/configdb
+    networks: [review_internal]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 256
+    stop_grace_period: 60s
+    logging: *logging
+
+  redis:
+    image: redis@sha256:1f09a89a207d794a8c61d9edfc26e7c58427de10ccef7c5d18d638df79a63b85
+    platform: linux/arm64
+    restart: 'no'
+    read_only: true
+    tmpfs: ['/tmp:rw,nosuid,nodev,size=128m']
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    command: [redis-server, /run/secrets/redis.conf]
+    secrets:
+      - redis.conf
+      - redis-users.acl
+    volumes:
+      - review_redis_data:/data
+    networks: [review_internal]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 30s
+    logging: *logging
+
+# Source files must be 600, with ownership readable by the image's actual service
+# UID after its normal entrypoint drops privileges. Compose bind-backed secrets do
+# NOT reliably honor requested uid/gid/mode. Prepare restricted runtime copies;
+# never chmod the original .env or reuse application volumes for this review.
+secrets:
+  mongo-tools.json:
+    file: ${MIGRATION_SECRET_DIR:?restricted runtime directory required}/mongo-tools.json
+  mongo-root-username:
+    file: ${MIGRATION_SECRET_DIR:?restricted runtime directory required}/mongo-root-username
+  mongo-root-password:
+    file: ${MIGRATION_SECRET_DIR:?restricted runtime directory required}/mongo-root-password
+  redis.conf:
+    file: ${MIGRATION_SECRET_DIR:?restricted runtime directory required}/redis.conf
+  redis-users.acl:
+    file: ${MIGRATION_SECRET_DIR:?restricted runtime directory required}/redis-users.acl
+
+networks:
+  review_internal:
+    internal: true
+
+volumes:
+  review_mongodb_data:
+  review_mongodb_config:
+  review_redis_data:

@@ -16,6 +16,7 @@ import logging
 
 from ..base_provider import BaseStockDataProvider
 from tradingagents.config.providers_config import get_provider_config
+from tradingagents.utils.tushare_https import create_tushare_client
 
 # 尝试导入tushare
 try:
@@ -162,9 +163,8 @@ class TushareProvider(BaseStockDataProvider):
             for source, token in token_candidates:
                 try:
                     self.logger.info(f"🔄 初始化 Tushare API Client (Token来源: {source})")
-                    # 直接传入 token 给 pro_api，不调用 set_token 避免写 tk.csv 文件
-                    # ts.set_token(token) 会把 token 缓存到 ~/tk.csv，在沙箱等受限环境会 Permission denied
-                    api = ts.pro_api(token)
+                    # 显式传入原 Token，使用 HTTPS；不写 tk.csv、不修改 SDK 全局状态。
+                    api = create_tushare_client(token)
 
                     if validate:
                         test_data = api.stock_basic(list_status='L', limit=1)

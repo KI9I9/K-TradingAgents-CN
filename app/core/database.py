@@ -353,7 +353,7 @@ class _LoopSafeRedisClientProxy:
         return getattr(self._target(), name)
 
 
-async def init_database():
+async def init_database(*, create_schema: bool = True):
     """初始化数据库连接"""
     global mongo_client, mongo_db, redis_client, redis_pool, _mongo_runtime_loop, _redis_runtime_loop
 
@@ -393,7 +393,8 @@ async def init_database():
         logger.info("🎉 所有数据库连接初始化完成")
 
         # 🔥 初始化数据库视图和索引
-        await init_database_views_and_indexes()
+        if create_schema:
+            await init_database_views_and_indexes()
 
     except Exception as e:
         logger.error(f"💥 数据库初始化失败: {e}")

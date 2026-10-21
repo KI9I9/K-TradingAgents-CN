@@ -42,7 +42,7 @@ def _reload_runtime_bridge(reason: str) -> None:
         reload_bridged_config()
         logger.info(f"🔄 已刷新运行时配置桥接: {reason}")
     except Exception as e:
-        logger.warning(f"⚠️ 刷新运行时配置桥接失败（忽略）: {reason}, error={e}")
+        logger.warning(f'⚠️ 刷新运行时配置桥接失败（忽略）: {reason}, error={type(e).__name__}')
 
 
 def _check_jdyun_mode_protected():
@@ -114,7 +114,7 @@ async def get_gateway_config(
         result["enabled"] = cfg.get("enabled", True)
         return ok(data=result)
     except Exception as e:
-        logger.error(f"❌ 获取 Gateway {platform} 配置失败: {e}")
+        logger.error(f'❌ 获取 Gateway {platform} 配置失败: {type(e).__name__}')
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -197,14 +197,14 @@ async def update_gateway_config(
                     gateway_router.register_adapter(adapter)
                     logger.info(f"✅ Gateway dingtalk 适配器已热重载")
             except Exception as reload_err:
-                logger.warning(f"⚠️ Gateway {platform} 适配器热重载失败: {reload_err}")
+                logger.warning(f'⚠️ Gateway {platform} 适配器热重载失败: {type(reload_err).__name__}')
         else:
             try:
                 from core.gateway.router import gateway_router
                 if platform == "qq":
                     await gateway_router.stop_ws_client()
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
 
         await log_operation(
             user_id=str(current_user.get("user_id", current_user.get("id", ""))),
@@ -216,7 +216,7 @@ async def update_gateway_config(
 
         return ok(message=f"Gateway {platform} 配置已保存")
     except Exception as e:
-        logger.error(f"❌ 更新 Gateway {platform} 配置失败: {e}")
+        logger.error(f'❌ 更新 Gateway {platform} 配置失败: {type(e).__name__}')
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -319,7 +319,7 @@ async def test_gateway_connection(
     except httpx.TimeoutException:
         return fail(message="连接超时，请检查网络环境")
     except Exception as e:
-        logger.error(f"❌ Gateway {platform} 连接测试失败: {e}")
+        logger.error(f'❌ Gateway {platform} 连接测试失败: {type(e).__name__}')
         return fail(message=f"测试失败：{str(e)}")
 
 
@@ -361,7 +361,7 @@ async def reload_config(current_user: dict = Depends(get_current_user)):
                 "message": "配置重载失败，请查看日志"
             }
     except Exception as e:
-        logger.error(f"配置重载失败: {e}", exc_info=True)
+        logger.error(f'配置重载失败: {type(e).__name__}', exc_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"配置重载失败: {str(e)}"
@@ -423,12 +423,12 @@ def _sanitize_llm_configs(items, providers_dict=None):
                 result.append(LLMConfig(**data))
             except Exception as e:
                 # 🔥 容错处理：如果某个配置处理失败（比如模型目录中已删除），跳过该配置
-                logger.warning(f"⚠️ 处理LLM配置失败，跳过: {item.model_dump() if hasattr(item, 'model_dump') else item}, 错误: {e}")
+                logger.warning(f'⚠️ 处理LLM配置失败，跳过: [omitted], 错误: {type(e).__name__}')
                 continue
 
         return result
     except Exception as e:
-        logger.error(f"❌ 脱敏 LLM 配置失败: {e}")
+        logger.error(f'❌ 脱敏 LLM 配置失败: {type(e).__name__}')
         return items
 
 def _sanitize_datasource_configs(items):
@@ -480,7 +480,7 @@ def _sanitize_datasource_configs(items):
 
         return result
     except Exception as e:
-        print(f"⚠️ 脱敏数据源配置失败: {e}")
+        print(f'⚠️ 脱敏数据源配置失败: {type(e).__name__}')
         return items
 
 def _sanitize_database_configs(items):
@@ -674,7 +674,7 @@ async def add_llm_provider(
                 success=True,
             )
         except Exception as e:
-            logger.warning(f"[config] 操作失败: {e}")
+            logger.warning(f'[config] 操作失败: {type(e).__name__}')
 
         _reload_runtime_bridge(f"add_llm_provider:{request.name}")
 
@@ -735,7 +735,7 @@ async def update_llm_provider(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
 
             _reload_runtime_bridge(f"update_llm_provider:{provider_id}")
 
@@ -780,7 +780,7 @@ async def delete_llm_provider(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {
                 "success": True,
                 "message": "厂家删除成功",
@@ -823,7 +823,7 @@ async def toggle_llm_provider(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {
                 "success": True,
                 "message": f"厂家已{'启用' if is_active else '禁用'}",
@@ -860,9 +860,9 @@ async def fetch_provider_models(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"获取模型列表失败: {e}")
+        print(f'获取模型列表失败: {type(e).__name__}')
         import traceback
-        traceback.print_exc()
+        logger.debug('Exception traceback omitted: may contain credentials')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取模型列表失败: {str(e)}"
@@ -890,7 +890,7 @@ async def migrate_env_to_providers(
                 success=bool(result.get("success", False)),
             )
         except Exception as e:
-            logger.warning(f"[config] 操作失败: {e}")
+            logger.warning(f'[config] 操作失败: {type(e).__name__}')
 
         return {
             "success": result["success"],
@@ -929,7 +929,7 @@ async def init_aggregator_providers(
                 success=bool(result.get("success", False)),
             )
         except Exception as e:
-            logger.warning(f"[config] 操作失败: {e}")
+            logger.warning(f'[config] 操作失败: {type(e).__name__}')
 
         return {
             "success": result["success"],
@@ -970,10 +970,10 @@ async def test_provider_api(
     try:
         logger.info(f"🧪 收到API测试请求 - provider_id: {provider_id}")
         result = await config_service.test_provider_api(provider_id)
-        logger.info(f"🧪 API测试结果: {result}")
+        logger.info(f'🧪 API测试结果: [omitted]')
         return result
     except Exception as e:
-        logger.error(f"测试厂家API失败: {e}")
+        logger.error(f'测试厂家API失败: {type(e).__name__}')
         raise HTTPException(
             status_code=500,
             detail=f"测试厂家API失败: {str(e)}"
@@ -991,12 +991,12 @@ async def add_llm_config(
     _check_jdyun_mode_protected()
     try:
         logger.info(f"🔧 添加/更新大模型配置开始")
-        logger.info(f"📊 请求数据: {request.model_dump()}")
-        logger.info(f"🏷️ 厂家: {request.provider}, 模型: {request.model_name}")
+        logger.info(f'📊 请求数据: [omitted]')
+        logger.info(f'🏷️ 厂家: [omitted], 模型: [omitted]')
 
         # 创建LLM配置
         llm_config_data = request.model_dump()
-        logger.info(f"📋 原始配置数据: {llm_config_data}")
+        logger.info(f'📋 原始配置数据: [omitted]')
 
         # 🔥 方案1：不要自动从厂家配置复制 API Key 到模型配置
         # 原因：
@@ -1019,8 +1019,8 @@ async def add_llm_config(
             llm_config = LLMConfig(**llm_config_data)
             logger.info(f"✅ LLMConfig对象创建成功")
         except Exception as e:
-            logger.error(f"❌ LLMConfig对象创建失败: {e}")
-            logger.error(f"📋 失败的数据: {llm_config_data}")
+            logger.error(f'❌ LLMConfig对象创建失败: {type(e).__name__}')
+            logger.error(f'📋 失败的数据: [omitted]')
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"配置数据验证失败: {str(e)}"
@@ -1038,7 +1038,7 @@ async def add_llm_config(
                 sync_pricing_config_now()
                 logger.info(f"✅ 定价配置已同步到 tradingagents")
             except Exception as e:
-                logger.warning(f"⚠️  同步定价配置失败: {e}")
+                logger.warning(f'⚠️  同步定价配置失败: {type(e).__name__}')
 
             # 审计日志（忽略异常）
             try:
@@ -1051,7 +1051,7 @@ async def add_llm_config(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "大模型配置更新成功", "model_name": llm_config.model_name}
         else:
             logger.error(f"❌ 大模型配置保存失败")
@@ -1062,9 +1062,9 @@ async def add_llm_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 添加大模型配置异常: {e}")
+        logger.error(f'❌ 添加大模型配置异常: {type(e).__name__}')
         import traceback
-        logger.error(f"📋 异常堆栈: {traceback.format_exc()}")
+        logger.error(f'📋 异常堆栈: [omitted]')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"添加大模型配置失败: {str(e)}"
@@ -1146,7 +1146,7 @@ async def add_data_source_config(
                         await config_service.add_datasource_to_category(grouping)
                     except Exception as e:
                         # 如果分组已存在或其他错误，记录但不影响主流程
-                        logger.warning(f"自动创建数据源分组失败: {str(e)}")
+                        logger.warning(f'自动创建数据源分组失败: {type(e).__name__}')
 
             # 审计日志（忽略异常）
             try:
@@ -1159,7 +1159,7 @@ async def add_data_source_config(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "数据源配置添加成功", "name": ds_config.name}
         else:
             raise HTTPException(
@@ -1211,7 +1211,7 @@ async def add_database_config(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "数据库配置添加成功", "name": db_config.name}
         else:
             raise HTTPException(
@@ -1300,7 +1300,7 @@ async def test_proxy_connection(
         if not proxies:
             return fail(message="请至少配置一个代理地址", data={"response_time": time.time() - start_time})
 
-        logger.info(f"🔍 测试代理连接: {proxies}")
+        logger.info(f'🔍 测试代理连接: [omitted]')
 
         response = requests.get(
             test_url,
@@ -1315,20 +1315,20 @@ async def test_proxy_connection(
             logger.info(f"✅ 代理连接测试成功 (耗时: {response_time:.2f}s)")
             return ok(data={"response_time": response_time}, message="代理连接正常")
         else:
-            logger.warning(f"⚠️ 代理连接返回非200状态: {response.status_code}")
+            logger.warning(f'⚠️ 代理连接返回非200状态: [omitted]')
             return fail(message=f"代理连接返回状态码: {response.status_code}", data={"response_time": response_time})
 
     except requests.exceptions.ProxyError as e:
-        logger.error(f"❌ 代理连接错误: {e}")
+        logger.error(f'❌ 代理连接错误: {type(e).__name__}')
         return fail(message="代理连接失败: 无法连接到代理服务器", data={"response_time": time.time() - start_time})
     except requests.exceptions.ConnectTimeout:
         logger.error("❌ 代理连接超时")
         return fail(message="代理连接超时", data={"response_time": time.time() - start_time})
     except requests.exceptions.ConnectionError as e:
-        logger.error(f"❌ 连接错误: {e}")
+        logger.error(f'❌ 连接错误: {type(e).__name__}')
         return fail(message="连接失败: 请检查代理地址是否正确", data={"response_time": time.time() - start_time})
     except Exception as e:
-        logger.error(f"❌ 代理测试失败: {e}")
+        logger.error(f'❌ 代理测试失败: {type(e).__name__}')
         return fail(message=f"测试失败: {str(e)}", data={"response_time": time.time() - start_time})
 
 
@@ -1374,7 +1374,7 @@ async def test_saved_database_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 测试数据库配置失败: {e}")
+        logger.error(f'❌ 测试数据库配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"测试数据库配置失败: {str(e)}"
@@ -1427,7 +1427,7 @@ async def get_llm_configs(
 
         return _sanitize_llm_configs(filtered_configs, providers_dict)
     except Exception as e:
-        logger.error(f"获取大模型配置失败: {e}")
+        logger.error(f'获取大模型配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取大模型配置失败: {str(e)}"
@@ -1455,7 +1455,7 @@ async def delete_llm_config(
                 sync_pricing_config_now()
                 logger.info(f"✅ 定价配置已同步到 tradingagents")
             except Exception as e:
-                logger.warning(f"⚠️  同步定价配置失败: {e}")
+                logger.warning(f'⚠️  同步定价配置失败: {type(e).__name__}')
 
             # 审计日志（忽略异常）
             try:
@@ -1468,7 +1468,7 @@ async def delete_llm_config(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "大模型配置删除成功"}
         else:
             logger.warning(f"⚠️ 未找到大模型配置 - {provider}/{model_name}")
@@ -1479,7 +1479,7 @@ async def delete_llm_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 删除大模型配置异常 - {provider}/{model_name}: {e}")
+        logger.error(f'❌ 删除大模型配置异常 - {provider}/{model_name}: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"删除大模型配置失败: {str(e)}"
@@ -1506,7 +1506,7 @@ async def set_default_llm(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "默认大模型设置成功", "default_llm": request.name}
         else:
             raise HTTPException(
@@ -1550,7 +1550,7 @@ async def batch_import_llm_configs(
 
         return result
     except Exception as e:
-        logger.error(f"批量导入大模型配置失败: {e}", exc_info=True)
+        logger.error(f'批量导入大模型配置失败: {type(e).__name__}', exc_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"批量导入失败: {str(e)}"
@@ -1609,7 +1609,7 @@ async def update_data_source_config(
                 # 处理 API Key
                 if 'api_key' in _req:
                     api_key = _req.get('api_key')
-                    logger.info(f"🔍 [API Key 验证] 收到的 API Key: {repr(api_key)} (类型: {type(api_key).__name__}, 长度: {len(api_key) if api_key else 0})")
+                    logger.info(f'🔍 [API Key 验证] 收到的 API Key: [omitted] (类型: [omitted], 长度: [omitted])')
 
                     # 如果是 None 或空字符串，保留原值（不更新）
                     if api_key is None or api_key == '':
@@ -1622,8 +1622,8 @@ async def update_data_source_config(
                         # 对数据库中的完整 API Key 进行相同的截断处理
                         if ds_config.api_key:
                             truncated_db_key = _truncate_api_key(ds_config.api_key)
-                            logger.info(f"🔍 [API Key 验证] 数据库原值截断后: {truncated_db_key}")
-                            logger.info(f"🔍 [API Key 验证] 收到的值: {api_key}")
+                            logger.info(f'🔍 [API Key 验证] 数据库原值截断后: [omitted]')
+                            logger.info(f'🔍 [API Key 验证] 收到的值: [omitted]')
 
                             # 比较截断后的值
                             if api_key == truncated_db_key:
@@ -1650,22 +1650,22 @@ async def update_data_source_config(
                         _req['api_key'] = ds_config.api_key or ""
                     # 如果是新输入的密钥，必须验证有效性
                     elif not is_valid_api_key(api_key):
-                        logger.error(f"❌ [API Key 验证] 验证失败: '{api_key}' (长度: {len(api_key)})")
-                        logger.error(f"   - 长度检查: {len(api_key)} >= 5? {len(api_key) >= 5}")
-                        logger.error(f"   - 占位符前缀检查: startswith('your_')? {api_key.startswith('your_')}, startswith('your-')? {api_key.startswith('your-')}")
-                        logger.error(f"   - 占位符后缀检查: endswith('_here')? {api_key.endswith('_here')}, endswith('-here')? {api_key.endswith('-here')}")
+                        logger.error(f"❌ [API Key 验证] 验证失败: '[omitted]' (长度: [omitted])")
+                        logger.error(f'   - 长度检查: [omitted] >= 5? [omitted]')
+                        logger.error(f"   - 占位符前缀检查: startswith('your_')? [omitted], startswith('your-')? [omitted]")
+                        logger.error(f"   - 占位符后缀检查: endswith('_here')? [omitted], endswith('-here')? [omitted]")
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=f"API Key 无效：长度必须至少 5 个字符，且不能是占位符（当前长度: {len(api_key)}）"
                         )
                     else:
-                        logger.info(f"✅ [API Key 验证] 验证通过，将更新密钥 (长度: {len(api_key)})")
+                        logger.info(f'✅ [API Key 验证] 验证通过，将更新密钥 (长度: [omitted])')
                     # 有效的完整密钥，保留（表示更新）
 
                 # 处理 API Secret
                 if 'api_secret' in _req:
                     api_secret = _req.get('api_secret')
-                    logger.info(f"🔍 [API Secret 验证] 收到的 API Secret: {repr(api_secret)} (类型: {type(api_secret).__name__}, 长度: {len(api_secret) if api_secret else 0})")
+                    logger.info(f'🔍 [API Secret 验证] 收到的 API Secret: [omitted] (类型: [omitted], 长度: [omitted])')
 
                     # 如果是 None 或空字符串，保留原值（不更新）
                     if api_secret is None or api_secret == '':
@@ -1678,8 +1678,8 @@ async def update_data_source_config(
                         # 对数据库中的完整 API Secret 进行相同的截断处理
                         if ds_config.api_secret:
                             truncated_db_secret = _truncate_api_key(ds_config.api_secret)
-                            logger.info(f"🔍 [API Secret 验证] 数据库原值截断后: {truncated_db_secret}")
-                            logger.info(f"🔍 [API Secret 验证] 收到的值: {api_secret}")
+                            logger.info(f'🔍 [API Secret 验证] 数据库原值截断后: [omitted]')
+                            logger.info(f'🔍 [API Secret 验证] 收到的值: [omitted]')
 
                             # 比较截断后的值
                             if api_secret == truncated_db_secret:
@@ -1706,14 +1706,14 @@ async def update_data_source_config(
                         _req['api_secret'] = ds_config.api_secret or ""
                     # 如果是新输入的密钥，必须验证有效性
                     elif not is_valid_api_key(api_secret):
-                        logger.error(f"❌ [API Secret 验证] 验证失败: '{api_secret}' (长度: {len(api_secret)})")
-                        logger.error(f"   - 长度检查: {len(api_secret)} >= 5? {len(api_secret) >= 5}")
+                        logger.error(f"❌ [API Secret 验证] 验证失败: '[omitted]' (长度: [omitted])")
+                        logger.error(f'   - 长度检查: [omitted] >= 5? [omitted]')
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=f"API Secret 无效：长度必须至少 5 个字符，且不能是占位符（当前长度: {len(api_secret)}）"
                         )
                     else:
-                        logger.info(f"✅ [API Secret 验证] 验证通过，将更新密钥 (长度: {len(api_secret)})")
+                        logger.info(f'✅ [API Secret 验证] 验证通过，将更新密钥 (长度: [omitted])')
 
                 updated_config = DataSourceConfig(**_req)
                 config.data_source_configs[i] = updated_config
@@ -1743,7 +1743,7 @@ async def update_data_source_config(
                             )
                             await config_service.add_datasource_to_category(grouping)
                         except Exception as e:
-                            logger.warning(f"添加数据源分组失败: {str(e)}")
+                            logger.warning(f'添加数据源分组失败: {type(e).__name__}')
 
                     # 需要删除的分类
                     to_remove = current_categories - new_categories
@@ -1751,7 +1751,7 @@ async def update_data_source_config(
                         try:
                             await config_service.remove_datasource_from_category(name, category_id)
                         except Exception as e:
-                            logger.warning(f"删除数据源分组失败: {str(e)}")
+                            logger.warning(f'删除数据源分组失败: {type(e).__name__}')
 
                     # 审计日志（忽略异常）
                     try:
@@ -1977,7 +1977,7 @@ async def add_market_category(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "市场分类添加成功", "id": category.id}
         else:
             raise HTTPException(
@@ -2015,7 +2015,7 @@ async def update_market_category(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "市场分类更新成功"}
         else:
             raise HTTPException(
@@ -2052,7 +2052,7 @@ async def delete_market_category(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "市场分类删除成功"}
         else:
             raise HTTPException(
@@ -2107,7 +2107,7 @@ async def add_datasource_to_category(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "数据源添加到分类成功"}
         else:
             raise HTTPException(
@@ -2145,7 +2145,7 @@ async def remove_datasource_from_category(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "数据源从分类中移除成功"}
         else:
             raise HTTPException(
@@ -2184,7 +2184,7 @@ async def update_datasource_grouping(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "数据源分组关系更新成功"}
         else:
             raise HTTPException(
@@ -2222,7 +2222,7 @@ async def update_category_datasource_order(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "数据源排序更新成功"}
         else:
             raise HTTPException(
@@ -2304,12 +2304,12 @@ async def update_system_settings(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             # 失效缓存
             try:
                 config_provider.invalidate()
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             # 若更新包含运行时关键键，立即重载桥接的环境变量以生效
             try:
                 reload_keys = {
@@ -2330,7 +2330,7 @@ async def update_system_settings(
                 if changed_reload_keys:
                     _reload_runtime_bridge(f"update_system_settings:{','.join(changed_reload_keys)}")
             except Exception as e:
-                logger.warning(f"⚠️  更新系统设置后触发重载失败（忽略）：{e}")
+                logger.warning(f'⚠️  更新系统设置后触发重载失败（忽略）：{type(e).__name__}')
             return ok(message="系统设置更新成功")
         else:
             raise HTTPException(
@@ -2352,7 +2352,7 @@ async def update_system_settings(
                 error_message=str(e),
             )
         except Exception as e:
-            logger.warning(f"[config] 操作失败: {e}")
+            logger.warning(f'[config] 操作失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"更新系统设置失败: {str(e)}"
@@ -2377,7 +2377,7 @@ async def export_config(
                 success=True,
             )
         except Exception as e:
-            logger.warning(f"[config] 操作失败: {e}")
+            logger.warning(f'[config] 操作失败: {type(e).__name__}')
         return {
             "message": "配置导出成功",
             "data": config_data,
@@ -2410,7 +2410,7 @@ async def import_config(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "配置导入成功"}
         else:
             raise HTTPException(
@@ -2445,7 +2445,7 @@ async def migrate_legacy_config(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": "传统配置迁移成功"}
         else:
             raise HTTPException(
@@ -2483,7 +2483,7 @@ async def set_default_llm(
                     success=True,
                 )
             except Exception as e:
-                logger.warning(f"[config] 操作失败: {e}")
+                logger.warning(f'[config] 操作失败: {type(e).__name__}')
             return {"message": f"默认大模型已设置为: {request.name}"}
         else:
             raise HTTPException(
@@ -2568,8 +2568,8 @@ async def save_model_catalog(
 ):
     """保存或更新模型目录"""
     try:
-        logger.info(f"📝 收到保存模型目录请求: provider={request.provider}, models数量={len(request.models)}")
-        logger.info(f"📝 请求数据: {request.model_dump()}")
+        logger.info(f'📝 收到保存模型目录请求: provider=[omitted], models数量=[omitted]')
+        logger.info(f'📝 请求数据: [omitted]')
 
         # 转换为 ModelInfo 列表
         models = [ModelInfo(**m) for m in request.models]
@@ -2604,7 +2604,7 @@ async def save_model_catalog(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 保存模型目录失败: {str(e)}", exc_info=True)
+        logger.error(f'❌ 保存模型目录失败: {type(e).__name__}', exc_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"保存模型目录失败: {str(e)}"
@@ -2709,7 +2709,7 @@ async def export_model_catalog(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 导出模型目录失败: {str(e)}", exc_info=True)
+        logger.error(f'❌ 导出模型目录失败: {type(e).__name__}', exc_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"导出模型目录失败: {str(e)}"
@@ -2736,7 +2736,7 @@ async def get_model_catalog_template(
             }
         }
     except Exception as e:
-        logger.error(f"❌ 获取预设模板失败: {str(e)}", exc_info=True)
+        logger.error(f'❌ 获取预设模板失败: {type(e).__name__}', exc_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取预设模板失败: {str(e)}"
@@ -2756,7 +2756,7 @@ async def import_model_catalog(
 ):
     """导入模型目录（从JSON文件）"""
     try:
-        logger.info(f"📥 收到导入模型目录请求: 数量={len(request.catalogs)}, 模式={request.merge_mode}")
+        logger.info(f'📥 收到导入模型目录请求: 数量=[omitted], 模式=[omitted]')
 
         success_count = 0
         failed_count = 0
@@ -2781,7 +2781,7 @@ async def import_model_catalog(
                         models.append(model)
                     except Exception as e:
                         errors.append(f"厂家 {provider} 的模型 {model_data.get('name', 'unknown')} 格式错误: {str(e)}")
-                        logger.warning(f"⚠️ 模型格式错误: {model_data} - {e}")
+                        logger.warning(f'⚠️ 模型格式错误: [omitted] - {type(e).__name__}')
 
                 if not models:
                     errors.append(f"厂家 {provider} 没有有效的模型数据")
@@ -2881,7 +2881,7 @@ async def import_model_catalog(
                 failed_count += 1
                 error_msg = f"厂家 {catalog_data.get('provider', 'unknown')} 导入失败: {str(e)}"
                 errors.append(error_msg)
-                logger.error(f"❌ {error_msg}", exc_info=True)
+                logger.error(f'❌ [omitted]', exc_info=False)
 
         # 记录操作日志
         await log_operation(
@@ -2911,7 +2911,7 @@ async def import_model_catalog(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 导入模型目录失败: {str(e)}", exc_info=True)
+        logger.error(f'❌ 导入模型目录失败: {type(e).__name__}', exc_info=False)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"导入模型目录失败: {str(e)}"
@@ -2931,7 +2931,7 @@ async def get_database_configs(
         logger.info(f"✅ 获取到 {len(configs)} 个数据库配置")
         return configs
     except Exception as e:
-        logger.error(f"❌ 获取数据库配置失败: {e}")
+        logger.error(f'❌ 获取数据库配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取数据库配置失败: {str(e)}"
@@ -2958,7 +2958,7 @@ async def get_database_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 获取数据库配置失败: {e}")
+        logger.error(f'❌ 获取数据库配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"获取数据库配置失败: {str(e)}"
@@ -2972,7 +2972,7 @@ async def add_database_config(
 ):
     """添加数据库配置"""
     try:
-        logger.info(f"➕ 添加数据库配置: {request.name}")
+        logger.info(f'➕ 添加数据库配置: [omitted]')
 
         # 转换为 DatabaseConfig 对象
         db_config = DatabaseConfig(**request.model_dump())
@@ -3000,7 +3000,7 @@ async def add_database_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 添加数据库配置失败: {e}")
+        logger.error(f'❌ 添加数据库配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"添加数据库配置失败: {str(e)}"
@@ -3050,7 +3050,7 @@ async def update_database_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 更新数据库配置失败: {e}")
+        logger.error(f'❌ 更新数据库配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"更新数据库配置失败: {str(e)}"
@@ -3089,7 +3089,7 @@ async def delete_database_config(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 删除数据库配置失败: {e}")
+        logger.error(f'❌ 删除数据库配置失败: {type(e).__name__}')
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"删除数据库配置失败: {str(e)}"

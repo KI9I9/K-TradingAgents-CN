@@ -36,13 +36,19 @@
           </div>
         </div>
 
+        <div v-if="syncStatus" class="sync-inventory-section">
+          <h4 class="section-title">已存基本信息</h4>
+          <p>{{ syncStatus.existing_records == null ? '暂时无法读取' : `${syncStatus.existing_records.toLocaleString()} 条` }}</p>
+          <p class="inventory-note">按数据源分别计数；同一股票可能有多条记录。</p>
+        </div>
+
         <!-- 同步统计 -->
         <div v-if="syncStatus && syncStatus.status !== 'never_run'" class="sync-stats-section">
-          <h4 class="section-title">同步统计</h4>
+          <h4 class="section-title">最近一次任务</h4>
           <div class="stats-grid">
             <div class="stat-item">
-              <div class="stat-value">{{ syncStatus.total }}</div>
-              <div class="stat-label">总数</div>
+              <div class="stat-value">{{ syncStatus.total ?? '—' }}</div>
+              <div class="stat-label">本次处理总数</div>
             </div>
             <div class="stat-item">
               <div class="stat-value success">{{ syncStatus.inserted }}</div>
@@ -75,9 +81,21 @@
 
           <!-- 最后同步时间 -->
           <div v-if="syncStatus.finished_at" class="sync-time">
-            <div class="time-label">完成时间:</div>
+            <div class="time-label">任务结束时间:</div>
             <div class="time-value">{{ formatTime(syncStatus.finished_at) }}</div>
           </div>
+          <p v-if="syncStatus.status === 'failed'" class="inventory-note">
+            {{ syncStatus.message || '本次任务失败；处理数量不代表数据库已有数量。' }}
+          </p>
+        </div>
+
+        <div v-if="syncStatus" class="sync-inventory-section">
+          <h4 class="section-title">最近成功同步</h4>
+          <template v-if="syncStatus.last_success">
+            <p>{{ syncStatus.last_success.status === 'success_with_errors' ? '部分成功' : '成功' }}：处理 {{ syncStatus.last_success.total ?? '—' }} 条</p>
+            <p v-if="syncStatus.last_success.finished_at">{{ formatTime(syncStatus.last_success.finished_at) }}</p>
+          </template>
+          <p v-else class="inventory-note">暂无保留的成功摘要；请以上方已存数据量为准。</p>
         </div>
 
         <!-- 同步控制 -->
@@ -614,6 +632,17 @@ onUnmounted(() => {
           }
         }
       }
+    }
+
+    .sync-inventory-section {
+      margin-bottom: 24px;
+      p { margin: 8px 0; }
+    }
+
+    .inventory-note {
+      color: var(--el-text-color-secondary);
+      font-size: 13px;
+      line-height: 1.6;
     }
 
     .sync-stats-section {

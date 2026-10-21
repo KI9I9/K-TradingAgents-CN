@@ -116,11 +116,11 @@ class ChatDashScopeOpenAI(ChatOpenAI):
 
             # 尝试从环境变量读取 API Key
             env_api_key = os.getenv("DASHSCOPE_API_KEY")
-            logger.info(f"🔍 [DashScope初始化] 从环境变量读取 DASHSCOPE_API_KEY: {'有值' if env_api_key else '空'}")
+            logger.info(f'🔍 [DashScope初始化] 从环境变量读取 DASHSCOPE_API_KEY: [omitted]')
 
             # 验证环境变量中的 API Key 是否有效（排除占位符）
             if env_api_key and is_valid_api_key(env_api_key):
-                logger.info(f"✅ [DashScope初始化] 环境变量中的 API Key 有效，长度: {len(env_api_key)}, 前10位: {env_api_key[:100]}...")
+                logger.info(f'✅ [DashScope初始化] 环境变量中的 API Key 有效，长度: [omitted], 前10位: [omitted]...')
                 api_key_from_kwargs = env_api_key
             elif env_api_key:
                 logger.warning(f"⚠️ [DashScope初始化] 环境变量中的 API Key 无效（可能是占位符），将被忽略")
@@ -144,12 +144,12 @@ class ChatDashScopeOpenAI(ChatOpenAI):
         # 检查 API 密钥和 base_url
         final_api_key = kwargs.get("api_key")
         final_base_url = kwargs.get("base_url")
-        logger.info(f"🔍 [DashScope初始化] 最终使用的 API Key: {'有值' if final_api_key else '空'}")
-        logger.info(f"🔍 [DashScope初始化] 最终使用的 base_url: {final_base_url}")
+        logger.info(f'🔍 [DashScope初始化] 最终使用的 API Key: [omitted]')
+        logger.info(f'🔍 [DashScope初始化] 最终使用的 base_url: [omitted]')
 
         # 🔥 严格检查：api_key 必须是非空字符串
         if not final_api_key or not isinstance(final_api_key, str) or not final_api_key.strip():
-            logger.error(f"❌ [DashScope初始化] API Key 检查失败（值为: {repr(final_api_key)}），即将抛出异常")
+            logger.error(f'❌ [DashScope初始化] API Key 检查失败（值为: [omitted]），即将抛出异常')
             raise ValueError(
                 "DashScope API key not found. Please configure API key in web interface "
                 "(Settings -> LLM Providers) or set DASHSCOPE_API_KEY environment variable."
@@ -163,7 +163,7 @@ class ChatDashScopeOpenAI(ChatOpenAI):
 
         # 兼容不同版本的属性名
         api_base = getattr(self, 'base_url', None) or getattr(self, 'openai_api_base', None) or kwargs.get('base_url', 'unknown')
-        logger.info(f"   API Base: {api_base}")
+        logger.info(f'   API Base: [omitted]')
     
     def _generate(self, *args, **kwargs):
         """重写生成方法，添加 token 使用量追踪"""
@@ -211,7 +211,7 @@ class ChatDashScopeOpenAI(ChatOpenAI):
                     
         except Exception as track_error:
             # token 追踪失败不应该影响主要功能
-            logger.error(f"⚠️ Token 追踪失败: {track_error}")
+            logger.error(f'⚠️ Token 追踪失败: {type(track_error).__name__}')
         
         return result
 
@@ -320,14 +320,14 @@ def test_dashscope_openai_connection(
         
         if response and hasattr(response, 'content') and response.content:
             logger.info(f"✅ DashScope OpenAI 兼容接口连接成功")
-            logger.info(f"   响应: {response.content[:100]}...")
+            logger.info(f'   响应: [omitted]...')
             return True
         else:
             logger.error(f"❌ DashScope OpenAI 兼容接口响应为空")
             return False
             
     except Exception as e:
-        logger.error(f"❌ DashScope OpenAI 兼容接口连接失败: {e}")
+        logger.error(f'❌ DashScope OpenAI 兼容接口连接失败: {type(e).__name__}')
         return False
 
 
@@ -369,17 +369,17 @@ def test_dashscope_openai_function_calling(
         response = llm_with_tools.invoke("请使用test_tool查询'hello world'")
         
         logger.info(f"✅ DashScope OpenAI Function Calling 测试完成")
-        logger.info(f"   响应类型: {type(response)}")
+        logger.info(f'   响应类型: [omitted]')
         
         if hasattr(response, 'tool_calls') and response.tool_calls:
-            logger.info(f"   工具调用数量: {len(response.tool_calls)}")
+            logger.info(f'   工具调用数量: [omitted]')
             return True
         else:
-            logger.info(f"   响应内容: {getattr(response, 'content', 'No content')}")
+            logger.info(f'   响应内容: [omitted]')
             return True  # 即使没有工具调用也算成功，因为模型可能选择不调用工具
             
     except Exception as e:
-        logger.error(f"❌ DashScope OpenAI Function Calling 测试失败: {e}")
+        logger.error(f'❌ DashScope OpenAI Function Calling 测试失败: {type(e).__name__}')
         return False
 
 

@@ -28,6 +28,7 @@ from pathlib import Path
 
 from app.core.config import settings
 from app.core.database import init_db, close_db
+from app.migration_guard import enabled as migration_review_enabled, ReviewGuard
 from app.core.logging_config import setup_logging
 from app.router_registry import register_routers
 from app.services.basics_sync_service import get_basics_sync_service
@@ -122,19 +123,7 @@ async def _print_config_summary(logger):
             if env_file.exists():
                 logger.info(f"  ✅ Found: {env_file} (size: {env_file.stat().st_size} bytes)")
                 env_file_found = True
-                # 显示文件的前几行（隐藏敏感信息）
-                try:
-                    with open(env_file, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()[:5]  # 只读前5行
-                        logger.info(f"     Preview (first 5 lines):")
-                        for i, line in enumerate(lines, 1):
-                            # 隐藏包含密码、密钥等敏感信息的行
-                            if any(keyword in line.upper() for keyword in ['PASSWORD', 'SECRET', 'KEY', 'TOKEN']):
-                                logger.info(f"       {i}: {line.split('=')[0]}=***")
-                            else:
-                                logger.info(f"       {i}: {line.strip()}")
-                except Exception as e:
-                    logger.warning(f"     Could not preview file: {e}")
+                # 只报告文件存在；不能依赖字段名判断哪些配置值可以公开。
             else:
                 logger.info(f"  ❌ Not found: {env_file}")
         
@@ -173,16 +162,11 @@ async def _print_config_summary(logger):
             logger.info("Proxy Configuration:")
             logger.info(f"  🔧 PROXY_ENABLED: True")
             if settings.HTTP_PROXY:
-                logger.info(f"  HTTP_PROXY: {settings.HTTP_PROXY}")
+                logger.info("  HTTP_PROXY: configured (value omitted)")
             if settings.HTTPS_PROXY:
-                logger.info(f"  HTTPS_PROXY: {settings.HTTPS_PROXY}")
+                logger.info("  HTTPS_PROXY: configured (value omitted)")
             if settings.NO_PROXY:
-                # 只显示前3个域名
-                no_proxy_list = settings.NO_PROXY.split(',')
-                if len(no_proxy_list) <= 3:
-                    logger.info(f"  NO_PROXY: {settings.NO_PROXY}")
-                else:
-                    logger.info(f"  NO_PROXY: {','.join(no_proxy_list[:3])}... ({len(no_proxy_list)} domains)")
+                logger.info("  NO_PROXY: configured (value omitted)")
             logger.info(f"  ✅ Proxy environment variables set successfully")
         else:
             if settings.PROXY_ENABLED:
@@ -207,7 +191,7 @@ async def _print_config_summary(logger):
             else:
                 logger.warning("⚠️  No LLM configured. Please configure at least one LLM in Web UI.")
         except Exception as e:
-            logger.warning(f"⚠️  Failed to check LLM configs: {e}")
+            logger.warning(f"⚠️  Failed to check LLM configs: {type(e).__name__}")
 
         # 检查数据源配置
         try:
@@ -222,16 +206,26 @@ async def _print_config_summary(logger):
             else:
                 logger.info("Data Sources: Using default (AKShare)")
         except Exception as e:
-            logger.warning(f"⚠️  Failed to check data source configs: {e}")
+            logger.warning(f"⚠️  Failed to check data source configs: {type(e).__name__}")
 
         logger.info("=" * 70)
     except Exception as e:
-        logger.error(f"Failed to print config summary: {e}")
+        logger.error(f"Failed to print config summary: {type(e).__name__}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    if migration_review_enabled():
+        # Do not run schema migration/bootstrap, load tools/MCP, build embeddings,
+        # start workers, calendar refresh or any scheduler while reviewing a clone.
+        # Index/view/count comparison must already have completed before login.
+        await init_db(create_schema=False)
+        try:
+            yield
+        finally:
+            await close_db()
+        return
     # 启动时初始化
     setup_logging()
     logger = logging.getLogger("app.main")
@@ -575,7 +569,8 @@ async def lifespan(app: FastAPI):
             preferred_sources = await get_preferred_sources_from_db()
             await multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources)
 
-        asyncio.create_task(run_sync_with_sources())
+        if settings.SYNC_STOCK_BASICS_ENABLED:
+            asyncio.create_task(run_sync_with_sources())
 
         # 配置调度：优先使用 CRON，其次使用 HH:MM
         # 🔥 定时任务也需要从数据库读取最新的数据源优先级
@@ -1112,19 +1107,8 @@ async def log_requests(request: Request, call_next):
     # 使用webapi logger记录请求
     logger = logging.getLogger("webapi")
     
-    # 对于 license/status 接口，记录更详细的信息
-    if request.url.path == "/api/license/status":
-        auth_header = request.headers.get("authorization", "无")
-        # 🔥 安全地访问 session（可能不存在或 SessionMiddleware 未安装）
-        session_id = "无"
-        try:
-            if "session" in request.scope:
-                session_id = request.session.get("user_id", "无")
-        except (AssertionError, AttributeError, KeyError):
-            session_id = "无"
-        logger.info(f"🔄 {request.method} {request.url.path} - 开始处理 (Authorization: {auth_header[:20] if len(auth_header) > 20 else auth_header}..., Session: {session_id})")
-    else:
-        logger.info(f"🔄 {request.method} {request.url.path} - 开始处理")
+    # Authorization 和 session 内容（包括片段）均不进入请求日志。
+    logger.info(f"🔄 {request.method} {request.url.path} - 开始处理")
 
     response = await call_next(request)
     process_time = time.time() - start_time
@@ -1143,6 +1127,7 @@ async def log_requests(request: Request, call_next):
 # 请求ID/Trace-ID 中间件（需作为最外层，放在函数式中间件之后）
 from app.middleware.request_id import RequestIDMiddleware
 app.add_middleware(RequestIDMiddleware)
+app.add_middleware(ReviewGuard)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):

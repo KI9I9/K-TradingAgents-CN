@@ -1,0 +1,11 @@
+FROM k-tradingagents-backend:arm64-d3ca3ec-logging-safe-20261016
+USER root
+COPY --chown=1000:1000 app/main.py /app/app/main.py
+COPY --chown=1000:1000 app/core/database.py /app/app/core/database.py
+COPY --chown=1000:1000 app/migration_guard.py /app/app/migration_guard.py
+COPY --chown=1000:1000 deploy/migration_review_entrypoint.py /app/deploy/migration_review_entrypoint.py
+COPY --chown=1000:1000 deploy/test_migration_guard.py /app/deploy/test_migration_guard.py
+USER appuser
+RUN python -B /app/deploy/test_migration_guard.py
+# No default production startup in this candidate.
+CMD ["python", "-B", "/app/deploy/migration_review_entrypoint.py"]

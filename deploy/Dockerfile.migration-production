@@ -1,0 +1,12 @@
+# Code-only derivative; base identity is checked by the offline build wrapper.
+FROM k-tradingagents-backend:arm64-d3ca3ec-review-safe-20261016-v2
+LABEL migration.launch.patch="final-cutover-gate-https-20261017-v1"
+COPY --chown=1000:1000 overlay/ /app/
+USER appuser
+# No dependency installation and no real app start during the build.
+RUN cd /app/deploy && python -B -m unittest test_migration_launch test_migration_restore test_migration_redis_history
+RUN python -I -B /app/deploy/test_tushare_https.py
+RUN python -I -B /app/deploy/test_migration_logging.py
+# Missing explicit approval must fail closed, even if invoked outside Compose.
+ENTRYPOINT ["python", "-B", "/app/deploy/migration_production_entrypoint.py"]
+CMD []
