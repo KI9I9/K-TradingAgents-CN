@@ -13,6 +13,9 @@ def now_local():
 
 async def save_enabled(scheduler, db, job_id, enabled):
     """保存显式开关选择；保存失败时恢复原调度状态。"""
+    from tradingagents.utils.tushare_manual import JOB_IDS
+    if enabled and job_id in JOB_IDS:
+        raise ValueError("Tushare 首期仅允许股票详情页的受限手动历史同步，自动任务不可启用")
     job = scheduler.get_job(job_id)
     if job is None:
         raise ValueError(f"任务不存在: {job_id}")
@@ -34,6 +37,8 @@ async def save_enabled(scheduler, db, job_id, enabled):
 
 async def restore_preferences(scheduler, db):
     """在调度器开始派发任务之前恢复已保存的开关。"""
+    from tradingagents.utils.tushare_manual import enforce_manual_jobs
+    await enforce_manual_jobs(scheduler, db)
     async for pref in db.scheduler_preferences.find({}):
         job_id = pref['_id']
         if scheduler.get_job(job_id) is None:

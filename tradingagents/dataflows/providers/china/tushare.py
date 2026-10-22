@@ -13,6 +13,8 @@ from datetime import datetime, date, timedelta
 import pandas as pd
 import asyncio
 import logging
+from tradingagents.utils.tushare_egress import TushareEgressStopped, raise_if_egress_blocked
+from tradingagents.utils.tushare_manual import CURRENT as _manual_current, validate_frame as _manual_frame
 
 from ..base_provider import BaseStockDataProvider
 from tradingagents.config.providers_config import get_provider_config
@@ -108,6 +110,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.warning("⚠️ [DB查询] 未找到激活的配置")
 
             self.logger.info("⚠️ [DB查询] 数据库中未找到有效的 Tushare Token")
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ [DB查询] 从数据库读取 Token 失败: {e}")
             import traceback
@@ -135,7 +139,7 @@ class TushareProvider(BaseStockDataProvider):
             token_candidates = []
             if db_token:
                 token_candidates.append(("database", db_token.strip()))
-            if env_token:
+            if env_token and env_token.strip() not in {value for _, value in token_candidates}:
                 token_candidates.append(("env", env_token.strip()))
 
             if not token_candidates:
@@ -178,6 +182,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.token_source = source
                     self.logger.info(f"✅ Tushare API Client 已就绪 (Token来源: {source})")
                     return True
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     self.logger.warning(f"⚠️ 初始化 Tushare API Client 失败 (Token来源: {source}): {e}")
                     continue
@@ -186,22 +192,29 @@ class TushareProvider(BaseStockDataProvider):
             self.connected = False
             return False
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 初始化 Tushare API Client 失败: {e}")
             self.api = None
             self.connected = False
             return False
 
-    def connect_sync(self) -> bool:
-        """同步初始化 Tushare API Client（兼容旧接口）。"""
-        return self._ensure_api_client(validate=True)
+    def connect_sync(self, validate: bool = False) -> bool:
+        """默认只准备客户端；validate=True 用于主动检查 stock_basic。
+
+        Tushare 各接口的权限和限额可能不同；stock_basic 失败不能
+        代表历史行情不可用。默认 True 仅表示客户端就绪，不表示已通过
+        联网认证或获得任何业务权限；实际请求仍由传输层校验并限额。
+        """
+        return self._ensure_api_client(validate=validate)
 
     async def connect(self) -> bool:
-        """异步初始化 Tushare API Client（兼容旧接口）。"""
+        """异步准备客户端；不进行 stock_basic 或其他联网探测。"""
         return await asyncio.to_thread(self.connect_sync)
     
     def is_available(self) -> bool:
-        """检查 Tushare API Client 是否可用。"""
+        """检查本地客户端是否就绪；不保证上游接口权限或网络可用。"""
         return self._ensure_api_client(validate=False)
     
     # ==================== 基础数据接口 ====================
@@ -223,6 +236,8 @@ class TushareProvider(BaseStockDataProvider):
             else:
                 self.logger.warning("⚠️ Tushare API 返回空数据")
                 return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取股票列表失败: {e}")
             return None
@@ -264,6 +279,8 @@ class TushareProvider(BaseStockDataProvider):
             self.logger.info(f"✅ 获取股票列表: {len(stock_list)}只")
             return stock_list
             
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取股票列表失败: {e}")
             return None
@@ -291,6 +308,8 @@ class TushareProvider(BaseStockDataProvider):
                 # 获取所有股票信息
                 return await self.get_stock_list()
                 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取股票基础信息失败 symbol={symbol}: {e}")
             return None
@@ -349,6 +368,8 @@ class TushareProvider(BaseStockDataProvider):
 
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             # 检查是否为限流错误
             if self._is_rate_limit_error(str(e)):
@@ -432,6 +453,8 @@ class TushareProvider(BaseStockDataProvider):
 
             return result
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             # 检查是否为限流错误
             if self._is_rate_limit_error(str(e)):
@@ -541,7 +564,8 @@ class TushareProvider(BaseStockDataProvider):
                             start_date=start_str,
                             end_date=end_str,
                             freq=freq,
-                            adj='qfq'  # 前复权（与同花顺一致）
+                            adj='qfq',  # 前复权（与同花顺一致）
+                            **({'retry_count': 1} if _manual_current.get() is not None else {})
                         )
                 except RuntimeError as runtime_error:
                     # 🔥 捕获 "cannot schedule new futures after shutdown" 错误
@@ -550,6 +574,8 @@ class TushareProvider(BaseStockDataProvider):
                         self._event_loop_closed = True  # 🔥 设置标志
                         return None
                     raise  # 其他 RuntimeError 继续抛出
+                raise_if_egress_blocked()  # SDK may swallow a stopped transport.
+                _manual_frame(df)
                 api_call_duration = time.perf_counter() - api_call_start
                 
                 # 根据耗时判断是否真正执行了网络请求
@@ -568,7 +594,10 @@ class TushareProvider(BaseStockDataProvider):
                         f"   返回类型: {type(df).__name__ if df is not None else 'None'}\n"
                         f"   返回数据: {'空DataFrame' if (df is not None and df.empty) else ('None' if df is None else f'{len(df)}行')}"
                     )
+            except TushareEgressStopped:
+                raise
             except Exception as api_exception:
+                raise_if_egress_blocked()  # SDK may replace a stop with OSError.
                 api_call_duration = time.perf_counter() - api_call_start
                 self.logger.error(
                     f"❌ [Tushare API调用] ts.pro_bar() 抛出异常\n"
@@ -599,6 +628,8 @@ class TushareProvider(BaseStockDataProvider):
             self.logger.info(f"✅ 获取{period}历史数据: {symbol} {len(df)}条记录 (前复权 qfq)")
             return df
             
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -634,6 +665,8 @@ class TushareProvider(BaseStockDataProvider):
             
             return None
             
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取每日基础数据失败 trade_date={trade_date}: {e}")
             return None
@@ -679,6 +712,8 @@ class TushareProvider(BaseStockDataProvider):
                 })
             self.logger.info(f"✅ Tushare 估值历史: {code} {start_date}~{end_date} → {len(records)}条")
             return {"source": "tushare", "data": records}
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ Tushare 估值历史失败 {code}: {e}")
             return {"source": "tushare", "data": []}
@@ -706,11 +741,15 @@ class TushareProvider(BaseStockDataProvider):
                         self.logger.info(f"✅ 找到最新交易日期: {formatted_date}")
                         return formatted_date
                         
+                except TushareEgressStopped:
+                    raise
                 except Exception:
                     continue
             
             return None
             
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 查找最新交易日期失败: {e}")
             return None
@@ -761,6 +800,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.debug(f"✅ {ts_code} 利润表数据获取成功: {len(income_df)} 条记录")
                 else:
                     self.logger.debug(f"⚠️ {ts_code} 利润表数据为空")
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.warning(f"❌ 获取{ts_code}利润表数据失败: {e}")
 
@@ -775,6 +816,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.debug(f"✅ {ts_code} 资产负债表数据获取成功: {len(balance_df)} 条记录")
                 else:
                     self.logger.debug(f"⚠️ {ts_code} 资产负债表数据为空")
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.warning(f"❌ 获取{ts_code}资产负债表数据失败: {e}")
 
@@ -789,6 +832,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.debug(f"✅ {ts_code} 现金流量表数据获取成功: {len(cashflow_df)} 条记录")
                 else:
                     self.logger.debug(f"⚠️ {ts_code} 现金流量表数据为空")
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.warning(f"❌ 获取{ts_code}现金流量表数据失败: {e}")
 
@@ -803,6 +848,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.debug(f"✅ {ts_code} 财务指标数据获取成功: {len(indicator_df)} 条记录")
                 else:
                     self.logger.debug(f"⚠️ {ts_code} 财务指标数据为空")
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.warning(f"❌ 获取{ts_code}财务指标数据失败: {e}")
 
@@ -817,6 +864,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.debug(f"✅ {ts_code} 主营业务构成数据获取成功: {len(mainbz_df)} 条记录")
                 else:
                     self.logger.debug(f"⚠️ {ts_code} 主营业务构成数据为空")
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.debug(f"获取{ts_code}主营业务构成数据失败: {e}")  # 主营业务数据不是必需的，保持debug级别
 
@@ -829,6 +878,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.warning(f"⚠️ {ts_code} 未获取到任何Tushare财务数据")
                 return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取Tushare财务数据失败 symbol={symbol}: {e}")
             return None
@@ -872,6 +923,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.debug(f"⚠️ {ts_code} 分红送股数据为空")
                 return []
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取Tushare分红送股数据失败 symbol={symbol}: {e}")
             return None
@@ -950,6 +1003,8 @@ class TushareProvider(BaseStockDataProvider):
                     else:
                         self.logger.debug(f"⚠️ {source} 未返回新闻数据")
 
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     self.logger.debug(f"从 {source} 获取新闻失败: {e}")
                     continue
@@ -972,6 +1027,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.warning("⚠️ 未获取到任何Tushare新闻数据")
                 return []
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             # 如果是权限问题，给出明确提示
             if any(keyword in str(e).lower() for keyword in ['权限', 'permission', 'unauthorized', 'access denied']):
@@ -1125,6 +1182,8 @@ class TushareProvider(BaseStockDataProvider):
         try:
             # Tushare时间格式: 2018-11-21 09:30:00
             return datetime.strptime(str(time_str), '%Y-%m-%d %H:%M:%S')
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.debug(f"解析Tushare新闻时间失败: {e}")
             return datetime.utcnow()
@@ -1207,6 +1266,8 @@ class TushareProvider(BaseStockDataProvider):
             self.logger.info(f"✅ {ts_code} 按期间获取财务数据完成: {len(financial_data_list)} 个报告期")
             return financial_data_list
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 按期间获取Tushare财务数据失败 symbol={symbol}: {e}")
             return None
@@ -1248,6 +1309,8 @@ class TushareProvider(BaseStockDataProvider):
 
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取Tushare财务指标失败 symbol={symbol}: {e}")
             return None
@@ -1578,6 +1641,8 @@ class TushareProvider(BaseStockDataProvider):
 
             return standardized_data
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 标准化Tushare财务数据失败: {e}")
             return {
@@ -1726,6 +1791,8 @@ class TushareProvider(BaseStockDataProvider):
 
             return ttm_value
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.warning(f"❌ TTM计算异常: {e}")
             return None
@@ -1817,6 +1884,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.info(f"✅ 获取同花顺{index_type}型板块列表: {len(df)} 个")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取同花顺板块列表失败: {e}")
             return None
@@ -1853,6 +1922,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.info(f"✅ 获取板块 {ts_code} 日线数据: {len(df)} 条")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取板块日线数据失败: {e}")
             return None
@@ -1894,6 +1965,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.info(f"✅ 获取股票 {con_code} 所属板块: {len(df)} 个")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取板块成分股失败: {e}")
             return None
@@ -1942,6 +2015,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.info(f"✅ 获取个股资金流向数据: {len(df)} 条")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取个股资金流向失败: {e}")
             return None
@@ -1993,6 +2068,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.info(f"✅ 获取行业板块资金流向: {len(df)} 条")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取行业板块资金流向失败: {e}")
             return None
@@ -2077,6 +2154,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.info(f"✅ 获取概念板块资金流向: {len(df)} 条")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取概念板块资金流向失败: {e}")
             return None
@@ -2117,6 +2196,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.info(f"✅ 获取行业资金流向数据: {len(df)} 条")
                 return df
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取行业资金流向失败: {e}")
             return None
@@ -2146,6 +2227,8 @@ class TushareProvider(BaseStockDataProvider):
                     self.logger.info(f"✅ 股票 {ticker} 所属行业: {industry}")
                     return str(industry)
             return None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取股票行业失败: {e}")
             return None
@@ -2188,6 +2271,8 @@ class TushareProvider(BaseStockDataProvider):
                 self.logger.warning(f"⚠️ 未找到 {industry} 行业的股票")
                 return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取行业股票列表失败: {e}")
             return None
@@ -2238,6 +2323,8 @@ class TushareProvider(BaseStockDataProvider):
             self.logger.info(f"✅ 获取 {industry} 行业 {len(result_df)} 只股票的每日指标")
             return result_df
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取行业股票每日指标失败: {e}")
             return None
@@ -2272,6 +2359,8 @@ class TushareProvider(BaseStockDataProvider):
             df = self.api.index_basic(**params)
             self.logger.info(f"✅ 获取指数基本信息: {len(df)} 条")
             return df
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取指数基本信息失败: {e}")
             return None
@@ -2317,6 +2406,8 @@ class TushareProvider(BaseStockDataProvider):
                     if cached_data is not None and not cached_data.empty if hasattr(cached_data, 'empty') else cached_data:
                         self.logger.info(f"📦 从缓存获取指数 {ts_code} 日线: {len(cached_data)} 条")
                         return cached_data
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.debug(f"⚠️ 缓存读取失败: {e}")
 
@@ -2343,10 +2434,14 @@ class TushareProvider(BaseStockDataProvider):
                         data_source="tushare_index"
                     )
                     self.logger.debug(f"💾 指数 {ts_code} 日线已缓存")
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     self.logger.debug(f"⚠️ 缓存保存失败: {e}")
 
             return df
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取指数日线失败: {e}")
             return None
@@ -2390,6 +2485,8 @@ class TushareProvider(BaseStockDataProvider):
                     if cached_data is not None and not cached_data.empty if hasattr(cached_data, 'empty') else cached_data:
                         self.logger.info(f"📦 从缓存获取指数每日指标: {len(cached_data)} 条")
                         return cached_data
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.debug(f"⚠️ 缓存读取失败: {e}")
 
@@ -2415,10 +2512,14 @@ class TushareProvider(BaseStockDataProvider):
                         end_date=trade_date,
                         data_source="tushare_index_basic"
                     )
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     self.logger.debug(f"⚠️ 缓存保存失败: {e}")
 
             return df
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取指数每日指标失败: {e}")
             return None
@@ -2463,6 +2564,8 @@ class TushareProvider(BaseStockDataProvider):
                     if cached_data is not None and not cached_data.empty if hasattr(cached_data, 'empty') else cached_data:
                         self.logger.info(f"📦 从缓存获取市场交易统计: {len(cached_data)} 条")
                         return cached_data
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 self.logger.debug(f"⚠️ 缓存读取失败: {e}")
 
@@ -2486,10 +2589,14 @@ class TushareProvider(BaseStockDataProvider):
                         end_date=trade_date,
                         data_source="tushare_daily_info"
                     )
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     self.logger.debug(f"⚠️ 缓存保存失败: {e}")
 
             return df
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取市场交易统计失败: {e}")
             return None
@@ -2520,6 +2627,8 @@ class TushareProvider(BaseStockDataProvider):
             df = self.api.index_weight(**params)
             self.logger.info(f"✅ 获取指数 {index_code} 成分权重: {len(df)} 条")
             return df
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取指数成分权重失败: {e}")
             return None
@@ -2576,6 +2685,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取沪深港通资金流向失败: {e}")
             return None
@@ -2631,6 +2742,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取融资融券数据失败: {e}")
             return None
@@ -2678,6 +2791,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取涨跌停统计失败: {e}")
             return None
@@ -2709,6 +2824,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取涨跌停价格失败: {e}")
             return None
@@ -2772,6 +2889,8 @@ class TushareProvider(BaseStockDataProvider):
             self.logger.info(f"✅ 获取每日市场统计: 涨{up_count}/跌{down_count}/平{flat_count}")
             return stats
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取每日市场统计失败: {e}")
             return None
@@ -2833,6 +2952,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取股权质押明细失败: {e}")
             return None
@@ -2892,6 +3013,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取审计意见失败: {e}")
             return None
@@ -2934,6 +3057,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取信息披露评级失败: {e}")
             return None
@@ -2989,6 +3114,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取股权激励失败: {e}")
             return None
@@ -3043,6 +3170,8 @@ class TushareProvider(BaseStockDataProvider):
                 return df
             return None
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             self.logger.error(f"❌ 获取违规处罚失败: {e}")
             return None

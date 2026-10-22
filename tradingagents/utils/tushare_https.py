@@ -9,7 +9,7 @@ import re
 import unicodedata
 
 import pandas as pd
-import requests
+from tradingagents.utils.tushare_egress import MainlandTransport, TushareEgressStopped
 
 
 class TushareTransportError(RuntimeError):
@@ -85,55 +85,18 @@ def _rejection_diagnostic(result, token):
 class HttpsTushareClient:
     def __init__(self, token, timeout=30):
         if not isinstance(token, str) or not token.strip():
-            raise TushareTransportError('tushare_token_missing')
+            raise TushareEgressStopped('token_invalid')
         if not isinstance(timeout, (int, float)) or not 0 < timeout <= 300:
-            raise TushareTransportError('tushare_timeout_invalid')
+            raise TushareEgressStopped('invalid_request')
         self.__token = token
         self.__timeout = timeout
 
     def query(self, api_name, fields='', **kwargs):
-        # API names cannot change the authority/path or inject query credentials.
-        if not isinstance(api_name, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', api_name):
-            raise TushareTransportError('tushare_api_name_invalid')
-        # This is an SDK payload discriminator, NOT a network request URL.
-        kwargs.setdefault('ts_type_name', 'http://api.waditu.com/dataapi')
-        payload = {'api_name': api_name, 'token': self.__token,
-                   'params': kwargs, 'fields': fields}
-        try:
-            # Per-request session: thread-safe policy, no global env mutation or
-            # inherited proxies/netrc/CA overrides; system requests CA verification.
-            with requests.Session() as session:
-                session.trust_env = False
-                with session.post('https://api.waditu.com/dataapi/' + api_name,
-                                  json=payload, timeout=self.__timeout,
-                                  verify=True, allow_redirects=False) as response:
-                    if 300 <= response.status_code < 400:
-                        raise TushareTransportError('tushare_redirect_blocked')
-                    if not 200 <= response.status_code < 300:
-                        raise TushareTransportError('tushare_http_error')
-                    result = response.json()
-                    if not isinstance(result, dict) or type(result.get('code')) is not int:
-                        raise TushareTransportError('tushare_response_invalid')
-                    if result['code'] != 0:
-                        # Do not echo msg: numeric code and fixed labels only.
-                        raise TushareTransportError(_rejection_diagnostic(result, self.__token))
-                    data = result['data']
-                    if (not isinstance(data, dict) or not isinstance(data.get('fields'), list)
-                            or not isinstance(data.get('items'), list)):
-                        raise TushareTransportError('tushare_response_invalid')
-                    return pd.DataFrame(data['items'], columns=data['fields'])
-        except TushareTransportError:
-            raise
-        except requests.exceptions.SSLError:
-            raise TushareTransportError('tushare_tls_failed') from None
-        except requests.exceptions.Timeout:
-            raise TushareTransportError('tushare_timeout') from None
-        except requests.exceptions.JSONDecodeError:
-            raise TushareTransportError('tushare_response_invalid') from None
-        except requests.exceptions.RequestException:
-            raise TushareTransportError('tushare_network_failed') from None
-        except Exception:
-            raise TushareTransportError('tushare_response_invalid') from None
+        # Candidate is closed unless BOTH the route and a finite permit are enabled.
+        # No direct/HTTP/alternate-Token fallback exists in this query path.
+        transport = MainlandTransport(self.__token, _rejection_diagnostic, self.__timeout)
+        table = transport.query(api_name, fields=fields, **kwargs)
+        return pd.DataFrame(table['items'], columns=table['fields'])
 
     def __getattr__(self, name):
         if name.startswith('_'):

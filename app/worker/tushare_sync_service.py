@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import logging
+from tradingagents.utils.tushare_egress import TushareEgressStopped, raise_if_egress_blocked
 
 from tradingagents.dataflows.providers.china.tushare import TushareProvider
 from app.services.stock_data_service import get_stock_data_service
@@ -66,10 +67,10 @@ class TushareSyncService:
         self.rate_limiter = get_tushare_rate_limiter(tier=tushare_tier, safety_margin=safety_margin)
     
     async def initialize(self):
-        """初始化同步服务"""
+        """准备同步服务；各业务接口在实际请求时独立校验权限。"""
         success = await self.provider.connect()
         if not success:
-            raise RuntimeError("❌ Tushare连接失败，无法启动同步服务")
+            raise RuntimeError("❌ Tushare客户端未就绪，请检查 SDK 和 Token 配置")
 
         # 初始化历史数据服务
         self.historical_service = await get_historical_data_service()
@@ -77,7 +78,7 @@ class TushareSyncService:
         # 初始化新闻数据服务
         self.news_service = await get_news_data_service()
 
-        logger.info("✅ Tushare同步服务初始化完成")
+        logger.info("✅ Tushare同步服务已就绪（尚未验证上游接口权限）")
     
     # ==================== 基础信息同步 ====================
     
@@ -118,6 +119,8 @@ class TushareSyncService:
                 mapping_result = await upsert_industry_mapping_from_records(stock_list, provider="tushare_fallback")
                 if mapping_result.get("total", 0) > 0:
                     logger.info(f"📊 系统行业映射集合已更新: {mapping_result['total']} 只股票")
+            except TushareEgressStopped:
+                raise
             except Exception as mapping_error:
                 logger.warning(f"⚠️ 更新系统行业映射集合失败，继续执行基础信息同步: {mapping_error}")
 
@@ -179,6 +182,8 @@ class TushareSyncService:
             
             return stats
             
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 股票基础信息同步失败: {e}")
             stats["errors"].append({"error": str(e), "context": "sync_stock_basic_info"})
@@ -187,6 +192,8 @@ class TushareSyncService:
             if job_id:
                 try:
                     await self._mark_task_failed(job_id, str(e))
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.error(f"❌ 更新任务失败状态时出错: {update_error}")
             
@@ -235,6 +242,8 @@ class TushareSyncService:
                         "context": "update_stock_basic_info"
                     })
 
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 batch_stats["error_count"] += 1
                 # 🔥 安全获取 code（处理 Pydantic 模型和字典）
@@ -388,6 +397,8 @@ class TushareSyncService:
                             "error": "更新数据库失败",
                             "context": "sync_realtime_quotes"
                         })
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     error_count += 1
                     stats["errors"].append({
@@ -411,6 +422,8 @@ class TushareSyncService:
 
             return stats
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             # 检查是否为限流错误
             error_msg = str(e)
@@ -469,6 +482,9 @@ class TushareSyncService:
 
         # 等待所有任务完成
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, TushareEgressStopped):
+                raise result
 
         # 统计结果
         for i, result in enumerate(results):
@@ -564,6 +580,8 @@ class TushareSyncService:
 
                 return await self.stock_service.update_market_quotes(symbol, quotes_data)
             return False
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             error_msg = str(e)
             # 检测限流错误，直接抛出让上层处理
@@ -682,6 +700,8 @@ class TushareSyncService:
                             logger.info(f"📋 从 stock_basic_info 获取到 {len(symbols)} 只唯一股票（已去重，已排除退市股票，已重新创建连接）")
                         else:
                             raise
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     logger.error(f"❌ 获取股票列表失败，使用备用方法: {e}")
                     # 🔥 如果发生事件循环相关错误，重新创建数据库连接
@@ -844,6 +864,8 @@ class TushareSyncService:
                             logger.warning(f"⚠️ 执行记录中没有有效的 processed_items ({processed_items})，将从0开始执行")
                     else:
                         logger.info(f"📊 未找到挂起或运行中的执行记录，将从0开始执行")
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     logger.warning(f"⚠️ 检查挂起任务失败，从开始执行: {e}", exc_info=True)
             
@@ -925,6 +947,8 @@ class TushareSyncService:
                                 logger.error(f"❌ {symbol}: Tushare重新连接失败，跳过该股票")
                                 stats["error_count"] += 1
                                 continue
+                        except TushareEgressStopped:
+                            raise
                         except Exception as reconnect_error:
                             logger.error(f"❌ {symbol}: Tushare重新连接异常: {reconnect_error}")
                             stats["error_count"] += 1
@@ -937,6 +961,8 @@ class TushareSyncService:
                         df = await self.provider.get_historical_data(symbol, symbol_start_date, end_date, period=period)
                         api_duration = (datetime.now() - api_start).total_seconds()
                         logger.debug(f"🔍 [sync_historical_data] get_historical_data 返回: df={'None' if df is None else ('空' if df.empty else f'{len(df)}行')}, 耗时={api_duration:.3f}秒")
+                    except TushareEgressStopped:
+                        raise
                     except Exception as api_error:
                         api_duration = (datetime.now() - api_start).total_seconds()
                         import traceback
@@ -1128,6 +1154,8 @@ class TushareSyncService:
                                    f"等待次数: {limiter_stats['total_waits']}, "
                                    f"总等待时间: {limiter_stats['total_wait_time']:.1f}秒")
 
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     import traceback
                     error_details = traceback.format_exc()
@@ -1323,6 +1351,8 @@ class TushareSyncService:
                                 total_items=total_processed,
                                 processed_items=total_processed  # 已处理的（包括成功和失败的）
                             )
+                        except TushareEgressStopped:
+                            raise
                         except Exception as progress_error:
                             logger.warning(f"⚠️ 更新最终进度时出错: {progress_error}")
                     
@@ -1345,11 +1375,15 @@ class TushareSyncService:
                     # 如果成功率 >= 80%，即使有错误也不设置 error_message，让 mark_job_completed 标记为 success
                     
                     await mark_job_completed(job_id, stats, error_message)
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.warning(f"⚠️ 更新任务完成状态时出错: {update_error}")
 
             return stats
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -1371,6 +1405,8 @@ class TushareSyncService:
                 try:
                     from app.services.scheduler_service import mark_job_completed
                     await mark_job_completed(job_id, None, str(e))
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.warning(f"⚠️ 更新任务失败状态时出错: {update_error}")
             
@@ -1398,6 +1434,8 @@ class TushareSyncService:
 
             return saved_count
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 保存{period}数据失败 {symbol}: {e}")
             return 0
@@ -1483,6 +1521,8 @@ class TushareSyncService:
                 {"code": 1}  # 只查询 code 字段，提高性能
             )
             return stock_info is not None
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.debug(f"检查股票 {symbol} 是否存在时出错: {e}")
             return False  # 出错时返回 False，不影响主流程
@@ -1554,6 +1594,8 @@ class TushareSyncService:
             # 默认返回30天前（确保不漏数据）
             return (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 获取最后同步日期失败 {symbol}: {e}")
             # 出错时返回30天前，确保不漏数据
@@ -1668,6 +1710,8 @@ class TushareSyncService:
                                 stats["cancelled"] = True
                                 raise
 
+                except TushareEgressStopped:
+                    raise
                 except Exception as e:
                     stats["error_count"] += 1
                     stats["errors"].append({
@@ -1703,11 +1747,15 @@ class TushareSyncService:
                         error_message = f"同步完成但有 {error_count} 个错误: {', '.join(error_messages)}"
                     
                     await mark_job_completed(job_id, stats, error_message)
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.warning(f"⚠️ 更新任务完成状态时出错: {update_error}")
 
             return stats
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 财务数据同步失败: {e}")
             stats["errors"].append({"error": str(e), "context": "sync_financial_data"})
@@ -1717,6 +1765,8 @@ class TushareSyncService:
                 try:
                     from app.services.scheduler_service import mark_job_completed
                     await mark_job_completed(job_id, None, str(e))
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.warning(f"⚠️ 更新任务失败状态时出错: {update_error}")
             
@@ -1742,6 +1792,8 @@ class TushareSyncService:
 
             return saved_count > 0
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 保存 {symbol} 财务数据失败: {e}")
             return False
@@ -1792,6 +1844,8 @@ class TushareSyncService:
                 "status_time": datetime.utcnow()
             }
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 获取同步状态失败: {e}", exc_info=True)
             return {"error": str(e)}
@@ -1908,11 +1962,15 @@ class TushareSyncService:
                         error_message = f"同步完成但有 {error_count} 个错误: {', '.join(error_messages)}"
                     
                     await mark_job_completed(job_id, stats, error_message)
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.warning(f"⚠️ 更新任务完成状态时出错: {update_error}")
 
             return stats
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 新闻数据同步失败: {e}")
             stats["errors"].append({"error": str(e), "context": "sync_news_data"})
@@ -1922,6 +1980,8 @@ class TushareSyncService:
                 try:
                     from app.services.scheduler_service import mark_job_completed
                     await mark_job_completed(job_id, None, str(e))
+                except TushareEgressStopped:
+                    raise
                 except Exception as update_error:
                     logger.warning(f"⚠️ 更新任务失败状态时出错: {update_error}")
             
@@ -1969,6 +2029,8 @@ class TushareSyncService:
                 # 🔥 API限流：成功后休眠
                 await asyncio.sleep(0.2)
 
+            except TushareEgressStopped:
+                raise
             except Exception as e:
                 batch_stats["error_count"] += 1
                 error_msg = f"{symbol}: {str(e)}"
@@ -2027,6 +2089,8 @@ class TushareSyncService:
             finally:
                 sync_client.close()
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 检查任务停止标记失败: {e}")
             return False
@@ -2086,6 +2150,8 @@ class TushareSyncService:
             sync_client.close()
             logger.info(f"✅ 任务 {job_id} 进度更新成功: {progress}% - {message}")
 
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             if "TaskCancelledException" in str(type(e).__name__):
                 raise
@@ -2115,6 +2181,8 @@ class TushareSyncService:
                 error_message = f"同步完成但有 {error_count} 个错误: {', '.join(error_messages)}"
             
             await mark_job_completed(job_id, stats, error_message)
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 标记任务完成失败: {e}", exc_info=True)
 
@@ -2130,6 +2198,8 @@ class TushareSyncService:
         try:
             from app.services.scheduler_service import mark_job_completed
             await mark_job_completed(job_id, None, error_message)
+        except TushareEgressStopped:
+            raise
         except Exception as e:
             logger.error(f"❌ 标记任务失败状态时出错: {e}", exc_info=True)
 

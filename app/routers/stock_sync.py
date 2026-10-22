@@ -758,6 +758,9 @@ async def sync_single_stock(
     current_user: dict = Depends(get_current_user)
 ):
     """提交单股同步任务，立即返回任务状态。"""
+    if request.data_source == "tushare":
+        from app.services.tushare_manual_sync import submit
+        return await submit(request, "single", current_user)
     try:
         payload = _request_to_dict(request)
         task_doc = await _create_stock_sync_task("single", payload, current_user)
@@ -994,6 +997,9 @@ async def sync_batch_stocks(
     current_user: dict = Depends(get_current_user)
 ):
     """提交批量同步任务，立即返回任务状态。"""
+    if request.data_source == "tushare":
+        from app.services.tushare_manual_sync import submit
+        return await submit(request, "batch", current_user)
     try:
         payload = _request_to_dict(request)
         task_doc = await _create_stock_sync_task("batch", payload, current_user)
@@ -1153,3 +1159,13 @@ async def sync_industry_from_official(current_user: dict = Depends(get_current_u
         logger.error(f"❌ 行业数据同步失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"行业数据同步失败: {str(e)}")
 
+
+
+@router.get("/tushare-manual-policy")
+async def get_tushare_manual_policy(current_user: dict = Depends(get_current_user)):
+    from tradingagents.utils.tushare_manual import DailyGate
+    from tradingagents.utils.tushare_egress import TushareEgressStopped
+    try:
+        return ok(data=DailyGate().status())
+    except TushareEgressStopped as error:
+        raise HTTPException(status_code=409, detail=error.reason) from None

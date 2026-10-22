@@ -223,11 +223,15 @@ async def _test_single_adapter(adapter) -> dict:
                     # 重置连接状态
                     provider.connected = False
                     provider.token_source = None
-                    # 重新连接
-                    await asyncio.wait_for(
-                        asyncio.to_thread(provider.connect_sync),
+                    # 用户主动测试时才查询 stock_basic；默认初始化不联网。
+                    result["verification_api"] = "stock_basic"
+                    validated = await asyncio.wait_for(
+                        asyncio.to_thread(provider.connect_sync, validate=True),
                         timeout=test_timeout
                     )
+                    if not validated:
+                        result["message"] = "❌ stock_basic 检查未通过（不代表历史行情接口不可用）"
+                        return result
 
             # 在线程池中运行 is_available() 检查
             is_available = await asyncio.wait_for(
@@ -243,14 +247,16 @@ async def _test_single_adapter(adapter) -> dict:
                 if adapter.name == "tushare" and hasattr(adapter, 'get_token_source'):
                     token_source = adapter.get_token_source()
 
+                success_label = ("stock_basic 检查通过（不代表其他接口权限）"
+                                 if result.get("verification_api") else "连接成功")
                 if token_source == 'database':
-                    result["message"] = "✅ 连接成功 (Token来源: 数据库)"
+                    result["message"] = f"✅ {success_label} (Token来源: 数据库)"
                     result["token_source"] = "database"
                 elif token_source == 'env':
-                    result["message"] = "✅ 连接成功 (Token来源: .env)"
+                    result["message"] = f"✅ {success_label} (Token来源: .env)"
                     result["token_source"] = "env"
                 else:
-                    result["message"] = "✅ 连接成功"
+                    result["message"] = f"✅ {success_label}"
 
                 logger.info(f"✅ {adapter.name} 连通性测试成功，Token来源: {token_source}")
             else:
@@ -263,7 +269,8 @@ async def _test_single_adapter(adapter) -> dict:
             logger.warning(f"⚠️ {adapter.name} 连接超时")
         except Exception as e:
             result["available"] = False
-            result["message"] = f"❌ 连接失败: {str(e)}"
+            check_label = "stock_basic 检查" if result.get("verification_api") else "连接"
+            result["message"] = f"❌ {check_label}失败: {str(e)}"
             logger.error(f"❌ {adapter.name} 连接失败: {e}")
 
     except Exception as e:

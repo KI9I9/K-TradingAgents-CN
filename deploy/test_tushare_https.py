@@ -1,164 +1,52 @@
-"""Offline transport tests: fake Token only, no app initialization or sockets."""
+"""Offline SDK adapter/classifier regressions for the guarded mainland transport.
+
+Run as a separate process; uses synthetic values and never starts the app.
+TLS, request budgets, persistence and stopping are covered by test_tushare_egress.
+"""
 import ast
-import contextlib
-import datetime
-import importlib.metadata
-import importlib.util
-import io
-import json
-import os
 from pathlib import Path
 import sys
-import traceback
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from offline_tushare_support import SOURCE, load, egress, deny_external
 
-def deny_network(event, args):
-    if event in {'socket.connect', 'socket.getaddrinfo', 'socket.sendto', 'subprocess.Popen'}:
-        raise RuntimeError('OfflineNetworkBlocked')
-
-
-sys.addaudithook(deny_network)
-import pandas as pd
-import requests
-
-ROOT = Path(__file__).resolve().parent.parent
+sys.addaudithook(deny_external)
+transport = load('tradingagents.utils.tushare_https', SOURCE/'tradingagents/utils/tushare_https.py')
 FAKE = 'SYNTHETIC_TOKEN_NOT_A_CREDENTIAL_20261017'
-SPEC = importlib.util.spec_from_file_location('https_transport', ROOT / 'tradingagents/utils/tushare_https.py')
-transport = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(transport)
+ROOT = SOURCE
 
 
-def response(data=None, status=200):
-    res = requests.Response()
-    res.status_code = status
-    res._content = json.dumps(data if data is not None else {
-        'code': 0, 'data': {'fields': ['ts_code', 'close'], 'items': [['FAKE.SZ', 1.25]]}
-    }).encode()
-    # Match a fully buffered real requests response so close() does not attempt
-    # to close a nonexistent raw socket in this socket-free fixture.
-    res._content_consumed = True
-    return res
+class AdapterTests(unittest.TestCase):
+    def test_guarded_transport_keeps_arguments_and_dataframe(self):
+        fake = Mock()
+        fake.query.return_value = {'fields': ['ts_code', 'close'], 'items': [['FAKE.SZ', 1.25]]}
+        with patch.object(transport, 'MainlandTransport', return_value=fake) as factory:
+            frame = transport.create_tushare_client(FAKE).daily(fields='ts_code,close', limit=1)
+        factory.assert_called_once_with(FAKE, transport._rejection_diagnostic, 30)
+        fake.query.assert_called_once_with('daily', fields='ts_code,close', limit=1)
+        self.assertEqual(frame.to_dict('records'), [{'ts_code': 'FAKE.SZ', 'close': 1.25}])
 
+    def test_stopped_transport_is_propagated_without_fallback(self):
+        fake = Mock()
+        error = egress.TushareEgressStopped('usage_limit', 40203)
+        fake.query.side_effect = error
+        with patch.object(transport, 'MainlandTransport', return_value=fake) as factory:
+            with self.assertRaises(egress.TushareEgressStopped) as caught:
+                transport.create_tushare_client(FAKE).daily()
+        self.assertIs(caught.exception, error)
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(fake.query.call_count, 1)
+        self.assertNotIn(FAKE, str(caught.exception))
 
-class TransportTests(unittest.TestCase):
-    def setUp(self):
-        self.sent = []
-        self.reply = response()
-        self.error = None
-        def send(session, request, **kwargs):
-            self.sent.append((session, request, kwargs))
-            if self.error is not None:
-                raise self.error
-            return self.reply
-        self.sender = patch.object(requests.Session, 'send', send)
-        self.sender.start()
-        self.addCleanup(self.sender.stop)
-        self.api = transport.create_tushare_client(FAKE)
-
-    def test_01_https_verified_no_redirect_proxy_netrc_or_env_changes(self):
-        fake_env = {'HTTP_PROXY': 'http://proxy.invalid:9999', 'HTTPS_PROXY': 'http://proxy.invalid:9999',
-                    'ALL_PROXY': 'http://proxy.invalid:9999', 'REQUESTS_CA_BUNDLE': '/no/such/ca',
-                    'NETRC': '/no/such/netrc'}
-        with patch.dict(os.environ, fake_env), patch('requests.sessions.get_netrc_auth', side_effect=AssertionError('netrc read')):
-            before = dict(os.environ)
-            df = self.api.stock_basic(fields='ts_code,close', limit=1)
-            self.assertEqual(dict(os.environ), before)
-        self.assertEqual(df.to_dict('records'), [{'ts_code': 'FAKE.SZ', 'close': 1.25}])
-        self.assertEqual(len(self.sent), 1)
-        session, req, opts = self.sent[0]
-        self.assertFalse(session.trust_env)
-        self.assertEqual(req.url, 'https://api.waditu.com/dataapi/stock_basic')
-        self.assertEqual(req.method, 'POST')
-        self.assertIs(opts['verify'], True)
-        self.assertIs(opts['allow_redirects'], False)
-        self.assertEqual(opts['proxies'], {})
-        self.assertEqual(opts['timeout'], 30)
-        self.assertNotIn('Authorization', req.headers)
-        self.assertNotIn('Cookie', req.headers)
-        self.assertEqual(session.get_adapter(req.url).max_retries.total, 0)
-
-    def test_02_payload_and_dataframe_match_installed_sdk(self):
-        dist = importlib.metadata.distribution('tushare')
-        self.assertEqual(dist.version, '1.4.29')
-        spec = importlib.util.spec_from_file_location('pinned_sdk_client', dist.locate_file('tushare/pro/client.py'))
-        sdk = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(sdk)
-        captured = []
-        def old_post(url, **kwargs):
-            captured.append((url, kwargs))
-            return response()
-        with patch.object(sdk.requests, 'post', old_post):
-            old = sdk.DataApi(FAKE).query('trade_cal', fields='ts_code,close', exchange='SSE')
-        new = self.api.query('trade_cal', fields='ts_code,close', exchange='SSE')
-        pd.testing.assert_frame_equal(old, new)
-        _, request, opts = self.sent[0]
-        self.assertEqual(request.url, captured[0][0].replace('http://', 'https://', 1))
-        self.assertEqual(json.loads(request.body), captured[0][1]['json'])
-        self.assertEqual(opts['timeout'], captured[0][1]['timeout'])
-
-    def test_03_explicit_discriminator_and_empty_data(self):
-        self.reply = response({'code': 0, 'data': {'fields': ['ts_code'], 'items': []}})
-        df = self.api.daily(ts_type_name='SYNTHETIC_DISCRIMINATOR')
-        self.assertTrue(df.empty)
-        self.assertEqual(list(df.columns), ['ts_code'])
-        self.assertEqual(json.loads(self.sent[0][1].body)['params']['ts_type_name'], 'SYNTHETIC_DISCRIMINATOR')
-
-    def test_04_redirects_do_not_forward_token_or_retry(self):
-        for status in (301, 302, 303, 307, 308):
-            with self.subTest(status=status):
-                self.sent.clear()
-                self.reply = response({'msg': FAKE}, status=status)
-                self.reply.headers['Location'] = 'http://untrusted.invalid/' + FAKE
-                with self.assertRaisesRegex(transport.TushareTransportError, '^tushare_redirect_blocked$'):
-                    self.api.stock_basic()
-                self.assertEqual(len(self.sent), 1)
-
-    def test_05_http_and_api_errors_never_echo_server_body(self):
-        for reply, category in ((response({'msg': FAKE}, 401), 'tushare_http_error'),
-                                (response({'code': -1, 'msg': FAKE}), 'tushare_api_rejected code=-1 reason=unclassified window=unknown'),
-                                (response({'code': FAKE}), 'tushare_response_invalid'),
-                                (response({'code': 0, 'data': FAKE}), 'tushare_response_invalid')):
-            self.reply = reply
-            with self.assertRaisesRegex(transport.TushareTransportError, '^' + category + '$'):
-                self.api.trade_cal()
-
-    def test_06_tls_timeouts_network_errors_sanitized_and_no_fallback(self):
-        for error, category in ((requests.exceptions.SSLError(FAKE), 'tushare_tls_failed'),
-                                (requests.exceptions.Timeout(FAKE), 'tushare_timeout'),
-                                (requests.exceptions.ConnectionError(FAKE), 'tushare_network_failed')):
-            self.sent.clear()
-            self.error = error
-            try:
-                self.api.daily()
-            except transport.TushareTransportError as caught:
-                self.assertEqual(str(caught), category)
-                self.assertNotIn(FAKE, ''.join(traceback.format_exception(caught)))
-            else:
-                self.fail('Expected safe failure')
-            self.assertEqual(len(self.sent), 1)
-            self.assertTrue(self.sent[0][1].url.startswith('https://'))
-
-    def test_07_bad_json_sanitized(self):
-        self.reply._content = FAKE.encode()
-        with self.assertRaisesRegex(transport.TushareTransportError, '^tushare_response_invalid$'):
-            self.api.daily()
-
-    def test_08_no_implicit_token_persistence_and_invalid_api_name(self):
-        for bad in ('', None, 123, '   '):
-            with self.assertRaisesRegex(transport.TushareTransportError, '^tushare_token_missing$'):
-                transport.create_tushare_client(bad)
-        for name in ('../token', '//evil.invalid', 'daily?x=1', 'https://evil.invalid', ''):
-            with self.assertRaisesRegex(transport.TushareTransportError, '^tushare_api_name_invalid$'):
-                self.api.query(name)
-        self.assertEqual(self.sent, [])
-        self.assertNotIn(FAKE, repr(self.api))
-
-    def test_09_sessions_are_not_shared(self):
-        self.api.daily()
-        self.api.daily()
-        self.assertIsNot(self.sent[0][0], self.sent[1][0])
+    def test_invalid_token_and_private_attributes_fail_locally(self):
+        for token in ('', None, 123, '   '):
+            with self.assertRaisesRegex(egress.TushareEgressStopped, 'token_invalid'):
+                transport.create_tushare_client(token)
+        api = transport.create_tushare_client(FAKE)
+        with self.assertRaises(AttributeError):
+            api._unexpected_private_attribute
+        self.assertNotIn(FAKE, repr(api))
 
     def test_10_both_callsites_use_shared_factory(self):
         paths = ('app/services/config_service.py', 'tradingagents/dataflows/providers/china/tushare.py')
@@ -169,38 +57,18 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                                  and n.func.attr == 'pro_api' for n in ast.walk(tree)))
 
-    def test_11_real_sdk_pro_bar_consumes_adapted_api_without_own_client(self):
-        dist = importlib.metadata.distribution('tushare')
-        tree = ast.parse(Path(dist.locate_file('tushare/pro/data_pro.py')).read_text())
-        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'pro_bar')
-        namespace = {'datetime': datetime, 'FORMAT': lambda x: '%.2f' % x}
-        exec(compile(ast.Module(body=[fn], type_ignores=[]), '<pinned-pro-bar>', 'exec'), namespace)
-        self.reply = response({'code': 0, 'data': {'fields': ['ts_code', 'trade_date', 'close'],
-                               'items': [['FAKE.SZ', '20260102', 2.0], ['FAKE.SZ', '20260101', 1.0]]}})
-        with contextlib.redirect_stdout(io.StringIO()) as capture:
-            df = namespace['pro_bar'](ts_code='FAKE.SZ', api=self.api, start_date='20260101', end_date='20260102',
-                                      freq='D', adj=None, fields='ts_code,trade_date,close')
-        self.assertEqual(len(df), 2)
-        self.assertEqual(len(self.sent), 1)
-        self.assertEqual(json.loads(self.sent[0][1].body)['api_name'], 'daily')
-        self.assertEqual(capture.getvalue(), '')
+
+
+class ClassifierTests(unittest.TestCase):
+    def setUp(self):
+        self.api = transport.create_tushare_client(FAKE)
 
     def assert_rejection(self, payload, expected, api=None):
-        self.reply = response(payload)
-        start_count = len(self.sent)
-        try:
-            (api or self.api).stock_basic(list_status='L', limit=1)
-        except transport.TushareTransportError as caught:
-            self.assertEqual(str(caught), expected)
-            self.assertEqual(caught.args, (expected,))
-            self.assertFalse(vars(caught))
-            # Standard traceback rendering must not expose response or Token.
-            rendered = ''.join(traceback.format_exception(caught))
-            self.assertNotIn(FAKE, rendered)
-            self.assertNotIn('PRIVATE_REPLY_SENTINEL', rendered)
-        else:
-            self.fail('Expected safe API rejection')
-        self.assertEqual(len(self.sent) - start_count, 1)
+        token = (api or self.api)._HttpsTushareClient__token
+        diagnostic = transport._rejection_diagnostic(payload, token)
+        self.assertEqual(diagnostic, expected)
+        self.assertNotIn(token, diagnostic)
+        self.assertNotIn('PRIVATE_REPLY_SENTINEL', diagnostic)
 
     def test_12_usage_ceiling_without_invented_window_or_code_mapping(self):
         self.assert_rejection(
@@ -209,6 +77,7 @@ class TransportTests(unittest.TestCase):
         self.assert_rejection(
             {'code': 40203, 'msg': 'PRIVATE_REPLY_SENTINEL'},
             'tushare_api_rejected code=40203 reason=unclassified window=unknown')
+
 
     def test_13_frequency_windows_and_permission_document_not_denial(self):
         for text, window in (
@@ -222,6 +91,7 @@ class TransportTests(unittest.TestCase):
             with self.subTest(window=window):
                 self.assert_rejection({'code': 40203, 'msg': text},
                     'tushare_api_rejected code=40203 reason=usage_limit window=' + window)
+
 
     def test_14_permissions_points_and_other_fixed_categories(self):
         for message, reason in (
@@ -237,6 +107,7 @@ class TransportTests(unittest.TestCase):
                 self.assert_rejection({'code': 2002, 'msg': message},
                     'tushare_api_rejected code=2002 reason=' + reason + ' window=unknown')
 
+
     def test_15_missing_malformed_oversized_and_escaped_messages(self):
         for msg in (None, 42, False, {'message': FAKE}, [FAKE], '次数已达上限' * 1000,
                     r'\u79ef\u5206\u4e0d\u8db3', 'PRIVATE_REPLY_SENTINEL\n' + FAKE):
@@ -245,13 +116,11 @@ class TransportTests(unittest.TestCase):
         self.assert_rejection({'code': 40203},
             'tushare_api_rejected code=40203 reason=unclassified window=unknown')
 
-    def test_16_only_small_integer_code_and_no_echoed_secret_attributes(self):
-        self.assert_rejection({'code': 10**40, 'msg': FAKE, 'token': FAKE, 'data': {'private': FAKE}},
-            'tushare_api_rejected code=unknown reason=unclassified window=unknown')
-        for code in (True, '40203', None, 40203.0):
-            self.reply = response({'code': code, 'msg': '调用次数已达上限 ' + FAKE})
-            with self.assertRaisesRegex(transport.TushareTransportError, '^tushare_response_invalid$'):
-                self.api.stock_basic()
+
+    def test_16_only_small_integer_code_is_reported(self):
+        for code in (10**40, True, '40203', None, 40203.0):
+            self.assert_rejection({'code': code, 'msg': FAKE, 'token': FAKE},
+                'tushare_api_rejected code=unknown reason=unclassified window=unknown')
 
     def test_17_echoed_token_cannot_invent_a_reason(self):
         fake_token = 'synthetic-调用次数已达上限-token'
@@ -263,17 +132,13 @@ class TransportTests(unittest.TestCase):
         self.assert_rejection({'code': 40203, 'msg': 'SYNTHETIC-调用次数已达上限-token'},
             'tushare_api_rejected code=40203 reason=unclassified window=unknown', api=api)
 
+
     def test_18_reason_fields_and_full_width_numeric_normalization(self):
         self.assert_rejection({'code': 40203, 'message': '每１小时最多访问一次'},
             'tushare_api_rejected code=40203 reason=usage_limit window=hour')
         self.assert_rejection({'code': 40203, 'detail': 'Quota exhausted'},
             'tushare_api_rejected code=40203 reason=usage_limit window=unknown')
 
-    def test_19_success_messages_do_not_change_success_path(self):
-        self.reply = response({'code': 0, 'msg': '调用次数已达上限 ' + FAKE,
-            'data': {'fields': ['value'], 'items': [[1]]}})
-        self.assertEqual(self.api.stock_basic().to_dict('records'), [{'value': 1}])
-        self.assertEqual(len(self.sent), 1)
 
 
 if __name__ == '__main__':

@@ -322,10 +322,8 @@ async def lifespan(app: FastAPI):
     # 恢复已启用的 MCP 服务器工具到 ToolRegistry
     # 后端重启后，MCP 工具不会自动注册，需要从 mcp_server_configs 集合恢复
     try:
-        from app.pro.services.mcp_service import MCPService
-        mcp_service = MCPService(db)
-        await mcp_service.restore_enabled_servers()
-        logger.info("✅ MCP 服务器工具恢复完成")
+        from tradingagents.utils.tushare_manual import restore_optional_mcp
+        await restore_optional_mcp(db, logger)
     except Exception as e:
         logger.error(f"❌ MCP 服务器工具恢复失败: {e}", exc_info=True)
 
