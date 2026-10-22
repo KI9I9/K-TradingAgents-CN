@@ -10,6 +10,11 @@ from .base import DataSourceAdapter
 
 logger = logging.getLogger(__name__)
 
+# 单个列表来源的时限。外层有界取数是 45 秒，三条回退链路必须都能挤进去：
+# 首条链路的内部 requests 未设 timeout，若不单独设限会独占整个预算，
+# 使后面东方财富/新浪的回退路径永远没有机会执行。
+STOCK_LIST_SOURCE_TIMEOUT_SECONDS = 12
+
 
 class AKShareAdapter(DataSourceAdapter):
     """AKShare数据源适配器"""
@@ -102,6 +107,36 @@ class AKShareAdapter(DataSourceAdapter):
 
         return normalized[["symbol", "name", "ts_code", "area", "industry", "market", "list_date"]]
 
+    @staticmethod
+    def _call_with_timeout(fetcher, timeout_seconds: int, source_name: str):
+        """在守护线程里调用取数函数，超过时限则放弃该来源。
+
+        AKShare 的列表函数不接受 timeout 参数，内部请求也没有超时，因此无法
+        通过参数约束。这里用守护线程 + join(时限) 给每个来源设置独立预算：
+        超时返回 None 交由调用方跳到下一个来源。线程本身无法强制终止，但它
+        运行在有界取数子进程中，子进程退出时会一并回收。
+        """
+        import threading
+
+        outcome = {}
+
+        def _target():
+            try:
+                outcome["value"] = fetcher()
+            except BaseException as exc:  # noqa: BLE001 - 原样抛回调用方分类
+                outcome["error"] = exc
+
+        worker = threading.Thread(
+            target=_target, name=f"stock-list-{source_name}", daemon=True
+        )
+        worker.start()
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            return None
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("value")
+
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """获取股票列表，优先使用 stock_info_a_code_name，失败时回退到东方财富实时列表。"""
         if not self.is_available():
@@ -117,7 +152,15 @@ class AKShareAdapter(DataSourceAdapter):
         for source_name, fetcher in data_sources:
             try:
                 logger.info(f"AKShare: Fetching stock list from {source_name}()...")
-                df = fetcher()
+                df = self._call_with_timeout(
+                    fetcher, STOCK_LIST_SOURCE_TIMEOUT_SECONDS, source_name
+                )
+                if df is None:
+                    logger.warning(
+                        "AKShare: %s() 超过 %ss 未返回，跳过该来源",
+                        source_name, STOCK_LIST_SOURCE_TIMEOUT_SECONDS,
+                    )
+                    continue
                 normalized = self._normalize_stock_list(df)
                 if normalized is not None and not normalized.empty:
                     logger.info(f"AKShare: Successfully fetched {len(normalized)} stocks from {source_name}()")
