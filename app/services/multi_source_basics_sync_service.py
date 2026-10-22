@@ -31,6 +31,11 @@ STATUS_COLLECTION = "sync_status"
 JOB_KEY = "stock_basics_multi_source"
 STOCK_LIST_FETCH_TIMEOUT_SECONDS = 45
 
+# 远端股票列表全部失败时，用库内已有记录充当兜底宇宙。
+# 下限用于防止残缺列表把同步范围缩小；上限防止异常放大时的内存与写入压力。
+LOCAL_STOCK_UNIVERSE_MIN_RECORDS = 1000
+LOCAL_STOCK_UNIVERSE_MAX_RECORDS = 20000
+
 
 class DataSourcePriority(Enum):
     """数据源优先级枚举"""
@@ -297,6 +302,80 @@ class MultiSourceBasicsSyncService:
             )
         return normalized or None
 
+    @staticmethod
+    def _ts_code_from_symbol(symbol: str) -> str:
+        """由 6 位代码推断 ts_code；规则与 akshare_adapter 保持一致。"""
+        code = str(symbol or "").zfill(6)
+        if not code or code == "000000":
+            return ""
+        if code.startswith(("60", "68", "90", "50", "51", "52", "58", "56", "11")):
+            return f"{code}.SH"
+        if code.startswith(("00", "30", "20", "15", "16", "12")):
+            return f"{code}.SZ"
+        if code.startswith(("8", "4", "92")):
+            return f"{code}.BJ"
+        return f"{code}.SZ"
+
+    async def _load_local_stock_universe(self, db: AsyncIOMotorDatabase):
+        """用库内已有 (code, source) 记录充当股票列表兜底宇宙。
+
+        仅在远端列表全部失败时调用。返回的 DataFrame 自带每条记录的 `source`，
+        写回时沿用原 source，因此命中的是既有 (code, source) 文档：既不产生重复
+        记录，也不会用空值覆盖已有的行业 / 上市日期等字段。
+        """
+        try:
+            import pandas as pd
+
+            projection = {
+                "_id": 0, "code": 1, "symbol": 1, "name": 1, "ts_code": 1,
+                "market": 1, "area": 1, "industry": 1, "list_date": 1, "source": 1,
+            }
+            cursor = db[COLLECTION_NAME].find({}, projection).limit(
+                LOCAL_STOCK_UNIVERSE_MAX_RECORDS
+            )
+            rows = await cursor.to_list(length=LOCAL_STOCK_UNIVERSE_MAX_RECORDS)
+        except Exception as exc:
+            logger.warning("🧩 [多数据源基础信息同步] 库内兜底列表读取失败: %s", exc)
+            return None
+
+        if not rows or len(rows) < LOCAL_STOCK_UNIVERSE_MIN_RECORDS:
+            logger.warning(
+                "🧩 [多数据源基础信息同步] 库内记录不足以兜底（%s < %s），不使用兜底",
+                len(rows or []), LOCAL_STOCK_UNIVERSE_MIN_RECORDS,
+            )
+            return None
+
+        frame = pd.DataFrame(rows)
+        for column in ("code", "symbol", "name", "ts_code", "market", "area",
+                       "industry", "list_date", "source"):
+            if column not in frame.columns:
+                frame[column] = ""
+
+        symbol = frame["symbol"].fillna("").astype(str).str.strip()
+        code = frame["code"].fillna("").astype(str).str.strip()
+        frame["symbol"] = symbol.where(symbol != "", code).str.extract(r"(\d+)", expand=False).fillna("").str.zfill(6)
+        for column in ("name", "market", "area", "industry", "list_date", "source"):
+            frame[column] = frame[column].fillna("").astype(str)
+        frame["ts_code"] = frame["ts_code"].fillna("").astype(str)
+
+        missing_ts = frame["ts_code"] == ""
+        frame.loc[missing_ts, "ts_code"] = frame.loc[missing_ts, "symbol"].apply(
+            self._ts_code_from_symbol
+        )
+
+        frame = frame[(frame["symbol"] != "") & (frame["source"] != "")]
+        if len(frame) < LOCAL_STOCK_UNIVERSE_MIN_RECORDS:
+            logger.warning(
+                "🧩 [多数据源基础信息同步] 兜底宇宙清洗后仅 %s 条，放弃兜底", len(frame)
+            )
+            return None
+
+        logger.warning(
+            "🧩 [多数据源基础信息同步] 启用库内兜底宇宙: 记录=%s 只股票=%s（沿用原 source，不新增文档）",
+            len(frame), frame["symbol"].nunique(),
+        )
+        return frame
+
     async def _fetch_stock_list_with_retry(
         self,
         manager,
@@ -347,6 +426,11 @@ class MultiSourceBasicsSyncService:
 
             # Step 2: 尝试从数据源获取股票列表（排除本地数据源）
             stock_df, source_used = await self._fetch_stock_list_with_retry(manager, preferred_sources)
+            if stock_df is None or getattr(stock_df, "empty", True):
+                # 远端列表全失败时不再整轮中断：改用库内已有 (code, source) 记录继续增量。
+                # 兜底帧每条记录自带 source，写入时命中既有文档。
+                stock_df = await self._load_local_stock_universe(db)
+                source_used = None if stock_df is None else "__local_universe__"
             if stock_df is None or getattr(stock_df, "empty", True):
                 raise RuntimeError("All data sources failed to provide stock list")
 
@@ -458,11 +542,13 @@ class MultiSourceBasicsSyncService:
                     # 🔥 确定数据源标识
                     # 根据实际使用的数据源设置 source 字段
                     # 注意：不再使用 "multi_source" 作为默认值，必须有明确的数据源
-                    if not source_used:
+                    # 兜底宇宙沿用每条记录原有的 source，避免 (code, source) 键变化产生重复文档。
+                    row_source = str(row.get("source") or "").strip()
+                    data_source = row_source or source_used
+                    if not data_source:
                         logger.warning(f"⚠️ 股票 {code} 没有明确的数据源，跳过")
                         errors += 1
                         continue
-                    data_source = source_used
 
                     # 构建文档
                     doc = {
