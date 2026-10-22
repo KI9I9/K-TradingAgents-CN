@@ -24,6 +24,7 @@ import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 import asyncio
+import importlib.util
 from pathlib import Path
 
 from app.core.config import settings
@@ -951,26 +952,42 @@ async def lifespan(app: FastAPI):
         logger.info("🔄 HITL 待确认操作过期清理已配置（每 30 分钟）")
 
         # v3.6.0：Skill 审核过期清理（每 30 分钟执行一次）
-        async def _expire_stale_skill_reviews():
+        # 社区版发布管道会整体剔除 app/pro（与 app/router_registry.py 的 PRO_ROUTERS 同处理）。
+        # 启动时先探测可选模块：
+        #   - 模块缺失：提示一次，且不注册该任务（避免每 30 分钟重复报 ModuleNotFoundError）；
+        #   - 模块存在但导入失败：照实上报真实错误与堆栈，同样不注册，不做无差别屏蔽。
+        if importlib.util.find_spec("app.pro") is None:
+            logger.info("[SkillReview·定时] 未注册：当前发行版未包含可选模块 app.pro")
+        else:
             try:
-                from app.core.database import get_mongo_db
                 from app.pro.services.skill_review_service import SkillReviewService
-                db = get_mongo_db()
-                if db is not None:
-                    svc = SkillReviewService(db=db)
-                    cleaned = await svc.expire_stale_reviews()
-                    if cleaned:
-                        logger.info(f"[SkillReview·定时] 已过期 {cleaned} 条待审核 Skill 记录")
-            except Exception as _e:
-                logger.warning(f"[SkillReview·定时] 过期清理失败: {_e}")
+            except Exception:
+                logger.error(
+                    "[SkillReview·定时] 未注册：可选模块 app.pro 存在但导入失败，堆栈见下",
+                    exc_info=True,
+                )
+                SkillReviewService = None
 
-        scheduler.add_job(
-            _expire_stale_skill_reviews,
-            IntervalTrigger(minutes=30, timezone=settings.TIMEZONE),
-            id="skill_review_expire_stale",
-            name="Skill 审核过期清理（每30分钟）"
-        )
-        logger.info("🔄 Skill 审核过期清理已配置（每 30 分钟）")
+            if SkillReviewService is not None:
+                async def _expire_stale_skill_reviews():
+                    try:
+                        from app.core.database import get_mongo_db
+                        db = get_mongo_db()
+                        if db is not None:
+                            svc = SkillReviewService(db=db)
+                            cleaned = await svc.expire_stale_reviews()
+                            if cleaned:
+                                logger.info(f"[SkillReview·定时] 已过期 {cleaned} 条待审核 Skill 记录")
+                    except Exception as _e:
+                        logger.warning(f"[SkillReview·定时] 过期清理失败: {_e}")
+
+                scheduler.add_job(
+                    _expire_stale_skill_reviews,
+                    IntervalTrigger(minutes=30, timezone=settings.TIMEZONE),
+                    id="skill_review_expire_stale",
+                    name="Skill 审核过期清理（每30分钟）"
+                )
+                logger.info("🔄 Skill 审核过期清理已配置（每 30 分钟）")
 
         # 先暂停派发，恢复用户的持久化开关后再开始调度。
         scheduler.start(paused=True)
