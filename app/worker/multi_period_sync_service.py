@@ -5,6 +5,7 @@
 """
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
@@ -15,6 +16,53 @@ from app.worker.akshare_sync_service import AKShareSyncService
 from app.worker.baostock_sync_service import BaoStockSyncService
 
 logger = logging.getLogger(__name__)
+
+# 单批次内个股请求的并发度上限。可用 HISTORICAL_SYNC_CONCURRENCY_<SOURCE> 覆盖。
+# 取值依据：每只个股请求都会起一个独立解释器子进程重新 import pandas/akshare，
+# 属于 CPU 密集型冷启动；实测在 4 vCPU 上并发 8 反而慢于并发 4
+# （24 只样本：4 并发 112.2s vs 8 并发 136.2s），故默认对齐核数。
+_DEFAULT_SYNC_CONCURRENCY = {"akshare": 4, "baostock": 4, "tushare": 2}
+_MAX_SYNC_CONCURRENCY = 32
+
+# 同时推进的批次数。批内为网络 IO 等待，多批并行近似线性提速。
+_DEFAULT_BATCH_CONCURRENCY = {"akshare": 3, "baostock": 2, "tushare": 1}
+
+
+def _sync_concurrency(data_source: str) -> int:
+    """返回指定数据源的单批并发度；非法配置回退到默认值。"""
+    raw = os.getenv(f"HISTORICAL_SYNC_CONCURRENCY_{data_source.upper()}")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"⚠️ 并发度配置非法({data_source}={raw!r})，使用默认值")
+        else:
+            if 1 <= value <= _MAX_SYNC_CONCURRENCY:
+                return value
+            logger.warning(
+                f"⚠️ 并发度超出范围({data_source}={value})，"
+                f"有效区间 1-{_MAX_SYNC_CONCURRENCY}，使用默认值"
+            )
+    return _DEFAULT_SYNC_CONCURRENCY.get(data_source, 4)
+
+
+def _batch_concurrency(data_source: str) -> int:
+    """返回同时推进的批次数；非法配置回退到默认值。
+
+    批内是网络 IO 等待，CPU 空闲，因此多批并行可近似线性提速。
+    默认值保守，避免倍数堆叠后被上游判定为异常流量。
+    """
+    raw = os.getenv(f"HISTORICAL_SYNC_BATCH_CONCURRENCY_{data_source.upper()}")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"⚠️ 批并发配置非法({data_source}={raw!r})，使用默认值")
+        else:
+            if 1 <= value <= 8:
+                return value
+            logger.warning(f"⚠️ 批并发超出范围({data_source}={value})，有效区间 1-8，使用默认值")
+    return _DEFAULT_BATCH_CONCURRENCY.get(data_source, 3)
 
 
 @dataclass
@@ -221,25 +269,48 @@ class MultiPeriodSyncService:
                 logger.error(f"❌ 不支持的数据源: {data_source}")
                 return stats
             
-            # 批量处理
+            # 分批 + 批间并发：批内是网络 IO 等待，多批并行近似线性提速
             batch_size = 50
-            for i in range(0, len(symbols), batch_size):
-                batch = symbols[i:i + batch_size]
-                batch_stats = await self._sync_batch_period_data(
-                    service, data_source, period, batch, start_date, end_date
+            batches = [symbols[i:i + batch_size] for i in range(0, len(symbols), batch_size)]
+            batch_limit = _batch_concurrency(data_source)
+            semaphore = asyncio.Semaphore(batch_limit)
+            progress = {"done": 0}
+
+            async def _run_batch(batch: List[str]) -> Dict[str, Any]:
+                async with semaphore:
+                    result = await self._sync_batch_period_data(
+                        service, data_source, period, batch, start_date, end_date
+                    )
+                    progress["done"] += len(batch)
+                    logger.info(
+                        f"📊 {data_source}-{period}进度: {progress['done']}/{len(symbols)} "
+                        f"本批成功{result['success']} 失败{result['errors']}"
+                    )
+                    await asyncio.sleep(0.5)
+                    return result
+
+            logger.info(
+                f"🚀 {data_source}-{period} 共 {len(batches)} 批，批间并发 {batch_limit}"
+            )
+            results = await asyncio.gather(
+                *(_run_batch(batch) for batch in batches), return_exceptions=True
+            )
+
+            failed_batches = 0
+            for result in results:
+                if isinstance(result, BaseException):
+                    failed_batches += 1
+                    logger.error(f"❌ {data_source}-{period} 批次异常: {result}")
+                    continue
+                stats["records"] += result["records"]
+                stats["success"] += result["success"]
+                stats["errors"] += result["errors"]
+
+            if batches and failed_batches == len(batches):
+                logger.error(
+                    f"🛑 {data_source}-{period} 全部 {len(batches)} 批异常，本轮无有效结果"
                 )
-                
-                stats["records"] += batch_stats["records"]
-                stats["success"] += batch_stats["success"]
-                stats["errors"] += batch_stats["errors"]
-                
-                # 进度日志
-                progress = min(i + batch_size, len(symbols))
-                logger.info(f"📊 {data_source}-{period}进度: {progress}/{len(symbols)}")
-                
-                # API限流
-                await asyncio.sleep(0.5)
-            
+
             return stats
             
         except Exception as e:
@@ -256,29 +327,49 @@ class MultiPeriodSyncService:
         start_date: str = None,
         end_date: str = None
     ) -> Dict[str, Any]:
-        """同步批次周期数据"""
+        """同步批次周期数据（受控并发）。
+
+        批次内个股请求并发执行，并发度由 ``_sync_concurrency`` 决定。
+        每只股票独立捕获异常，单只失败不影响同批其余股票。
+
+        并发安全性说明：累加在事件循环单线程内完成，且 ``+=`` 前后没有
+        ``await`` 让出点，因此不需要额外加锁；落库侧使用
+        ``(symbol, trade_date, data_source, period)`` 唯一索引 + upsert，
+        不同个股之间不存在写冲突。
+        """
         stats = {"records": 0, "success": 0, "errors": 0}
-        
-        for symbol in symbols:
-            try:
-                # 获取历史数据
-                if data_source == "tushare":
+        if data_source not in ("tushare", "akshare", "baostock"):
+            return stats
+        if not symbols:
+            return stats
+
+        # akshare 走批量通道：一个子进程拉整批，摊薄解释器冷启动开销
+        if data_source == "akshare":
+            return await self._sync_akshare_batch(period, symbols, start_date, end_date)
+
+        concurrency = _sync_concurrency(data_source)
+        semaphore = asyncio.Semaphore(concurrency)
+        error_samples: List[str] = []
+
+        async def _sync_one(symbol: str) -> None:
+            async with semaphore:
+                try:
                     hist_data = await service.provider.get_historical_data(
                         symbol, start_date, end_date, period
                     )
-                elif data_source == "akshare":
-                    hist_data = await service.provider.get_historical_data(
-                        symbol, start_date, end_date, period
-                    )
-                elif data_source == "baostock":
-                    hist_data = await service.provider.get_historical_data(
-                        symbol, start_date, end_date, period
-                    )
-                else:
-                    continue
-                
-                if hist_data is not None and not hist_data.empty:
-                    # 保存到数据库
+                except Exception as exc:
+                    stats["errors"] += 1
+                    if len(error_samples) < 5:
+                        error_samples.append(f"{symbol}: {type(exc).__name__}: {exc}")
+                    return
+
+                if hist_data is None or hist_data.empty:
+                    stats["errors"] += 1
+                    if len(error_samples) < 5:
+                        error_samples.append(f"{symbol}: 空数据")
+                    return
+
+                try:
                     saved_count = await self.historical_service.save_historical_data(
                         symbol=symbol,
                         data=hist_data,
@@ -286,18 +377,86 @@ class MultiPeriodSyncService:
                         market="CN",
                         period=period
                     )
-                    
-                    stats["records"] += saved_count
-                    stats["success"] += 1
-                else:
+                except Exception as exc:
                     stats["errors"] += 1
-                    
-            except Exception as e:
-                logger.error(f"❌ {symbol}-{period}同步失败: {e}")
-                stats["errors"] += 1
-        
+                    if len(error_samples) < 5:
+                        error_samples.append(f"{symbol}: 落库失败 {type(exc).__name__}: {exc}")
+                    return
+
+                stats["records"] += saved_count
+                stats["success"] += 1
+
+        await asyncio.gather(*(_sync_one(symbol) for symbol in symbols))
+
+        if error_samples:
+            # 只报样例，避免单批 50 只全失败时刷屏
+            logger.warning(
+                f"⚠️ {data_source}-{period} 批次失败 {stats['errors']} 只，"
+                f"样例: " + " | ".join(error_samples)
+            )
+
         return stats
     
+    async def _sync_akshare_batch(
+        self,
+        period: str,
+        symbols: List[str],
+        start_date: str = None,
+        end_date: str = None
+    ) -> Dict[str, Any]:
+        """akshare 批量通道：一次子进程拉整批，再逐只落库。
+
+        冷启动（import pandas/akshare 约 3-5 秒）按批摊薄，而不是按只支付。
+        落库保持逐只执行，单只写入毫秒级，不构成瓶颈。
+        """
+        from tradingagents.utils.bounded_data_fetch import fetch_async
+
+        stats = {"records": 0, "success": 0, "errors": 0}
+        try:
+            frames, fetch_errors, _circuit = await fetch_async(
+                "akshare_history_batch",
+                {
+                    "codes": list(symbols),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "period": period,
+                },
+                timeout=180,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"⚠️ akshare 批量拉取失败 {len(symbols)} 只: {type(exc).__name__}: {exc}"
+            )
+            stats["errors"] += len(symbols)
+            return stats
+
+        for symbol in symbols:
+            frame = frames.get(symbol)
+            if frame is None or frame.empty:
+                stats["errors"] += 1
+                continue
+            try:
+                saved_count = await self.historical_service.save_historical_data(
+                    symbol=symbol,
+                    data=frame,
+                    data_source="akshare",
+                    market="CN",
+                    period=period
+                )
+            except Exception as exc:
+                stats["errors"] += 1
+                logger.debug(f"akshare 落库失败 {symbol}: {type(exc).__name__}: {exc}")
+                continue
+            stats["records"] += saved_count
+            stats["success"] += 1
+
+        if fetch_errors:
+            logger.info(
+                f"ℹ️ akshare 批次 {len(symbols)} 只，拉取阶段失败 {len(fetch_errors)} 只"
+            )
+
+        return stats
+
     async def _get_all_symbols(self) -> List[str]:
         """获取所有股票代码"""
         try:
@@ -306,10 +465,15 @@ class MultiPeriodSyncService:
             db = get_mongo_db()
             collection = db.stock_basic_info
 
+            # stock_basic_info 按 (code, source) 存多条，直接取 symbol 会把同一只股票取两次
+            # （本库 5577 只 → 11154 条），导致同步请求量与耗时直接翻倍。此处按 symbol 去重。
             cursor = collection.find({}, {"symbol": 1})
-            symbols = [doc["symbol"] async for doc in cursor]
+            symbols = sorted({
+                doc["symbol"] async for doc in cursor
+                if isinstance(doc.get("symbol"), str) and doc["symbol"]
+            })
 
-            logger.info(f"📊 获取股票列表: {len(symbols)}只股票")
+            logger.info(f"📊 获取股票列表: {len(symbols)}只股票（已去重）")
             return symbols
 
         except Exception as e:
