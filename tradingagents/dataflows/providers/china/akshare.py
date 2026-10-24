@@ -1631,16 +1631,30 @@ class AKShareProvider(BaseStockDataProvider):
         end_date: str,
         period: str = "daily"
     ) -> Optional[pd.DataFrame]:
-        """使用新浪历史接口作为 AK 日线历史数据兜底。"""
+        """使用新浪历史接口作为 AK 日线历史数据兜底。
+
+        两处与东财口径对齐的处理，缺一不可：
+        1. 成交量单位：stock_zh_a_daily 返回「股」，本库 akshare 通道统一为「手」，需 /100 取整。
+           漏掉这步会把成交量放大 100 倍（2026-10-14 起东财被封后大规模走本路径，已造成脏数据）。
+        2. pre_close 预热：只取请求区间时，区间首日没有前收，涨跌额/涨跌幅会算成空。
+           因此前推 20 天取数，算完 pre_close 再裁回请求区间。
+        """
         if period != "daily":
             return None
 
         symbol = self._get_akshare_cn_symbol(code)
 
+        try:
+            warmup_start = (
+                datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=20)
+            ).strftime('%Y-%m-%d')
+        except ValueError:
+            warmup_start = start_date
+
         def fetch_historical_data():
             return self.ak.stock_zh_a_daily(
                 symbol=symbol,
-                start_date=start_date.replace('-', ''),
+                start_date=warmup_start.replace('-', ''),
                 end_date=end_date.replace('-', ''),
                 adjust="qfq"
             )
@@ -1652,16 +1666,26 @@ class AKShareProvider(BaseStockDataProvider):
         hist_df = hist_df.copy()
         if 'date' in hist_df.columns:
             hist_df['date'] = pd.to_datetime(hist_df['date'], errors='coerce')
+            hist_df = hist_df.dropna(subset=['date']).sort_values('date').reset_index(drop=True)
+
+        if hist_df.empty:
+            return None
+
+        if 'volume' in hist_df.columns:
+            hist_df['volume'] = (
+                pd.to_numeric(hist_df['volume'], errors='coerce').fillna(0) / 100.0
+            ).round()
+
+        if 'pre_close' not in hist_df.columns and 'close' in hist_df.columns and 'date' in hist_df.columns:
+            hist_df['pre_close'] = hist_df['close'].shift(1)
+
+        if 'date' in hist_df.columns:
             start_dt = pd.to_datetime(start_date)
             end_dt = pd.to_datetime(end_date)
             hist_df = hist_df[(hist_df['date'] >= start_dt) & (hist_df['date'] <= end_dt)]
 
         if hist_df.empty:
             return None
-
-        if 'pre_close' not in hist_df.columns and 'close' in hist_df.columns and 'date' in hist_df.columns:
-            hist_df = hist_df.sort_values('date').reset_index(drop=True)
-            hist_df['pre_close'] = hist_df['close'].shift(1)
 
         return hist_df
 
@@ -1696,6 +1720,69 @@ class AKShareProvider(BaseStockDataProvider):
         logger.info(f"ℹ️ {code} 备用历史接口正常返回，但指定区间无数据")
         return pd.DataFrame()
 
+    async def _get_historical_data_bj_sina(
+        self, code: str, start_date: str, end_date: str, period: str = 'daily'
+    ) -> pd.DataFrame:
+        """北交所日线：直接走新浪，不再尝试东财。
+
+        920 段在东财历史接口上实测被拒（境外/机房出口全封），且北交所在东财侧本就覆盖不全。
+        若沿用“先撞东财失败再回退”的路径，每股要多耗数秒重试；批量模式下 50 只拼一批，
+        足以拖穿 bounded_data_fetch 的 180 秒硬超时，进而被判定为整批失败。
+
+        单位口径：新浪 stock_zh_a_daily 的 volume 为「股」，本库 akshare 通道为「手」，
+        此处统一 /100 取整；amount 已是「元」，与库内一致，直接透传。
+
+        Args:
+            code: 6 位证券代码（920xxx 或 8/4 开头的旧号段）
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+            period: 周期，仅支持 daily
+
+        Returns:
+            标准化后的历史行情 DataFrame；无数据时返回空 DataFrame
+        """
+        if period != 'daily':
+            return pd.DataFrame()
+
+        symbol = 'bj' + str(code).strip()
+
+        # 多取 20 天只用于计算区间首日的 pre_close，取回后按请求起点裁剪
+        try:
+            warmup_start = (
+                datetime.strptime(start_date, '%Y-%m-%d') - timedelta(days=20)
+            ).strftime('%Y-%m-%d')
+        except ValueError:
+            warmup_start = start_date
+
+        def fetch():
+            return self.ak.stock_zh_a_daily(
+                symbol=symbol,
+                start_date=warmup_start.replace('-', ''),
+                end_date=end_date.replace('-', ''),
+                adjust='qfq',
+            )
+
+        frame = await asyncio.to_thread(fetch)
+        if frame is None or frame.empty:
+            return pd.DataFrame()
+
+        frame = frame.copy()
+        if 'date' in frame.columns:
+            frame['date'] = pd.to_datetime(frame['date'], errors='coerce')
+            frame = frame.sort_values('date').reset_index(drop=True)
+        if 'volume' in frame.columns:
+            frame['volume'] = (
+                pd.to_numeric(frame['volume'], errors='coerce').fillna(0) / 100.0
+            ).round()
+        if 'pre_close' not in frame.columns and 'close' in frame.columns:
+            frame['pre_close'] = frame['close'].shift(1)
+        if 'date' in frame.columns:
+            frame = frame[frame['date'] >= pd.to_datetime(start_date)]
+        if frame.empty:
+            return pd.DataFrame()
+
+        return self._standardize_historical_columns(frame, code)
+
     async def get_historical_data(
         self, code: str, start_date: str, end_date: str, period: str = "daily"
     ) -> Optional[pd.DataFrame]:
@@ -1728,6 +1815,14 @@ class AKShareProvider(BaseStockDataProvider):
             return pd.DataFrame()
         if not self.connected:
             raise AKShareNetworkError('AKShare 数据提供器尚未就绪')
+
+        # 北交所：绕开东财直接走新浪。放在分批判断之前，长区间也走这条，不递归分批。
+        if self._get_full_symbol(code).endswith('.BJ'):
+            logger.debug(f'📈 {code} 北交所标的，使用新浪历史接口')
+            return await self._get_historical_data_bj_sina(
+                code, start_date, end_date, period
+            )
+
         if (end_dt - start_dt).days > 730:
             return await self._get_historical_data_in_batches(code, start_date, end_date, period)
 
