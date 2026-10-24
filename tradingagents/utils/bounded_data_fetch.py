@@ -16,7 +16,7 @@ import threading
 import time
 
 IS_WORKER = False
-OPERATIONS = {"stock_list", "trade_date", "daily_basic", "akshare_history"}
+OPERATIONS = {"stock_list", "trade_date", "daily_basic", "akshare_history", "akshare_history_batch"}
 
 
 class DataFetchNetworkError(RuntimeError):
@@ -32,6 +32,13 @@ def _decode(raw):
         if category == "network":
             raise DataFetchNetworkError("数据源网络请求失败", value.get("circuit"))
         raise RuntimeError("数据源返回错误，未取得新数据")
+    if "frames" in value:
+        # 批量形态：{code: frame|null} + 逐只错误分类，单只失败不影响整批
+        import pandas as pd
+        frames = {}
+        for code, frame in value["frames"].items():
+            frames[code] = None if frame is None else pd.DataFrame(frame["data"], columns=frame["columns"])
+        return frames, value.get("errors") or {}, value.get("circuit")
     if "frame" in value:
         import pandas as pd
         frame = value["frame"]
@@ -105,6 +112,46 @@ def _perform(operation, arguments):
             return asyncio.run(provider.get_historical_data(**arguments)), circuit()
         except AKShareNetworkError:
             raise DataFetchNetworkError("数据源网络请求失败", circuit()) from None
+    if operation == "akshare_history_batch":
+        # 一个子进程内串行拉多只：冷启动（import pandas/akshare）只付一次。
+        # 单只异常只登记在 errors 里，不中断同批其余个股。
+        from tradingagents.dataflows.providers.china.akshare import AKShareProvider, AKShareNetworkError
+        provider = AKShareProvider()
+        arguments = dict(arguments)
+        codes = list(arguments.pop("codes") or ())
+        state = arguments.pop("circuit", {})
+        provider._history_failure_count = state.get("failures", 0)
+        provider._history_retry_after = state.get("retry_after", 0.0)
+        start_date = arguments.get("start_date")
+        end_date = arguments.get("end_date")
+        period = arguments.get("period", "daily")
+        # 批内节流：连续无间隔请求会触发东财熔断，之后全批回退到备用接口
+        # （实测 50 只无间隔时成功率仅 48%）。0.35s 是实测可稳定规避的值。
+        try:
+            interval = max(0.0, min(2.0, float(arguments.get("interval", 0.35))))
+        except (TypeError, ValueError):
+            interval = 0.35
+
+        def circuit():
+            return {"failures": provider._history_failure_count, "retry_after": provider._history_retry_after}
+
+        async def _run_batch():
+            frames, errors = {}, {}
+            for index, code in enumerate(codes):
+                try:
+                    frames[code] = await provider.get_historical_data(code, start_date, end_date, period)
+                except AKShareNetworkError:
+                    frames[code] = None
+                    errors[code] = "network"
+                except Exception:
+                    frames[code] = None
+                    errors[code] = "sdk"
+                if interval and index + 1 < len(codes):
+                    await asyncio.sleep(interval)
+            return frames, errors
+
+        frames, errors = asyncio.run(_run_batch())
+        return {"frames": frames, "errors": errors}, circuit()
     from app.services.data_sources.manager import DataSourceManager
     # Reuse the application's request headers/default timeout in this fresh
     # interpreter too; importing the adapter alone does not initialize them.
@@ -123,7 +170,12 @@ def _main():
     global IS_WORKER
     IS_WORKER = True
     # File execution starts with utils/ on sys.path, not the project root.
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    _pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if not os.path.isdir(os.path.join(_pkg_root, "tradingagents")):
+        # 文件被放在非标准路径时（离线验证/挂载测试），回落到应用根目录
+        if os.path.isdir(os.path.join("/app", "tradingagents")):
+            _pkg_root = "/app"
+    sys.path.insert(0, _pkg_root)
     # Importing the module by its canonical name must see the same worker flag.
     sys.modules["tradingagents.utils.bounded_data_fetch"] = sys.modules[__name__]
     logging.disable(logging.CRITICAL)
@@ -136,14 +188,24 @@ def _main():
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             result, source = _perform(operation, request["arguments"])
         packet = {"ok": True}
-        if operation != "trade_date":
-            packet["frame"] = None if result is None else json.loads(result.to_json(orient="split", date_format="iso", index=False))
-            if operation != "akshare_history":
-                packet["source"] = source
-            else:
-                packet["circuit"] = source
-        else:
+        if operation == "trade_date":
             packet["value"] = result
+        elif operation == "akshare_history_batch":
+            packet["frames"] = {
+                code: (None if frame is None else json.loads(
+                    frame.to_json(orient="split", date_format="iso", index=False)))
+                for code, frame in result["frames"].items()
+            }
+            if len(packet["frames"]) != len(result["frames"]):
+                raise RuntimeError("批量结果序列化丢失记录")
+            packet["errors"] = result["errors"]
+            packet["circuit"] = source
+        else:
+            packet["frame"] = None if result is None else json.loads(result.to_json(orient="split", date_format="iso", index=False))
+            if operation == "akshare_history":
+                packet["circuit"] = source
+            else:
+                packet["source"] = source
     except Exception as error:
         from requests.exceptions import ConnectionError, Timeout, HTTPError
         packet["category"] = "network" if isinstance(error, (ConnectionError, Timeout, HTTPError, DataFetchNetworkError, TimeoutError)) else "SDKError"
