@@ -1475,34 +1475,53 @@ class AKShareSyncService:
             codes = [item[0] for item in targets]
             start_map = dict(targets)
 
-            # 单只约 2-3 秒（每只都要先试东财再回落新浪），100 只必然撞穿
-            # bounded_data_fetch 的 180 秒硬上限，整批全废。改为分块 + 块间并发：
-            # 每块 40 只（约 110 秒，留足余量），最多 3 块并行。
+            # 单只实测约 4 秒（先试东财再回落新浪，且新浪是整份历史下回来再按区间过滤，
+            # 窗口为空也要付全额时间），bounded_data_fetch 是 180 秒子进程硬上限。
+            # 因此按 20 只切块（约 84 秒，留一倍余量）、最多 4 块并行；
+            # 单块仍超时则对半拆开重试一次，避免个别慢股票拖垮整块。
             frames = {}
             batch_error = None
-            chunk_size = 40
-            max_parallel = 3
+            chunk_size = 25
+            max_parallel = 4
             chunks = [codes[i:i + chunk_size] for i in range(0, len(codes), chunk_size)]
             semaphore = asyncio.Semaphore(max_parallel)
 
+            async def _fetch_codes(sub_codes, timeout_seconds):
+                sub_start = min(start_map[c] for c in sub_codes)
+                try:
+                    sub_frames, _fetch_errors, _circuit = await fetch_async(
+                        "akshare_history_batch",
+                        {
+                            "codes": sub_codes,
+                            "start_date": sub_start,
+                            "end_date": end_date,
+                            "period": period,
+                        },
+                        timeout=timeout_seconds,
+                    )
+                    return sub_frames or {}, None
+                except Exception as exc:
+                    return {}, exc
+
             async def _fetch_chunk(chunk):
                 # 每块按自己最早起始日拉取，避免整批被个别老数据股票拖成超长窗口
-                chunk_start = min(start_map[c] for c in chunk)
                 async with semaphore:
-                    try:
-                        chunk_frames, _fetch_errors, _circuit = await fetch_async(
-                            "akshare_history_batch",
-                            {
-                                "codes": chunk,
-                                "start_date": chunk_start,
-                                "end_date": end_date,
-                                "period": period,
-                            },
-                            timeout=170,
+                    chunk_frames, chunk_exc = await _fetch_codes(chunk, 170)
+                    if chunk_exc is not None and len(chunk) > 8:
+                        # 拆半重试：一块里通常只有个别股票特别慢
+                        half = len(chunk) // 2
+                        parts = [chunk[:half], chunk[half:]]
+                        retried = await asyncio.gather(
+                            *[_fetch_codes(p, 130) for p in parts]
                         )
-                        return chunk, chunk_frames or {}, None
-                    except Exception as exc:
-                        return chunk, {}, exc
+                        chunk_frames = {}
+                        last_exc = None
+                        for part_frames, part_exc in retried:
+                            chunk_frames.update(part_frames)
+                            if part_exc is not None:
+                                last_exc = part_exc
+                        chunk_exc = last_exc
+                    return chunk, chunk_frames, chunk_exc
 
             chunk_results = await asyncio.gather(*[_fetch_chunk(c) for c in chunks])
             for chunk, chunk_frames, chunk_exc in chunk_results:
