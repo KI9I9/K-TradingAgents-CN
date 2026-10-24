@@ -1473,36 +1473,57 @@ class AKShareSyncService:
             from tradingagents.utils.bounded_data_fetch import fetch_async
 
             codes = [item[0] for item in targets]
-            # 各股起始日可能不同，取最早的统一拉取；落库是幂等 upsert，
-            # 多取已存在的行不会产生重复记录。
-            effective_start = min(item[1] for item in targets)
+            start_map = dict(targets)
 
+            # 单只约 2-3 秒（每只都要先试东财再回落新浪），100 只必然撞穿
+            # bounded_data_fetch 的 180 秒硬上限，整批全废。改为分块 + 块间并发：
+            # 每块 40 只（约 110 秒，留足余量），最多 3 块并行。
             frames = {}
             batch_error = None
-            try:
-                frames, _fetch_errors, _circuit = await fetch_async(
-                    "akshare_history_batch",
-                    {
-                        "codes": codes,
-                        "start_date": effective_start,
-                        "end_date": end_date,
-                        "period": period,
-                    },
-                    timeout=180,
-                )
-            except Exception as exc:
-                batch_error = exc
-                logger.warning(
-                    f"⚠️ akshare 批量拉取失败 {len(codes)} 只 "
-                    f"(start={effective_start}): {type(exc).__name__}: {exc}"
-                )
-                for symbol in codes:
-                    batch_stats["error_count"] += 1
-                    batch_stats["errors"].append({
-                        "code": symbol,
-                        "error": f"批量拉取失败: {type(exc).__name__}: {exc}",
-                        "context": "_process_historical_batch"
-                    })
+            chunk_size = 40
+            max_parallel = 3
+            chunks = [codes[i:i + chunk_size] for i in range(0, len(codes), chunk_size)]
+            semaphore = asyncio.Semaphore(max_parallel)
+
+            async def _fetch_chunk(chunk):
+                # 每块按自己最早起始日拉取，避免整批被个别老数据股票拖成超长窗口
+                chunk_start = min(start_map[c] for c in chunk)
+                async with semaphore:
+                    try:
+                        chunk_frames, _fetch_errors, _circuit = await fetch_async(
+                            "akshare_history_batch",
+                            {
+                                "codes": chunk,
+                                "start_date": chunk_start,
+                                "end_date": end_date,
+                                "period": period,
+                            },
+                            timeout=170,
+                        )
+                        return chunk, chunk_frames or {}, None
+                    except Exception as exc:
+                        return chunk, {}, exc
+
+            chunk_results = await asyncio.gather(*[_fetch_chunk(c) for c in chunks])
+            for chunk, chunk_frames, chunk_exc in chunk_results:
+                frames.update(chunk_frames)
+                if chunk_exc is not None:
+                    batch_error = chunk_exc
+                    logger.warning(
+                        f"⚠️ akshare 批量拉取失败 {len(chunk)} 只 "
+                        f"(start={min(start_map[c] for c in chunk)}): "
+                        f"{type(chunk_exc).__name__}: {chunk_exc}"
+                    )
+                    for symbol in chunk:
+                        batch_stats["error_count"] += 1
+                        batch_stats["errors"].append({
+                            "code": symbol,
+                            "error": f"批量拉取失败: {type(chunk_exc).__name__}: {chunk_exc}",
+                            "context": "_process_historical_batch"
+                        })
+
+            # 逐块容错：某块失败只影响该块，其余块的结果照常落库
+            batch_error = None
 
             if batch_error is None:
                 for symbol in codes:
