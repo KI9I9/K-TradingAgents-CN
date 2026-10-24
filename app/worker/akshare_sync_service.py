@@ -779,11 +779,17 @@ class AKShareSyncService:
     async def _get_all_listed_symbols(self) -> List[str]:
         """获取所有上市状态的股票代码列表"""
         try:
+            # 注意：本库 stock_basic_info 实际并未写入 list_status 字段（11154 条全为空），
+            # 原先 {"list_status": "L"} 会返回 0 条，导致「个股失败 → 全量行情」的兜底静默失效。
+            # 改为排除已退市（$ne 对缺失字段同样成立），字段将来补齐后行为自动收紧。
             basic_info_cursor = self.db.stock_basic_info.find(
-                {"list_status": "L"},  # 只获取上市状态的股票
+                {"list_status": {"$ne": "D"}},
                 {"code": 1}
             )
-            symbols = [doc["code"] async for doc in basic_info_cursor]
+            symbols = sorted({
+                doc["code"] async for doc in basic_info_cursor
+                if isinstance(doc.get("code"), str) and doc["code"]
+            })
             return symbols
         except Exception as e:
             logger.error(f"❌ 获取股票列表失败: {e}")
@@ -1423,121 +1429,150 @@ class AKShareSyncService:
             "processed_count": processed_count  # 🔥 保存当前已处理数量
         }
 
+        # ── 阶段 1：增量判定与分拣（只读库，不触网） ──────────────────────
+        targets = []  # [(symbol, start_date)]
         for symbol in batch:
-            # 🔥 检查任务是否应该停止
             if job_id and await self._should_stop(job_id):
                 logger.warning(f"⚠️ 任务 {job_id} 收到停止信号，正在退出批次处理...")
                 batch_stats["stopped"] = True
                 break
-            
-            # 🔥 每处理一个股票，立即更新已处理数量（无论成功还是失败）
-            processed_count += 1
-            batch_stats["processed_count"] = processed_count
-            
-            try:
-                # 确定该股票的起始日期
-                symbol_start_date = start_date
-                if not symbol_start_date:
-                    if incremental:
-                        # 增量同步：获取该股票的最后日期
-                        symbol_start_date = await self._get_last_sync_date(symbol)
-                        logger.debug(f"📅 {symbol}: 从 {symbol_start_date} 开始同步")
-                    else:
-                        # 全量同步：最近1年
-                        symbol_start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
 
-                # 数据已覆盖目标日期时不再请求；仍执行下方进度与取消检查。
-                up_to_date = datetime.strptime(symbol_start_date, '%Y-%m-%d') > datetime.strptime(end_date, '%Y-%m-%d')
-                hist_data = None
-                if up_to_date:
-                    batch_stats["skipped_count"] += 1
+            symbol_start_date = start_date
+            if not symbol_start_date:
+                if incremental:
+                    symbol_start_date = await self._get_last_sync_date(symbol)
                 else:
-                    hist_data = await self.provider.get_historical_data(symbol, symbol_start_date, end_date, period)
+                    symbol_start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
 
-                if hist_data is not None and not hist_data.empty:
-                    # 保存到统一历史数据集合
-                    # 🔥 确保 historical_service 已初始化（如果为 None，使用当前 db 连接创建）
-                    if self.historical_service is None:
-                        from app.services.historical_data_service import HistoricalDataService
-                        self.historical_service = HistoricalDataService()
-                        self.historical_service.db = self.db
-                        self.historical_service.collection = self.db.stock_daily_quotes
-                        await self.historical_service._ensure_indexes()
+            try:
+                up_to_date = datetime.strptime(symbol_start_date, '%Y-%m-%d') > datetime.strptime(end_date, '%Y-%m-%d')
+            except (TypeError, ValueError):
+                up_to_date = False
 
-                    saved_count = await self.historical_service.save_historical_data(
-                        symbol=symbol,
-                        data=hist_data,
-                        data_source="akshare",
-                        market="CN",
-                        period=period
-                    )
+            if up_to_date:
+                batch_stats["skipped_count"] += 1
+                processed_count += 1
+                continue
 
-                    batch_stats["success_count"] += 1
-                    batch_stats["total_records"] += saved_count
-                    logger.debug(f"✅ {symbol}历史数据同步成功: {saved_count}条记录")
-                elif not up_to_date:
-                    # 接口正常返回空数据与网络失败分别统计，不推断一定已补齐。
-                    batch_stats["no_data_count"] += 1
+            targets.append((symbol, symbol_start_date))
 
-            except Exception as e:
-                batch_stats["error_count"] += 1
-                batch_stats["errors"].append({
-                    "code": symbol,
-                    "error": str(e),
-                    "context": "_process_historical_batch"
-                })
-            
-            # 🔥 每处理完一个股票（无论成功还是失败），立即更新进度
-            if job_id and original_total_symbols > 0:
-                try:
-                    from app.services.scheduler_service import update_job_progress
-                    
-                    # 🔥 计算进度百分比
-                    progress_percent = int((processed_count / original_total_symbols) * 100) if original_total_symbols > 0 else 0
-                    
-                    # 🔥 构建进度消息
-                    progress_message = f"正在同步历史数据 ({processed_count}/{original_total_symbols})"
-                    progress_message += (
-                        f" | 本批次：无需更新 {batch_stats['skipped_count']}，"
-                        f"接口无数据 {batch_stats['no_data_count']}"
-                    )
-                    
-                    # 🔥 如果有错误，在消息中包含错误信息
-                    if batch_stats.get("error_count", 0) > 0:
-                        recent_errors = batch_stats.get("errors", [])[-3:]  # 只取最近3个错误
-                        if recent_errors:
-                            error_summary = []
-                            for error in recent_errors:
-                                error_str = error.get("error", "") if isinstance(error, dict) else str(error)
-                                if error_str:
-                                    # 提取关键错误信息（网络连接中断、连接错误等）
-                                    if "网络连接中断" in error_str or "Connection" in error_str or "连接" in error_str or "RemoteDisconnected" in error_str:
-                                        error_summary.append("网络连接问题")
-                                    elif "网络错误" in error_str:
-                                        error_summary.append("网络错误")
-                                    else:
-                                        # 截取前30个字符
-                                        short_error = error_str[:30] + "..." if len(error_str) > 30 else error_str
-                                        error_summary.append(short_error)
-                            
-                            if error_summary:
-                                # 去重并只显示前2个不同的错误类型
-                                unique_errors = list(set(error_summary))[:2]
-                                progress_message += f" | 遇到错误: {', '.join(unique_errors)}"
-                    
-                    await update_job_progress(
-                        job_id=job_id,
-                        progress=progress_percent,
-                        message=progress_message,
-                        total_items=original_total_symbols,
-                        processed_items=processed_count
-                    )
-                except Exception as progress_error:
-                    from app.services.scheduler_service import TaskCancelledException
-                    if isinstance(progress_error, TaskCancelledException):
-                        raise
-                    # 普通进度更新失败不影响同步，但取消请求必须交给外层收尾。
-                    logger.debug(f"⚠️ 更新进度失败（继续执行）: {progress_error}")
+        batch_stats["processed_count"] = processed_count
+
+        # ── 阶段 2：整批一次拉取，逐只落库 ──────────────────────────────
+        # 原先逐只起子进程（每只重复 import pandas/akshare），且限流时逐只等满
+        # 超时，10 只就能堆出 30 分钟无进度而被 watchdog 判死。改为整批一次拉取：
+        # 冷启动按批摊薄，限流时整批在 180 秒内快速失败，不再触发超时判定。
+        if targets and not batch_stats.get("stopped"):
+            if self.historical_service is None:
+                from app.services.historical_data_service import HistoricalDataService
+                self.historical_service = HistoricalDataService()
+                self.historical_service.db = self.db
+                self.historical_service.collection = self.db.stock_daily_quotes
+                await self.historical_service._ensure_indexes()
+
+            from tradingagents.utils.bounded_data_fetch import fetch_async
+
+            codes = [item[0] for item in targets]
+            # 各股起始日可能不同，取最早的统一拉取；落库是幂等 upsert，
+            # 多取已存在的行不会产生重复记录。
+            effective_start = min(item[1] for item in targets)
+
+            frames = {}
+            batch_error = None
+            try:
+                frames, _fetch_errors, _circuit = await fetch_async(
+                    "akshare_history_batch",
+                    {
+                        "codes": codes,
+                        "start_date": effective_start,
+                        "end_date": end_date,
+                        "period": period,
+                    },
+                    timeout=180,
+                )
+            except Exception as exc:
+                batch_error = exc
+                logger.warning(
+                    f"⚠️ akshare 批量拉取失败 {len(codes)} 只 "
+                    f"(start={effective_start}): {type(exc).__name__}: {exc}"
+                )
+                for symbol in codes:
+                    batch_stats["error_count"] += 1
+                    batch_stats["errors"].append({
+                        "code": symbol,
+                        "error": f"批量拉取失败: {type(exc).__name__}: {exc}",
+                        "context": "_process_historical_batch"
+                    })
+
+            if batch_error is None:
+                for symbol in codes:
+                    hist_data = frames.get(symbol)
+                    if hist_data is not None and not hist_data.empty:
+                        try:
+                            saved_count = await self.historical_service.save_historical_data(
+                                symbol=symbol,
+                                data=hist_data,
+                                data_source="akshare",
+                                market="CN",
+                                period=period
+                            )
+                            batch_stats["success_count"] += 1
+                            batch_stats["total_records"] += saved_count
+                        except Exception as exc:
+                            batch_stats["error_count"] += 1
+                            batch_stats["errors"].append({
+                                "code": symbol,
+                                "error": f"落库失败: {type(exc).__name__}: {exc}",
+                                "context": "_process_historical_batch"
+                            })
+                    else:
+                        # 接口正常返回空，与网络失败分开统计
+                        batch_stats["no_data_count"] += 1
+
+            processed_count += len(codes)
+            batch_stats["processed_count"] = processed_count
+
+        # ── 阶段 3：每批更新一次进度，不再逐只写库 ──────────────────────
+        if job_id and original_total_symbols > 0:
+            try:
+                from app.services.scheduler_service import update_job_progress
+
+                progress_percent = int((processed_count / original_total_symbols) * 100) if original_total_symbols > 0 else 0
+                progress_message = f"正在同步历史数据 ({processed_count}/{original_total_symbols})"
+                progress_message += (
+                    f" | 本批次：无需更新 {batch_stats['skipped_count']}，"
+                    f"接口无数据 {batch_stats['no_data_count']}"
+                )
+
+                if batch_stats.get("error_count", 0) > 0:
+                    recent_errors = batch_stats.get("errors", [])[-3:]
+                    error_summary = []
+                    for error in recent_errors:
+                        error_str = error.get("error", "") if isinstance(error, dict) else str(error)
+                        if error_str:
+                            if "网络连接中断" in error_str or "Connection" in error_str or "连接" in error_str or "RemoteDisconnected" in error_str:
+                                error_summary.append("网络连接问题")
+                            elif "网络错误" in error_str:
+                                error_summary.append("网络错误")
+                            else:
+                                short_error = error_str[:30] + "..." if len(error_str) > 30 else error_str
+                                error_summary.append(short_error)
+                    if error_summary:
+                        unique_errors = list(dict.fromkeys(error_summary))[:2]
+                        progress_message += f" | 遇到错误: {', '.join(unique_errors)}"
+
+                await update_job_progress(
+                    job_id=job_id,
+                    progress=progress_percent,
+                    message=progress_message,
+                    total_items=original_total_symbols,
+                    processed_items=processed_count
+                )
+            except Exception as progress_error:
+                from app.services.scheduler_service import TaskCancelledException
+                if isinstance(progress_error, TaskCancelledException):
+                    raise
+                logger.debug(f"⚠️ 更新进度失败（继续执行）: {progress_error}")
 
         return batch_stats
 
