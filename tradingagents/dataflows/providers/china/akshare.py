@@ -1596,10 +1596,18 @@ class AKShareProvider(BaseStockDataProvider):
 
         symbol = self._get_akshare_cn_symbol(code)
 
+        # 多取 20 天：单日窗口下 shift(1) 拿不到前收，必须靠预热段推算
+        _warm_start = start_date
+        try:
+            _ws = pd.to_datetime(start_date) - pd.Timedelta(days=20)
+            _warm_start = _ws.strftime("%Y-%m-%d") if "-" in str(start_date) else _ws.strftime("%Y%m%d")
+        except Exception:
+            _warm_start = start_date
+
         def fetch_historical_data():
             return self.ak.stock_zh_a_hist_tx(
                 symbol=symbol,
-                start_date=start_date,
+                start_date=_warm_start,
                 end_date=end_date,
                 adjust="qfq"
             )
@@ -1611,16 +1619,32 @@ class AKShareProvider(BaseStockDataProvider):
         hist_df = hist_df.copy()
         if 'date' in hist_df.columns:
             hist_df['date'] = pd.to_datetime(hist_df['date'], errors='coerce')
+
+        # 成交量单位归一：腾讯接口对同一批个股可能返回「手」也可能返回「股」
+        # （实测 000001 返回手、002624 返回股），不能无条件 /100。
+        # 判定依据 r = amount/volume/close：手 ≈ 100，股 ≈ 1；仅在 r < 10 时按股处理。
+        if {'volume', 'amount', 'close'}.issubset(hist_df.columns):
+            _vol = pd.to_numeric(hist_df['volume'], errors='coerce').fillna(0)
+            _amt = pd.to_numeric(hist_df['amount'], errors='coerce').fillna(0)
+            _cls = pd.to_numeric(hist_df['close'], errors='coerce').fillna(0)
+            _r = _amt / _vol.replace(0, pd.NA) / _cls.replace(0, pd.NA)
+            _need = _r.notna() & (_r < 10)
+            if bool(_need.any()):
+                hist_df.loc[_need, 'volume'] = (_vol[_need] / 100.0).round()
+
+        # pre_close 必须在裁剪之前、用含预热段的完整序列推算
+        if 'pre_close' not in hist_df.columns and 'close' in hist_df.columns and 'date' in hist_df.columns:
+            hist_df = hist_df.sort_values('date').reset_index(drop=True)
+            hist_df['pre_close'] = hist_df['close'].shift(1)
+
+        # 裁剪回请求区间
+        if 'date' in hist_df.columns:
             start_dt = pd.to_datetime(start_date)
             end_dt = pd.to_datetime(end_date)
             hist_df = hist_df[(hist_df['date'] >= start_dt) & (hist_df['date'] <= end_dt)]
 
         if hist_df.empty:
             return None
-
-        if 'pre_close' not in hist_df.columns and 'close' in hist_df.columns and 'date' in hist_df.columns:
-            hist_df = hist_df.sort_values('date').reset_index(drop=True)
-            hist_df['pre_close'] = hist_df['close'].shift(1)
 
         return hist_df
 
