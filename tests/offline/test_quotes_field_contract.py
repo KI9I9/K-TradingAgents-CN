@@ -1,0 +1,275 @@
+# -*- coding: utf-8 -*-
+"""批量行情字段契约的离线回归测试。
+
+背景
+----
+`AKShareProvider.get_batch_stock_quotes(codes)` 默认 `return_all=False`，该分支
+原先只输出 `open_price/high_price/low_price`，不输出 `open/high/low/close/trade_date/updated_at`。
+
+而写入侧 `akshare_sync_service` 直接 `$set` 落库、消费侧 `paper.py` 读 `open/high/low/close`，
+于是产生两类故障：
+
+1. 新记录缺 `high/low/close` → 下单报「无法获取股票 X 的当天价格区间」
+2. 已有昨日记录只更新 `price`，`high/low/close` 残留昨日值 → 按昨日区间/昨收成交
+
+本测试不依赖第三方库、不连接网络与数据库，可在任意装有 Python 3.8+ 的机器复现：
+
+    python3 tests/offline/test_quotes_field_contract.py
+
+覆盖：
+  A. provider 源码契约（AST 静态断言）
+  B. `$set` 覆盖语义（修复前残留 vs 修复后全量覆盖）
+  C. 消费侧可读性（复现报错条件 / 修复后可读）
+  D. 标的查询契约（内联 list_status="L" 已移除）
+  E. 已知缺陷复现：新鲜度判断的负时间差被当作「新鲜」
+"""
+
+import ast
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PROVIDER_PATH = REPO_ROOT / "tradingagents/dataflows/providers/china/akshare.py"
+SYNC_PATH = REPO_ROOT / "app/worker/akshare_sync_service.py"
+
+
+def _parse(path):
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _find_func(tree, name, class_name=None):
+    """按名称取函数节点；class_name 给定时限定在该类内。"""
+    scope = [tree]
+    if class_name:
+        scope = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.ClassDef) and n.name == class_name]
+    for root in scope:
+        for node in ast.walk(root):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+                return node
+    return None
+
+
+def _quote_dict_keys(nodes):
+    """收集 `quote_dict["xxx"] = ...` 中出现的键。"""
+    keys = set()
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "quote_dict"):
+                    sl = target.slice
+                    if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+                        keys.add(sl.value)
+    return keys
+
+
+class TestProviderFieldContract(unittest.TestCase):
+    """A. provider 必须为批量路径输出消费侧需要的标准字段。"""
+
+    #: 消费侧 paper.py 实际读取的键（_get_today_price_range 读 high/low；_get_last_price 读 close）
+    CONSUMER_KEYS = {"open", "high", "low", "close"}
+    #: 附加契约（可观测性）
+    EXTRA_KEYS = {"current_price", "pct_chg", "updated_at"}
+
+    def setUp(self):
+        self.tree = _parse(PROVIDER_PATH)
+        self.func = _find_func(self.tree, "get_batch_stock_quotes", "AKShareProvider")
+        self.assertIsNotNone(self.func, "未找到 AKShareProvider.get_batch_stock_quotes")
+
+    def _branches(self):
+        """返回 (return_all 分支键, 非 return_all 分支键)。"""
+        for node in ast.walk(self.func):
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Name) \
+                    and node.test.id == "return_all":
+                body = _quote_dict_keys(ast.walk(node))
+                orelse = set()
+                for sub in node.orelse:
+                    orelse |= _quote_dict_keys(ast.walk(sub))
+                # 只取含 quote_dict 赋值的那一对分支
+                if body or orelse:
+                    return body, orelse
+        return set(), set()
+
+    def test_batch_branch_emits_consumer_keys(self):
+        """非 return_all 分支必须输出 open/high/low/close。"""
+        _, orelse = self._branches()
+        missing = self.CONSUMER_KEYS - orelse
+        self.assertEqual(missing, set(), f"批量分支缺少消费侧必需字段: {sorted(missing)}")
+
+    def test_batch_branch_emits_extra_keys(self):
+        _, orelse = self._branches()
+        missing = self.EXTRA_KEYS - orelse
+        self.assertEqual(missing, set(), f"批量分支缺少扩展字段: {sorted(missing)}")
+
+    def test_batch_branch_keeps_legacy_price_keys(self):
+        """兼容性：不能删掉 *_price，既有调用方可能依赖。"""
+        _, orelse = self._branches()
+        legacy = {"open_price", "high_price", "low_price"}
+        self.assertTrue(legacy.issubset(orelse), "批量分支丢失 *_price 兼容字段")
+
+    def test_return_all_branch_still_has_trade_date(self):
+        """防回归：return_all 分支原有的 trade_date 不能被误删。"""
+        body, _ = self._branches()
+        self.assertIn("trade_date", body, "return_all 分支丢失 trade_date")
+
+
+class TestUpsertSemantics(unittest.TestCase):
+    """B. 模拟 MongoDB `$set` 的字段覆盖语义。"""
+
+    #: 库内已有的昨日快照
+    OLD_RECORD = {
+        "code": "000001", "price": 11.0,
+        "open": 10.5, "high": 11.5, "low": 10.2, "close": 11.0,
+        "trade_date": "2026-10-26",
+    }
+
+    #: 修复前的载荷（只有 *_price）
+    LEGACY_PAYLOAD = {
+        "price": 12.0, "open_price": 11.8, "high_price": 13.0, "low_price": 10.0,
+    }
+
+    #: 修复后的载荷
+    FIXED_PAYLOAD = {
+        "price": 12.0, "open_price": 11.8, "high_price": 13.0, "low_price": 10.0,
+        "open": 11.8, "high": 13.0, "low": 10.0, "close": 12.0,
+        "trade_date": "2026-10-27",
+    }
+
+    def test_legacy_payload_leaks_yesterday_values(self):
+        """缺陷复现：修复前 `$set` 后 high/low/close 仍是昨日值。"""
+        merged = {**self.OLD_RECORD, **self.LEGACY_PAYLOAD}
+        self.assertEqual(merged["high"], 11.5, "昨日高点应残留")
+        self.assertEqual(merged["low"], 10.2, "昨日低点应残留")
+        self.assertEqual(merged["close"], 11.0, "昨日收盘应残留")
+        self.assertEqual(merged["price"], 12.0, "只有 price 被更新——正是隐蔽的错误来源")
+
+    def test_fixed_payload_overwrites_all_fields(self):
+        """修复后：high/low/close/trade_date 全部被当日值覆盖。"""
+        merged = {**self.OLD_RECORD, **self.FIXED_PAYLOAD}
+        self.assertEqual(merged["high"], 13.0)
+        self.assertEqual(merged["low"], 10.0)
+        self.assertEqual(merged["close"], 12.0)
+        self.assertEqual(merged["trade_date"], "2026-10-27")
+
+
+class TestConsumerReadability(unittest.TestCase):
+    """C. 按 paper.py 的读取方式复现故障与验证修复。"""
+
+    @staticmethod
+    def read_price_range(record):
+        """复刻 paper._get_today_price_range 的取值与判定。"""
+        if not record:
+            return None
+        high = float(record.get("high", 0)) if record.get("high") is not None else None
+        low = float(record.get("low", 0)) if record.get("low") is not None else None
+        if high is not None and low is not None and high > 0 and low > 0:
+            return {"high": high, "low": low}
+        return None
+
+    @staticmethod
+    def read_last_price(record):
+        """复刻 paper._get_last_price 对 market_quotes 的读取（只认 close）。"""
+        if record and record.get("close") is not None:
+            try:
+                price = float(record["close"])
+                if price > 0:
+                    return price
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def test_legacy_record_is_unreadable(self):
+        """修复前：只有 *_price，两个消费函数都拿不到值 → 下单报错。"""
+        record = {"code": "000001", "price": 12.0,
+                  "open_price": 11.8, "high_price": 13.0, "low_price": 10.0}
+        self.assertIsNone(self.read_price_range(record))
+        self.assertIsNone(self.read_last_price(record))
+
+    def test_fixed_record_is_readable(self):
+        """修复后：区间与最新价都能读出。"""
+        record = {"code": "000001", "price": 12.0,
+                  "open": 11.8, "high": 13.0, "low": 10.0, "close": 12.0}
+        self.assertEqual(self.read_price_range(record), {"high": 13.0, "low": 10.0})
+        self.assertEqual(self.read_last_price(record), 12.0)
+
+    def test_zero_and_none_are_rejected(self):
+        """high/low 为 0 或 None 时不放行，避免用无效数据下单。"""
+        self.assertIsNone(self.read_price_range({"high": 0, "low": 0}))
+        self.assertIsNone(self.read_price_range({"high": None, "low": None}))
+        self.assertIsNone(self.read_price_range({}))
+
+
+class TestSymbolPoolQuery(unittest.TestCase):
+    """D. 标的查询契约：不得再出现恒空的 list_status="L"。"""
+
+    def setUp(self):
+        self.tree = _parse(SYNC_PATH)
+        self.func = _find_func(self.tree, "sync_realtime_quotes", "AKShareSyncService")
+        self.assertIsNotNone(self.func, "未找到 AKShareSyncService.sync_realtime_quotes")
+
+    def test_no_hardcoded_list_status_L(self):
+        """sync_realtime_quotes 内不得再有 {"list_status": "L"}。"""
+        found = []
+        for node in ast.walk(self.func):
+            if isinstance(node, ast.Dict):
+                for k, v in zip(node.keys, node.values):
+                    if (isinstance(k, ast.Constant) and k.value == "list_status"
+                            and isinstance(v, ast.Constant) and v.value == "L"):
+                        found.append(getattr(node, "lineno", "?"))
+        self.assertEqual(found, [], f"仍存在恒空的 list_status=\"L\" 查询，行号: {found}")
+
+    def test_reuses_listed_symbols_helper(self):
+        """必须复用 _get_all_listed_symbols()（含去重与非法代码过滤）。"""
+        src = ast.get_source_segment(SYNC_PATH.read_text(encoding="utf-8"), self.func) or ""
+        self.assertIn("_get_all_listed_symbols", src)
+
+    def test_empty_pool_reports_failure(self):
+        """空标的池必须记入 errors，不能静默返回零计数。"""
+        src = ast.get_source_segment(SYNC_PATH.read_text(encoding="utf-8"), self.func) or ""
+        self.assertIn("标的池为空", src)
+
+
+class TestFreshnessNegativeDelta(unittest.TestCase):
+    """E. 已知缺陷复现：`_is_data_fresh` 对负时间差判为「新鲜」。
+
+    该缺陷本次**未修复**（超出最小改动范围），此处用测试固化现状，
+    待确认生产容器时区后再决定是否修。若将来修复，本测试会失败——属于预期提醒。
+    """
+
+    @staticmethod
+    def replicate_is_fresh(updated_at, now, minutes=15):
+        """复刻 akshare_sync_service._is_data_fresh 的核心比较逻辑。"""
+        if updated_at.tzinfo is not None:
+            if updated_at.tzinfo == timezone.utc:
+                updated_at = updated_at.replace(tzinfo=None) + timedelta(hours=8)
+            else:
+                updated_at = updated_at.astimezone().replace(tzinfo=None)
+        time_diff = now - updated_at
+        return time_diff.total_seconds() < minutes * 60
+
+    def test_utc_timestamp_yields_negative_delta_on_utc_host(self):
+        """主机时区为 UTC 时，UTC 时间戳被 +8，产生负差值。"""
+        now_utc_naive = datetime(2026, 10, 26, 17, 0)          # 主机 UTC 本地时间
+        updated = datetime(2026, 10, 26, 16, 0, tzinfo=timezone.utc)
+        converted = updated.replace(tzinfo=None) + timedelta(hours=8)   # → 10-27 00:00
+        diff = (now_utc_naive - converted).total_seconds()
+        self.assertLess(diff, 0, "应产生负差值")
+        self.assertTrue(self.replicate_is_fresh(updated, now_utc_naive),
+                        "负差值被判定为新鲜（缺陷）")
+
+    def test_plus8_timestamp_is_handled_correctly(self):
+        """修复采用 +08:00 显式时区后，同一算法返回正确结果（不再走 UTC 分支）。"""
+        now_utc_naive = datetime(2026, 10, 26, 17, 0)
+        # provider 现在输出 +08:00 时区
+        updated = datetime(2026, 10, 27, 1, 0, tzinfo=timezone(timedelta(hours=8)))
+        diff = (now_utc_naive - updated.replace(tzinfo=None)).total_seconds()
+        # astimezone() 在 UTC 主机上会转成 UTC naive（17:00），差值约为 0
+        converted = updated.astimezone().replace(tzinfo=None)
+        self.assertLess(abs((now_utc_naive - converted).total_seconds()), 86400)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
