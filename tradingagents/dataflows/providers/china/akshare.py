@@ -1123,10 +1123,25 @@ class AKShareProvider(BaseStockDataProvider):
                             quote_dict["trade_date"] = trade_date_str
                             quote_dict["updated_at"] = updated_at_str
                         else:
-                            # 批量获取时，使用 open_price/high_price/low_price（保持兼容性）
-                            quote_dict["open_price"] = float(quotes_data.get("open", 0))
-                            quote_dict["high_price"] = float(quotes_data.get("high", 0))
-                            quote_dict["low_price"] = float(quotes_data.get("low", 0))
+                            # 批量获取时保留 *_price（兼容既有调用方），同时补齐标准字段。
+                            # 必要性：写入侧 akshare_sync_service 直接 $set 落库，而消费侧
+                            # paper._get_today_price_range / _get_last_price 读的是 open/high/low/close。
+                            # 只给 *_price 会造成两种失败：
+                            #   1) 新记录缺 high/low/close → 下单报「无法获取当天价格区间」
+                            #   2) 已有记录只更新 price，high/low/close 残留昨日值 → 按昨日区间成交
+                            quote_dict["open_price"] = float(quotes_data.get("open", 0) or 0)
+                            quote_dict["high_price"] = float(quotes_data.get("high", 0) or 0)
+                            quote_dict["low_price"] = float(quotes_data.get("low", 0) or 0)
+                            quote_dict["open"] = quote_dict["open_price"]
+                            quote_dict["high"] = quote_dict["high_price"]
+                            quote_dict["low"] = quote_dict["low_price"]
+                            quote_dict["close"] = quote_dict["price"]
+                            quote_dict["current_price"] = quote_dict["price"]
+                            quote_dict["pct_chg"] = quote_dict["change_percent"]
+                            # 快照接口不提供行情所属日期，trade_date 交由写入侧按交易日历确定，
+                            # 避免把「当前日期」误当行情日期（盘前/非交易日会写伪数据）。
+                            # updated_at 用 +08:00 显式时区，避开 _is_data_fresh 里 UTC 硬编码 +8 的分支。
+                            quote_dict["updated_at"] = datetime.now(timezone(timedelta(hours=8))).isoformat()
                         
                         quotes_map[matched_code] = quote_dict
 
