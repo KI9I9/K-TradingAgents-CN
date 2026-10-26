@@ -4,7 +4,7 @@ AKShare数据同步服务
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from typing import Dict, Any, List, Optional, Tuple
 import pymongo
 
@@ -427,17 +427,36 @@ class AKShareSyncService:
         job_id = self._resolve_job_id(manual_mode)
 
         try:
+            # 0. 解析本次行情所属交易日，供写入侧使用。
+            #    规则：确认今天是交易日且已过 09:30（连续竞价开始）才用当天，
+            #    否则退回最近交易日。快照接口不带行情日期，直接把「当前日期」
+            #    当行情日期会在盘前/非交易日写入伪有效数据。
+            resolved_trade_date = None
+            try:
+                from app.services.trading_calendar_service import get_trading_calendar_service
+                _cal = get_trading_calendar_service()
+                _now_cst = datetime.now(timezone(timedelta(hours=8)))
+                if await _cal.is_today_trade_day() and _now_cst.time() >= time(9, 30):
+                    resolved_trade_date = _now_cst.strftime("%Y-%m-%d")
+                else:
+                    resolved_trade_date = await _cal.get_last_trade_date()
+            except Exception as _td_err:
+                logger.warning(f"⚠️ 无法解析交易日，本次不更新 trade_date: {_td_err}")
+
             # 1. 确定要同步的股票列表
             if symbols is None:
-                # 从数据库获取所有上市状态的股票代码（排除退市股票）
-                basic_info_cursor = self.db.stock_basic_info.find(
-                    {"list_status": "L"},  # 只获取上市状态的股票
-                    {"code": 1}
-                )
-                symbols = [doc["code"] async for doc in basic_info_cursor]
+                # 复用统一的上市标的获取：stock_basic_info 实际无 list_status 字段，
+                # 用 $ne:"D" 排除退市并去重（详见 _get_all_listed_symbols 注释）。
+                # 原先内联的 {"list_status": "L"} 恒返回 0 条，导致任务空跑。
+                symbols = await self._get_all_listed_symbols()
 
             if not symbols:
-                logger.warning("⚠️ 没有找到要同步的股票")
+                # 空池属于失败而非成功，避免「零计数且不报错」掩盖配置/数据问题
+                logger.error("❌ 标的池为空，无法同步行情（检查 stock_basic_info 是否可读）")
+                stats["errors"].append({
+                    "error": "标的池为空",
+                    "context": "sync_realtime_quotes_no_symbols",
+                })
                 return stats
 
             stats["total_processed"] = len(symbols)
@@ -611,6 +630,11 @@ class AKShareSyncService:
                                             quotes_data["symbol"] = symbol
                                         if "code" not in quotes_data:
                                             quotes_data["code"] = symbol
+
+                                        # trade_date 由本函数按交易日历统一注入（provider 不提供）。
+                                        # 只在缺失时补，避免覆盖 provider 将来给出的真实行情日期。
+                                        if resolved_trade_date and not quotes_data.get("trade_date"):
+                                            quotes_data["trade_date"] = resolved_trade_date
 
                                         # 更新到数据库
                                         await self.db.market_quotes.update_one(
