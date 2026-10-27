@@ -1226,9 +1226,10 @@ class AKShareProvider(BaseStockDataProvider):
                 now_cn = datetime.now(cn_tz)
                 trade_date = now_cn.strftime("%Y-%m-%d")  # 格式：2025-11-05
 
-                # 🔥 成交量单位转换：手 → 股（1手 = 100股）
+                # 成交量统一为「手」。库内标准就是手（批量快照接口本身返回手），
+                # 此前这里把「总手」乘 100 转成「股」，导致单只同步与批量失败后的
+                # 逐只回退路径写出的量比批量路径大 100 倍（评审 P1-5）。
                 volume_in_lots = self._safe_int(data_dict.get("总手", 0))  # 单位：手
-                volume_in_shares = volume_in_lots * 100  # 单位：股
 
                 quotes = {
                     "code": code,
@@ -1240,7 +1241,8 @@ class AKShareProvider(BaseStockDataProvider):
                     "change": self._safe_float(data_dict.get("涨跌", 0)),
                     "change_percent": self._safe_float(data_dict.get("涨幅", 0)),
                     "pct_chg": self._safe_float(data_dict.get("涨幅", 0)),  # 🔥 pct_chg 字段（兼容旧数据）
-                    "volume": volume_in_shares,  # 🔥 单位：股（已转换）
+                    "volume": volume_in_lots,  # 单位：手（与批量快照一致）
+                    "volume_unit": "lot",
                     "amount": self._safe_float(data_dict.get("金额", 0)),  # 单位：元
                     "open": self._safe_float(data_dict.get("今开", 0)),  # 🔥 使用 open 而不是 open_price
                     "high": self._safe_float(data_dict.get("最高", 0)),  # 🔥 使用 high 而不是 high_price

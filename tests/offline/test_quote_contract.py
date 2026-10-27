@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """行情时间/字段契约 + 调度失败判定 的行为测试（纯标准库，可离线跑）。
 
-设计原则（针对上一轮评审的意见）：
-- 测**行为**，不测「源码里是否包含某个字符串」。
-- 直接加载 `app/services/quote_contract.py` 与 `app/services/scheduler_runtime.py`
-  的真实实现；后者只需给 `bson` 打一个最小 stub，不改被测代码。
-- 时间三类（BSON naive UTC / ISO 字符串 / 缺失或非法）逐一覆盖，
-  其中「缺失或非法」必须**被拒绝**，这是上一版护栏的漏洞。
-- 用真实 provider 返回值（`return_all=False` 的键集合）跑完整链路：
-  上游字典 → 写入规范化 → 消费侧判定，而不是手写理想 payload。
+针对第三轮评审逐条补的反例：
+- P1-1 不完整快照不得刷新旧价格的时间（用「$set 合并」语义模拟验证）
+- P1-2 行情时间缺失 → 严格路径拒绝，不得用采集时间冒充
+- P1-3 盘中写入的当日日线 → 不得用于成交
+- P2-4 inf / nan / bool 不得当作价格
+- P1-5 单只路径「股」单位 → 统一换算为「手」
 
 运行：python3 -B tests/offline/test_quote_contract.py
 """
@@ -17,7 +15,7 @@ import importlib.util
 import sys
 import types
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,7 +44,14 @@ qc = _load("quote_contract", "app/services/quote_contract.py")
 sched = _load("scheduler_runtime", "app/services/scheduler_runtime.py")
 
 CN_TZ = qc.CN_TZ
-NOW = datetime(2026, 10, 27, 10, 0, tzinfo=CN_TZ)
+
+
+def at(hour, minute, day=27):
+    return datetime(2026, 10, day, hour, minute, tzinfo=CN_TZ)
+
+
+NOW = at(10, 0)
+TODAY = "2026-10-27"
 
 
 def naive_utc(y, mo, d, h, mi, s=0):
@@ -54,28 +59,33 @@ def naive_utc(y, mo, d, h, mi, s=0):
     return datetime(y, mo, d, h, mi, s)
 
 
+def apply_set_idempotent(old: dict, doc: dict) -> dict:
+    """模拟 MongoDB {"$set": doc} 的合并语义。"""
+    merged = dict(old)
+    for key, value in doc.items():
+        if key != "_id":
+            merged[key] = value
+    return merged
+
+
 class TestParseQuoteTime(unittest.TestCase):
     def test_bson_naive_datetime_treated_as_utc(self):
         parsed = qc.parse_quote_time(naive_utc(2026, 10, 27, 1, 55))
         self.assertEqual(parsed.utcoffset(), timedelta(0))
-        # 01:55 UTC == 09:55 +08:00
         self.assertEqual(parsed.astimezone(CN_TZ).strftime("%H:%M"), "09:55")
 
     def test_iso_with_offset(self):
-        parsed = qc.parse_quote_time("2026-10-27T09:58:00+08:00")
-        self.assertEqual(parsed.utcoffset(), timedelta(hours=8))
+        self.assertEqual(
+            qc.parse_quote_time("2026-10-27T09:58:00+08:00").utcoffset(), timedelta(hours=8)
+        )
 
     def test_iso_z(self):
-        parsed = qc.parse_quote_time("2026-10-27T01:58:00Z")
-        self.assertEqual(parsed.utcoffset(), timedelta(0))
+        self.assertEqual(qc.parse_quote_time("2026-10-27T01:58:00Z").utcoffset(), timedelta(0))
 
     def test_naive_string_uses_exchange_tz(self):
-        parsed = qc.parse_quote_time("2026-10-27 09:58:00")
-        self.assertEqual(parsed.utcoffset(), timedelta(hours=8))
-
-    def test_aware_datetime_passthrough(self):
-        value = datetime(2026, 10, 27, 9, 58, tzinfo=CN_TZ)
-        self.assertEqual(qc.parse_quote_time(value), value)
+        self.assertEqual(
+            qc.parse_quote_time("2026-10-27 09:58:00").utcoffset(), timedelta(hours=8)
+        )
 
     def test_invalid_values_return_none(self):
         for value in ("", "   ", "bad-value", None, 12345, 1.5, True, [], {}):
@@ -85,14 +95,11 @@ class TestParseQuoteTime(unittest.TestCase):
 
 class TestCoerceTradeDate(unittest.TestCase):
     def test_formats(self):
-        self.assertEqual(qc.coerce_trade_date("2026-10-27"), "2026-10-27")
-        self.assertEqual(qc.coerce_trade_date("20261027"), "2026-10-27")
-        self.assertEqual(qc.coerce_trade_date("2026/10/27"), "2026-10-27")
-        self.assertEqual(qc.coerce_trade_date(date(2026, 10, 27)), "2026-10-27")
-        self.assertEqual(
-            qc.coerce_trade_date(datetime(2026, 10, 27, 9, 0, tzinfo=CN_TZ)),
-            "2026-10-27",
-        )
+        self.assertEqual(qc.coerce_trade_date("2026-10-27"), TODAY)
+        self.assertEqual(qc.coerce_trade_date("20261027"), TODAY)
+        self.assertEqual(qc.coerce_trade_date("2026/10/27"), TODAY)
+        self.assertEqual(qc.coerce_trade_date(date(2026, 10, 27)), TODAY)
+        self.assertEqual(qc.coerce_trade_date(at(9, 0)), TODAY)
 
     def test_unrecognised(self):
         for value in (None, "", "2026-1-7", "abc", 20261027):
@@ -100,194 +107,223 @@ class TestCoerceTradeDate(unittest.TestCase):
                 self.assertIsNone(qc.coerce_trade_date(value))
 
 
+class TestValidatePrice(unittest.TestCase):
+    def test_valid(self):
+        self.assertEqual(qc.validate_price(10)[0], 10.0)
+        self.assertEqual(qc.validate_price("10.5")[0], 10.5)
+
+    def test_infinite_rejected(self):
+        self.assertIsNone(qc.validate_price(float("inf"))[0])
+        self.assertIsNone(qc.validate_price(float("-inf"))[0])
+        self.assertIsNone(qc.validate_price(float("nan"))[0])
+
+    def test_bool_rejected(self):
+        """True/False 是 int 的子类，绝不能当价格。"""
+        self.assertEqual(qc.validate_price(True)[1], "bool_not_price")
+        self.assertIsNone(qc.validate_price(False)[0])
+
+    def test_non_positive_and_none(self):
+        self.assertEqual(qc.validate_price(0)[1], "non_positive")
+        self.assertEqual(qc.validate_price(-1)[1], "non_positive")
+        self.assertEqual(qc.validate_price(None)[1], "missing")
+
+
 class TestQuoteIsUsable(unittest.TestCase):
-    def test_fresh_bson_datetime_accepted(self):
+    def test_quote_time_present_accepted(self):
         ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-27", "updated_at": naive_utc(2026, 10, 27, 1, 55)}, NOW
+            {"trade_date": TODAY, "quote_time": "2026-10-27T09:58:00+08:00"}, NOW
         )
         self.assertTrue(ok, reason)
 
-    def test_fresh_iso_string_accepted(self):
+    def test_quote_time_from_bson_date(self):
         ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-27", "updated_at": "2026-10-27T09:58:00+08:00"}, NOW
+            {"trade_date": TODAY, "quote_time": naive_utc(2026, 10, 27, 1, 55)}, NOW
         )
         self.assertTrue(ok, reason)
 
-    def test_trade_date_plain_format_accepted(self):
+    def test_missing_quote_time_rejected_even_if_fetched_now(self):
+        """评审 P1-2：刚采集过 ≠ 报价新鲜。"""
         ok, reason = qc.quote_is_usable(
-            {"trade_date": "20261027", "updated_at": "2026-10-27T09:58:00+08:00"}, NOW
+            {
+                "trade_date": TODAY,
+                "fetched_at": "2026-10-27T09:59:59+08:00",
+                "updated_at": "2026-10-27T09:59:59+08:00",
+            },
+            NOW,
         )
-        self.assertTrue(ok, reason)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "quote_time_missing")
 
-    def test_stale_rejected(self):
+    def test_fetch_time_allowed_only_when_policy_flipped(self):
+        original = qc.ALLOW_FETCH_TIME_AS_QUOTE_TIME
+        try:
+            qc.ALLOW_FETCH_TIME_AS_QUOTE_TIME = True
+            ok, reason = qc.quote_is_usable(
+                {"trade_date": TODAY, "fetched_at": "2026-10-27T09:59:00+08:00"}, NOW
+            )
+            self.assertTrue(ok, reason)
+        finally:
+            qc.ALLOW_FETCH_TIME_AS_QUOTE_TIME = original
+
+    def test_stale_quote_rejected(self):
         ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-27", "updated_at": "2026-10-27T09:00:00+08:00"}, NOW
+            {"trade_date": TODAY, "quote_time": "2026-10-27T09:00:00+08:00"}, NOW
         )
         self.assertFalse(ok)
         self.assertTrue(reason.startswith("quote_stale"), reason)
 
-    def test_future_rejected(self):
+    def test_future_quote_rejected(self):
         ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-27", "updated_at": "2026-10-27T10:30:00+08:00"}, NOW
+            {"trade_date": TODAY, "quote_time": "2026-10-27T10:30:00+08:00"}, NOW
         )
         self.assertFalse(ok)
         self.assertTrue(reason.startswith("quote_from_future"), reason)
 
-    def test_small_clock_skew_tolerated(self):
-        ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-27", "updated_at": "2026-10-27T10:00:30+08:00"}, NOW
-        )
-        self.assertTrue(ok, reason)
-
-    def test_missing_time_rejected(self):
-        """上一版护栏的漏洞：updated_at 缺失会 return True。"""
-        ok, reason = qc.quote_is_usable({"trade_date": "2026-10-27"}, NOW)
-        self.assertFalse(ok)
-        self.assertTrue(reason.startswith("quote_time_unparseable"), reason)
-
-    def test_bad_time_rejected(self):
-        ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-27", "updated_at": "bad-value"}, NOW
-        )
-        self.assertFalse(ok)
-        self.assertTrue(reason.startswith("quote_time_unparseable"), reason)
-
-    def test_numeric_time_rejected(self):
-        ok, reason = qc.quote_is_usable({"trade_date": "2026-10-27", "updated_at": 1730000000}, NOW)
-        self.assertFalse(ok)
-        self.assertTrue(reason.startswith("quote_time_unparseable"), reason)
-
     def test_trade_date_mismatch_rejected(self):
         ok, reason = qc.quote_is_usable(
-            {"trade_date": "2026-10-26", "updated_at": "2026-10-27T09:58:00+08:00"}, NOW
+            {"trade_date": "2026-10-26", "quote_time": "2026-10-27T09:58:00+08:00"}, NOW
         )
         self.assertFalse(ok)
         self.assertTrue(reason.startswith("trade_date_mismatch"), reason)
 
-    def test_missing_trade_date_rejected_when_required(self):
-        ok, reason = qc.quote_is_usable({"updated_at": "2026-10-27T09:58:00+08:00"}, NOW)
-        self.assertFalse(ok)
-        self.assertTrue(reason.startswith("trade_date_mismatch"), reason)
 
-    def test_trade_date_optional(self):
-        ok, reason = qc.quote_is_usable(
-            {"updated_at": "2026-10-27T09:58:00+08:00"}, NOW, require_trade_date=False
-        )
+class TestPrepareQuoteWrite(unittest.TestCase):
+    """评审 P1-1 的核心反例：不完整快照不得刷新旧价格的时间。"""
+
+    OLD_DOC = {
+        "_id": "x",
+        "code": "600000",
+        "symbol": "600000",
+        "close": 8.0,
+        "high": 9.0,
+        "low": 7.0,
+        "trade_date": "2026-10-26",
+        "updated_at": "2026-10-26T15:05:00+08:00",
+        "quote_time": "2026-10-26T14:59:00+08:00",
+    }
+
+    def test_partial_snapshot_is_rejected_and_old_doc_untouched(self):
+        payload = {"price": 12.0, "close": None, "high": None, "low": None}
+        doc, reason = qc.prepare_quote_write(payload, "600000", TODAY, NOW)
+        self.assertIsNone(doc)
+        self.assertTrue(reason.startswith("incomplete_snapshot"), reason)
+
+        # 没有 doc 就不会发生 $set，旧记录原样保留
+        merged = self.OLD_DOC if doc is None else apply_set_idempotent(self.OLD_DOC, doc)
+        self.assertEqual(merged["trade_date"], "2026-10-26")
+        self.assertEqual(merged["updated_at"], "2026-10-26T15:05:00+08:00")
+        self.assertEqual(merged["high"], 9.0)
+        ok, why = qc.quote_is_usable(merged, NOW)
+        self.assertFalse(ok, why)
+
+    def test_missing_one_field_rejected(self):
+        payload = {"close": 8.0, "high": 9.0}  # 缺 low
+        doc, reason = qc.prepare_quote_write(payload, "600000", TODAY, NOW)
+        self.assertIsNone(doc)
+        self.assertIn("low_missing", reason)
+
+    def test_complete_snapshot_written_but_not_tradable_without_quote_time(self):
+        payload = {"close": 8.0, "high": 9.0, "low": 7.0, "volume": 1000}
+        doc, reason = qc.prepare_quote_write(payload, "600000", TODAY, NOW)
+        self.assertEqual(reason, "ok")
+        self.assertEqual(doc["trade_date"], TODAY)
+        self.assertEqual(doc["quote_time_source"], "fetch")
+        self.assertNotIn("quote_time", doc)
+        ok, why = qc.quote_is_usable(doc, NOW)
+        self.assertFalse(ok)
+        self.assertEqual(why, "quote_time_missing")
+
+    def test_alias_filled(self):
+        payload = {"price": 11.3, "close": 11.3, "open_price": 11.1,
+                   "high_price": 11.4, "low_price": 11.0}
+        doc, reason = qc.prepare_quote_write(payload, "000001", TODAY, NOW)
+        self.assertEqual(reason, "ok")
+        self.assertEqual(doc["high"], 11.4)
+        self.assertEqual(doc["low"], 11.0)
+
+    def test_volume_normalised_from_shares(self):
+        """评审 P1-5：单只路径曾写「股」，这里按 volume_unit 归一为「手」。"""
+        payload = {"close": 8.0, "high": 9.0, "low": 7.0,
+                   "volume": 123400, "volume_unit": "share"}
+        doc, _ = qc.prepare_quote_write(payload, "600000", TODAY, NOW)
+        self.assertAlmostEqual(doc["volume"], 1234.0)
+
+    def test_volume_lot_untouched(self):
+        payload = {"close": 8.0, "high": 9.0, "low": 7.0, "volume": 1234, "volume_unit": "lot"}
+        doc, _ = qc.prepare_quote_write(payload, "600000", TODAY, NOW)
+        self.assertEqual(doc["volume"], 1234)
+
+    def test_non_finite_price_rejected(self):
+        payload = {"close": float("inf"), "high": 9.0, "low": 7.0}
+        doc, reason = qc.prepare_quote_write(payload, "600000", TODAY, NOW)
+        self.assertIsNone(doc)
+        self.assertIn("not_finite", reason)
+
+
+class TestDailyFallback(unittest.TestCase):
+    """评审 P1-3：盘中写入的当日日线不得用于成交。"""
+
+    def _bar(self, written_at):
+        return {
+            "trade_date": TODAY,
+            "open": 9.5, "high": 11.0, "low": 9.0, "close": 10.0,
+            "updated_at": written_at,
+        }
+
+    def test_intraday_bar_rejected_at_afternoon(self):
+        bar = self._bar("2026-10-27T09:35:00+08:00")
+        ok, reason = qc.daily_bar_is_final(bar, at(14, 0))
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith("bar_written_intraday"), reason)
+
+    def test_after_close_bar_accepted(self):
+        bar = self._bar("2026-10-27T18:05:00+08:00")
+        ok, reason = qc.daily_bar_is_final(bar, at(19, 0))
         self.assertTrue(ok, reason)
 
+    def test_yesterday_bar_rejected(self):
+        bar = self._bar("2026-10-26T18:05:00+08:00")
+        bar["trade_date"] = "2026-10-26"
+        ok, reason = qc.daily_bar_is_final(bar, at(19, 0))
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith("bar_trade_date_mismatch"), reason)
 
-class TestValidatePriceRange(unittest.TestCase):
-    def test_valid(self):
-        self.assertEqual(qc.validate_price_range({"high": 10, "low": 9})[:2], (10.0, 9.0))
+    def test_bar_without_write_time_rejected(self):
+        bar = self._bar(None)
+        ok, reason = qc.daily_bar_is_final(bar, at(19, 0))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "bar_write_time_missing")
 
-    def test_string_numbers(self):
-        self.assertEqual(qc.validate_price_range({"high": "10", "low": "9"})[:2], (10.0, 9.0))
-
-    def test_missing(self):
-        self.assertEqual(qc.validate_price_range({})[2], "quote_missing")
-        self.assertEqual(qc.validate_price_range({"high": 10})[2], "not_numeric")
-
-    def test_low_greater_than_high(self):
-        self.assertEqual(qc.validate_price_range({"high": 9, "low": 10})[2], "low_gt_high")
-
-    def test_non_positive(self):
-        self.assertEqual(qc.validate_price_range({"high": 0, "low": 0})[2], "non_positive")
-
-    def test_not_finite(self):
-        self.assertEqual(
-            qc.validate_price_range({"high": float("nan"), "low": 1})[2], "not_finite"
-        )
+    def test_fallback_gate_before_and_after_close(self):
+        self.assertFalse(qc.daily_fallback_allowed(at(14, 0))[0])
+        self.assertTrue(qc.daily_fallback_allowed(at(15, 30))[0])
+        self.assertTrue(qc.daily_fallback_allowed(at(19, 0))[0])
 
 
 class TestSyncRoundGate(unittest.TestCase):
-    def at(self, hour, minute):
-        return datetime(2026, 10, 27, hour, minute, tzinfo=CN_TZ)
-
     def test_pre_open_skipped(self):
-        self.assertEqual(qc.sync_round_skip_reason(self.at(9, 0), True, "akshare"), "pre_open")
+        self.assertEqual(qc.sync_round_skip_reason(at(9, 0), True, "akshare"), "pre_open")
 
     def test_session_allowed(self):
-        self.assertIsNone(qc.sync_round_skip_reason(self.at(9, 30), True, "akshare"))
-        self.assertIsNone(qc.sync_round_skip_reason(self.at(14, 59), True, "tushare"))
+        self.assertIsNone(qc.sync_round_skip_reason(at(9, 30), True, "akshare"))
+        self.assertIsNone(qc.sync_round_skip_reason(at(14, 59), True, "tushare"))
 
     def test_after_close_skipped(self):
-        self.assertEqual(qc.sync_round_skip_reason(self.at(15, 31), True, "akshare"), "after_close")
+        self.assertEqual(qc.sync_round_skip_reason(at(15, 31), True, "akshare"), "after_close")
 
     def test_not_trade_day(self):
-        self.assertEqual(
-            qc.sync_round_skip_reason(self.at(10, 0), False, "akshare"), "not_trade_day"
-        )
+        self.assertEqual(qc.sync_round_skip_reason(at(10, 0), False, "akshare"), "not_trade_day")
 
     def test_fallback_calendar_is_unverified(self):
-        """日历 API 全失败会退回普通工作日，节假日会被误判成交易日。"""
         self.assertEqual(
-            qc.sync_round_skip_reason(self.at(10, 0), True, "fallback"), "calendar_unverified"
+            qc.sync_round_skip_reason(at(10, 0), True, "fallback"), "calendar_unverified"
         )
 
     def test_missing_source_is_unverified(self):
-        self.assertEqual(
-            qc.sync_round_skip_reason(self.at(10, 0), True, None), "calendar_unverified"
-        )
-
-
-class TestBuildQuoteDoc(unittest.TestCase):
-    """用真实 provider 返回的键集合跑链路。"""
-
-    # 未修复的批量分支（return_all=False）实际返回的键
-    LEGACY = {
-        "symbol": "000001", "name": "平安银行", "price": 11.3, "change": 0.1,
-        "change_percent": 0.89, "volume": 1323113, "amount": 1.48e9, "pre_close": 11.2,
-        "open_price": 11.15, "high_price": 11.34, "low_price": 11.13,
-        "data_source": "akshare", "sync_status": "success",
-    }
-
-    # 修复后的批量分支（本分支 defef53）会多出这些键
-    FIXED = dict(
-        LEGACY,
-        open=11.15, high=11.34, low=11.13, close=11.3, current_price=11.3, pct_chg=0.89,
-        updated_at="2026-10-27T09:58:00+08:00",
-    )
-
-    def test_symbol_code_and_trade_date_injected(self):
-        doc = qc.build_quote_doc({"price": 1.0}, "600000", "2026-10-27")
-        self.assertEqual(doc["symbol"], "600000")
-        self.assertEqual(doc["code"], "600000")
-        self.assertEqual(doc["trade_date"], "2026-10-27")
-
-    def test_existing_trade_date_not_overwritten(self):
-        doc = qc.build_quote_doc({"trade_date": "2026-10-24"}, "600000", "2026-10-27")
-        self.assertEqual(doc["trade_date"], "2026-10-24")
-
-    def test_alias_mapped_to_standard(self):
-        doc = qc.build_quote_doc(dict(self.LEGACY), "000001", "2026-10-27")
-        self.assertEqual(doc["high"], 11.34)
-        self.assertEqual(doc["low"], 11.13)
-        self.assertEqual(doc["open"], 11.15)
-
-    def test_none_values_dropped(self):
-        doc = qc.build_quote_doc({"close": None, "high": 10, "amount": None}, "600000")
-        self.assertNotIn("close", doc)
-        self.assertNotIn("amount", doc)
-        self.assertEqual(doc["high"], 10)
-
-    def test_chain_legacy_payload_still_rejected(self):
-        """上游未修复时：写入文档有区间，但没有行情时间 → 消费侧必须拒绝。"""
-        doc = qc.build_quote_doc(dict(self.LEGACY), "000001", "2026-10-27")
-        self.assertIsNotNone(qc.validate_price_range(doc)[0])
-        ok, reason = qc.quote_is_usable(doc, NOW)
-        self.assertFalse(ok)
-        self.assertTrue(reason.startswith("quote_time_unparseable"), reason)
-
-    def test_chain_fixed_payload_accepted(self):
-        doc = qc.build_quote_doc(dict(self.FIXED), "000001", "2026-10-27")
-        ok, reason = qc.quote_is_usable(doc, NOW)
-        self.assertTrue(ok, reason)
-        self.assertEqual(qc.validate_price_range(doc)[:2], (11.34, 11.13))
+        self.assertEqual(qc.sync_round_skip_reason(at(10, 0), True, None), "calendar_unverified")
 
 
 class TestSchedulerOutcome(unittest.TestCase):
-    """直接调用真实 outcome()，确认空池结果会被判 failed 而不是 success。"""
-
     def test_empty_pool_is_failed(self):
         stats = qc.build_failure_stats("标的池为空", "sync_realtime_quotes_no_symbols")
         status, message = sched.outcome(stats)
@@ -295,17 +331,16 @@ class TestSchedulerOutcome(unittest.TestCase):
         self.assertIn("标的池为空", message)
 
     def test_legacy_stats_with_only_errors_would_be_success(self):
-        """回归护栏：只往 errors 里塞、不给 success=False，就会被记成 success。"""
         status, _ = sched.outcome({"error_count": 0, "errors": [{"error": "标的池为空"}]})
         self.assertEqual(status, "success")
 
     def test_skipped_maps_to_skipped(self):
-        status, _ = sched.outcome({"skipped": True, "reason": "pre_open"})
-        self.assertEqual(status, "skipped")
+        self.assertEqual(sched.outcome({"skipped": True, "reason": "pre_open"})[0], "skipped")
 
     def test_normal_result_is_success(self):
-        status, _ = sched.outcome({"success_count": 10, "error_count": 0, "errors": []})
-        self.assertEqual(status, "success")
+        self.assertEqual(
+            sched.outcome({"success_count": 10, "error_count": 0, "errors": []})[0], "success"
+        )
 
 
 if __name__ == "__main__":

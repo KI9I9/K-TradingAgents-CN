@@ -13,8 +13,8 @@ from app.services.historical_data_service import get_historical_data_service
 from app.services.news_data_service import get_news_data_service
 from app.services.quote_contract import (
     build_failure_stats,
-    build_quote_doc,
     cn_now,
+    prepare_quote_write,
     resolve_trade_date,
     sync_round_skip_reason,
 )
@@ -658,11 +658,20 @@ class AKShareSyncService:
                                         else:
                                             quotes_data = quotes
 
-                                        # 统一规范化：补 symbol/code、别名兜底、注入 trade_date、
-                                        # 剔除 None 的价格字段（避免空值覆盖有效行情）
-                                        quotes_data = build_quote_doc(
-                                            quotes_data, symbol, resolved_trade_date
+                                        # 统一规范化：只有 close/high/low 齐全才允许写。
+                                        # 不完整快照整条拒写 —— 否则旧价格会被盖上今天的日期与时间，
+                                        # 再被消费侧当成「当日新鲜行情」放行。
+                                        quotes_data, _doc_reason = prepare_quote_write(
+                                            quotes_data, symbol, resolved_trade_date, cn_now()
                                         )
+                                        if quotes_data is None:
+                                            stats["error_count"] += 1
+                                            stats["errors"].append({
+                                                "code": symbol,
+                                                "error": f"行情快照不完整，整条拒写: {_doc_reason}",
+                                                "context": "sync_realtime_quotes_incomplete",
+                                            })
+                                            continue
 
                                         # 更新到数据库
                                         await self.db.market_quotes.update_one(
@@ -879,9 +888,13 @@ class AKShareSyncService:
                             quotes_data = quotes
                         
                         # 统一规范化（与批量循环、单只保存共用同一实现）
-                        quotes_data = build_quote_doc(
-                            quotes_data, symbol, getattr(self, "_run_trade_date", None)
+                        quotes_data, _doc_reason = prepare_quote_write(
+                            quotes_data, symbol,
+                            getattr(self, "_run_trade_date", None), cn_now()
                         )
+                        if quotes_data is None:
+                            logger.warning(f"⚠️ {symbol} 行情快照不完整，整条拒写: {_doc_reason}")
+                            continue
                         
                         # 构建批量更新操作
                         operations.append(
@@ -944,9 +957,13 @@ class AKShareSyncService:
                     logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
                 else:
                     # 单个股票数据，单独保存（与批量路径共用同一规范化实现）
-                    quotes_data = build_quote_doc(
-                        quotes_data, symbol, getattr(self, "_run_trade_date", None)
+                    quotes_data, _doc_reason = prepare_quote_write(
+                        quotes_data, symbol,
+                        getattr(self, "_run_trade_date", None), cn_now()
                     )
+                    if quotes_data is None:
+                        logger.error(f"❌ {symbol} 行情快照不完整，整条拒写: {_doc_reason}")
+                        return False
 
                     # 🔥 打印即将保存到数据库的数据
                     logger.info(f"💾 准备保存 {symbol} 行情到数据库:")
