@@ -11,7 +11,7 @@
 ```
 仓库：~/projects/K-TradingAgents-CN-osaka-safety-20261016
 分支：fix/quotes-field-contract-20261027
-HEAD：59e2b03（代码在 ad70bee；工作区应干净）
+HEAD：以 `git log -1` 为准（代码在 ad70bee；工作区应干净；文档提交不影响代码 diff 哈希）
 基线：9dd06bd（已用哈希证实与生产一致）
 
 git diff 9dd06bd..HEAD -- app/ tradingagents/ tests/ frontend/ deploy/
