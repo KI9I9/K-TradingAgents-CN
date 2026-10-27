@@ -96,7 +96,10 @@
 ====================================================================
 
 1) 运维 Bearer Token（执行单里的 TA_TOKEN）
+   它不是静态 API Key，而是 POST /api/auth/login 签发的 JWT，**有效期 1 小时**，
+   服务端还会校验 token 内的 session_id（MongoDB sessions 集合）。
    阶段 B 和 A7 必须用它读 /api/scheduler/jobs（匿名访问返回 401）。
+   拿法见 docs/review-20261027/TA_TOKEN-从哪获取-20261028.md（含三种方式，推荐让 King 建 0600 凭据文件，由你登录换 token）。
    拿不到就停止部署，不要用「启动日志里有暂停字样」替代——
    main.py 在打印暂停之后还会恢复持久化偏好，日志证明不了最终状态。
 
