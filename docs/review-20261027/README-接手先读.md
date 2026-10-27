@@ -64,3 +64,10 @@ for f in test_quote_contract test_paper_pricing test_sync_write test_sync_entry 
 - 「cron 已修」→ 只修了历史同步；`AKSHARE_QUOTES_SYNC_CRON` 生产仍是 `1-5`（= 周二至周六），不覆盖 `config.py` 则周一不跑。
 - 「午休不采集」→ `*/30 9-15` 在 12 点仍采集。
 - 「ETF 加进股票池就能盘中成交」→ 股票快照接口本身不返回 ETF 行。
+
+## 7. 有两件事必须找 King 要，不能自己绕
+
+1. **运维 Bearer Token**（执行单里的 `TA_TOKEN`）：阶段 B 4.4 和 A7 必须用它读 `/api/scheduler/jobs`（匿名访问返回 401）。
+   拿不到就**停止部署**，不要用「启动日志里有暂停字样」替代——`main.py` 在启动日志之后还会恢复持久化偏好，日志证明不了最终状态。
+2. **部署授权**：重启 backend / frontend、启用任何任务、调用真实数据源，都要 King 单独批准。
+   本文和代码里的一切都只是「可以这样做」，不是「已经批准这样做」。
