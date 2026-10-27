@@ -3,8 +3,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
-import io
-import urllib.error
+import ssl
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -127,40 +126,62 @@ class FrontendReadinessTests(unittest.TestCase):
     def setUp(self):
         self.m = load()
         self.expected = {'index.html': self.m.digest(b'expected')}
+        self.connection = Mock()
+        self.response = self.connection.getresponse.return_value
+        self.response.status = 200
+        self.response.read.return_value = b'expected'
+        factory = patch('http.client.HTTPSConnection', return_value=self.connection)
+        self.factory = factory.start()
+        self.addCleanup(factory.stop)
+        tls = patch('ssl.create_default_context')
+        self.tls = tls.start()
+        self.addCleanup(tls.stop)
 
     def test_connection_refused_then_ready_checks_bytes(self):
-        opener = Mock()
-        opener.open.side_effect = [urllib.error.URLError(ConnectionRefusedError()), io.BytesIO(b'expected')]
-        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep:
-            result = self.m.verify_frontend_resources(self.expected)
+        self.connection.request.side_effect = [ConnectionRefusedError(), None]
+        with patch('time.sleep') as sleep:
+            result = self.m.verify_frontend_resources(self.expected, 'public certificate')
         self.assertEqual(result, {'verified_http_resources': 1, 'attempts': 2})
         sleep.assert_called_once()
 
     def test_wrong_content_is_not_retried(self):
-        opener = Mock()
-        opener.open.return_value = io.BytesIO(b'wrong')
-        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep:
+        self.response.read.return_value = b'wrong'
+        with patch('time.sleep') as sleep:
             with self.assertRaisesRegex(RuntimeError, 'frontend_http_hash_mismatch'):
-                self.m.verify_frontend_resources(self.expected)
+                self.m.verify_frontend_resources(self.expected, 'public certificate')
         sleep.assert_not_called()
 
     def test_http_error_is_not_retried(self):
-        opener = Mock()
-        opener.open.side_effect = urllib.error.HTTPError('http://frontend/index.html', 404, 'missing', {}, None)
-        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep:
+        self.response.status = 404
+        with patch('time.sleep') as sleep:
             with self.assertRaisesRegex(RuntimeError, 'frontend_http_status_failed'):
-                self.m.verify_frontend_resources(self.expected)
+                self.m.verify_frontend_resources(self.expected, 'public certificate')
         sleep.assert_not_called()
 
     def test_unavailable_listener_has_bounded_deadline(self):
-        opener = Mock()
-        opener.open.side_effect = urllib.error.URLError(ConnectionRefusedError())
-        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep, \
-                patch('time.monotonic', side_effect=[0, 0, 45]):
+        self.connection.request.side_effect = ConnectionRefusedError()
+        with patch('time.sleep') as sleep, patch('time.monotonic', side_effect=[0, 0, 45]):
             with self.assertRaisesRegex(RuntimeError, 'frontend_http_ready_timeout'):
-                self.m.verify_frontend_resources(self.expected)
-        self.assertEqual(opener.open.call_count, 1)
+                self.m.verify_frontend_resources(self.expected, 'public certificate')
+        self.assertEqual(self.connection.request.call_count, 1)
         sleep.assert_not_called()
+
+    def test_tls_verification_failure_is_not_retried(self):
+        self.connection.request.side_effect = ssl.SSLCertVerificationError('certificate mismatch')
+        with patch('time.sleep') as sleep:
+            with self.assertRaises(ssl.SSLCertVerificationError):
+                self.m.verify_frontend_resources(self.expected, 'public certificate')
+        sleep.assert_not_called()
+
+    def test_tls_hostname_and_route_are_distinct(self):
+        self.m.verify_frontend_resources(self.expected, 'public certificate')
+        self.tls.assert_called_once_with(cadata='public certificate')
+        self.assertEqual(self.factory.call_args.args, ('localhost', 8080))
+        self.assertIs(self.factory.call_args.kwargs['context'], self.tls.return_value)
+        with patch('socket.create_connection') as connect:
+            self.connection._create_connection(('localhost', 8080), 5, None)
+        connect.assert_called_once_with(('frontend', 8080), 5, None)
+        self.connection.request.assert_called_once_with('GET', '/index.html')
 
 
 if __name__=='__main__':

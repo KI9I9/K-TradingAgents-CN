@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 import time
 from datetime import datetime, timezone
 
@@ -16,6 +17,7 @@ STAGED = ROOT / 'staged'
 BACKUP = Path('/home/ubuntu/k-tradingagents-paper-guard-v11/backup')
 BACKEND = 'ta-live-088a60b962bf-backend-1'
 FRONTEND = 'ta-live-088a60b962bf-frontend-1'
+FRONTEND_CERT_SHA256 = 'd8245a033b6e0ed360a5b7b64a14b8757b15fcec9a90a69cd0300e0dd2935be4'
 MONGO = 'ta-live-088a60b962bf-mongodb-1'
 JOBS = ['akshare_quotes_sync','quotes_ingestion_service','etf_sync','tushare_realtime_quotes_hourly']
 STATE = {'stage': 'initializing', 'events': []}
@@ -191,47 +193,69 @@ def smoke():
     private_json('installed-smoke.json', {'result': result})
 
 
-def verify_frontend_resources(expected, timeout=45):
+def verify_frontend_resources(expected, ca_pem, timeout=45):
     """Wait for the listener, but never retry HTTP errors or mismatched bytes."""
     import hashlib
+    import http.client
+    import socket
+    import ssl
     import time
-    import urllib.error
-    import urllib.request
 
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    context = ssl.create_default_context(cadata=ca_pem)
     deadline = time.monotonic() + timeout
     attempts = 0
     while True:
         attempts += 1
+        connection = None
         try:
             for path, expected_hash in expected.items():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError('frontend_http_ready_timeout')
-                with opener.open('http://frontend/' + path, timeout=min(5, remaining)) as response:
-                    data = response.read()
+                # Route inside Docker while retaining localhost SNI, Host and certificate verification.
+                connection = http.client.HTTPSConnection('localhost', 8080, timeout=min(5, remaining), context=context)
+                connection._create_connection = lambda address, timeout, source_address: socket.create_connection(
+                    ('frontend', address[1]), timeout, source_address)
+                connection.request('GET', '/' + path)
+                response = connection.getresponse()
+                if response.status != 200:
+                    raise RuntimeError('frontend_http_status_failed')
+                data = response.read()
+                connection.close()
+                connection = None
                 if hashlib.sha256(data).hexdigest() != expected_hash:
                     raise RuntimeError('frontend_http_hash_mismatch')
             return {'verified_http_resources': len(expected), 'attempts': attempts}
-        except urllib.error.HTTPError:
-            raise RuntimeError('frontend_http_status_failed') from None
-        except (urllib.error.URLError, TimeoutError, ConnectionError):
+        except (TimeoutError, ConnectionError, socket.gaierror):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError('frontend_http_ready_timeout') from None
             time.sleep(min(1, remaining))
+        finally:
+            if connection is not None:
+                connection.close()
 
 
-def frontend_http_probe():
-    index = (STAGED/'frontend-dist/index.html').read_text()
+def frontend_http_probe(new=True):
+    import ssl
+    cert_path = next(m['Source'] for m in inspect('frontend')['Mounts']
+                     if m['Destination'] == '/run/secrets/tls-cert.pem')
+    ca_pem = Path(cert_path).read_text()
+    require(digest(ssl.PEM_cert_to_DER_cert(ca_pem)) == FRONTEND_CERT_SHA256, 'frontend_certificate_changed')
+    def read_asset(path):
+        if new:
+            return (STAGED/'frontend-dist'/path).read_bytes()
+        with tarfile.open(BACKUP/'frontend-before.tar') as archive:
+            return archive.extractfile('./' + path).read()
+    index = read_asset('index.html').decode()
     paths = ['index.html'] + re.findall(r'(?:src|href)=["\'](/(?:js|css|assets)/[^"\']+)["\']', index)
     checks = {}
     for value in paths:
         path = value.lstrip('/')
         require('..' not in Path(path).parts, 'unsafe_asset_path')
-        checks[path] = digest((STAGED/'frontend-dist'/path).read_bytes())
+        checks[path] = digest(read_asset(path))
     code = source_inspect.getsource(verify_frontend_resources)
-    code += '\nimport json\nprint(json.dumps(verify_frontend_resources(' + repr(checks) + ')))\n'
+    code += '\nimport json\nprint(json.dumps(verify_frontend_resources(' + repr(checks) + ', ' + repr(ca_pem) + ')))\n'
     return json.loads(in_backend(code))
 
 
@@ -261,6 +285,7 @@ def preflight():
     private_json('runtime-before-switch.json', runtime_probe())
     private_json('db-before-stop.json', db_probe())
     api_probe('jobs-immediate-before.json')
+    private_json('frontend-http-before.json', frontend_http_probe(False))
 
 
 def rollback():
@@ -284,6 +309,7 @@ def rollback():
     if STATE.get('frontend_attempted'):
         up('frontend', False)
         check_running('frontend', config('frontend', False))
+    private_json('frontend-http-rollback.json', frontend_http_probe(False))
     event('rolled_back')
 
 

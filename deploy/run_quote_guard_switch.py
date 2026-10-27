@@ -81,7 +81,7 @@ if pidfile.exists():
                  'runtime-before-switch.json','db-before-stop.json','jobs-immediate-before.json',
                  'db-stopped-baseline.json','runtime-module-hashes.json','installed-smoke.json',
                  'jobs-after-backend.json','frontend-http.json','db-after-switch.json','completion.json',
-                 'jobs-after-rollback.json']:
+                 'jobs-after-rollback.json','frontend-http-before.json','frontend-http-rollback.json']:
         source=root/name
         if source.exists():source.rename(archive/name)
 logfd=os.open(root/'switch-process.log',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
