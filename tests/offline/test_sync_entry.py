@@ -16,7 +16,8 @@ import types
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
+from unittest.mock import patch
 
 sys.path.insert(0, ".")
 os.environ.setdefault("QUOTES_WRITE_ENABLED", "1")
@@ -81,6 +82,7 @@ def load_entry(now):
         "Dict": Dict,
         "List": list,
         "Optional": Optional,
+        "Set": Set,
     }
     exec(compile(module, str(SRC), "exec"), ns)
     return ns["sync_realtime_quotes"]
@@ -161,8 +163,7 @@ class FakeSelf:
 
     async def _batch_update_quotes_to_db(self, quotes_map, captured_at=None):
         self.batch_calls.append(captured_at)
-        self._last_batch_accepted = set(quotes_map)
-        return len(quotes_map)
+        return set(quotes_map)
 
 
 def install_calendar(is_trade_day=True, source="akshare"):
@@ -240,6 +241,109 @@ class TestSyncEntry(unittest.TestCase):
         self.assertEqual(fake.db.writes, [])
 
 
+def bind_real_writers(fake, now=NOW):
+    """执行真实入口、单只保存、批量写入和更新构造，仅替换外部依赖。"""
+    entry = load_entry(now)
+    ns = entry.__globals__
+    tree = ast.parse(SRC.read_text(encoding="utf-8"))
+    spec = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "_mongo_update_spec")
+    exec(compile(ast.Module(body=[spec], type_ignores=[]), str(SRC), "exec"), ns)
+    ns["pymongo"] = types.SimpleNamespace(
+        UpdateOne=lambda query, update, upsert: (query, update, upsert))
+    exec(compile(_extract_methods({"_batch_update_quotes_to_db", "_get_and_save_quotes"}),
+                 str(SRC), "exec"), ns)
+    for name in ("_batch_update_quotes_to_db", "_get_and_save_quotes"):
+        setattr(fake, name, types.MethodType(ns[name], fake))
+    return entry
+
+
+class TestConfirmedWrites(unittest.TestCase):
+    def setUp(self):
+        self.env = patch.dict(os.environ, {"QUOTES_WRITE_ENABLED": "1"})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        install_calendar()
+        self.addCleanup(sys.modules.pop, "app.services.trading_calendar_service", None)
+        self.quote = {"close": 10.0, "high": 11.0, "low": 9.0}
+        self.fake = FakeSelf(FakeProvider(batch={"600000": dict(self.quote)}), ["600000"], NOW)
+        self.entry = bind_real_writers(self.fake)
+        self.bulk_calls = []
+
+        async def bulk(operations, ordered=False):
+            self.bulk_calls.append(operations)
+            return types.SimpleNamespace(acknowledged=True, matched_count=len(operations),
+                                         modified_count=0, upserted_count=0)
+        self.fake.db.market_quotes.bulk_write = bulk
+
+    def run_entry(self):
+        return asyncio.run(self.entry(self.fake, symbols=["600000"], manual_mode=True))
+
+    def test_closed_gate_manual_fallback_has_no_writes_or_success(self):
+        os.environ["QUOTES_WRITE_ENABLED"] = "0"
+        stats = self.run_entry()
+        self.assertIs(stats.get("success"), False)
+        self.assertEqual(stats["success_count"], 0)
+        self.assertEqual(self.bulk_calls, [])
+        self.assertEqual(self.fake.db.writes, [])
+
+    def test_database_exception_does_not_report_success(self):
+        async def fail(*a, **k):
+            raise RuntimeError("simulated database failure")
+        self.fake.db.market_quotes.bulk_write = fail
+        stats = self.run_entry()
+        self.assertEqual(stats["success_count"], 0)
+        self.assertIs(stats.get("success"), False)
+
+    def test_acknowledged_idempotent_write_is_success(self):
+        stats = self.run_entry()
+        self.assertEqual(stats["success_count"], 1)
+        self.assertEqual(stats["error_count"], 0)
+        self.assertEqual(len(self.bulk_calls), 1)
+
+    def test_unacknowledged_write_is_not_success(self):
+        async def unacknowledged(*a, **k):
+            return types.SimpleNamespace(acknowledged=False)
+        self.fake.db.market_quotes.bulk_write = unacknowledged
+        self.assertIs(self.run_entry().get("success"), False)
+
+    def test_inconsistent_acknowledged_count_is_not_success(self):
+        async def missing(*a, **k):
+            return types.SimpleNamespace(acknowledged=True, matched_count=0, upserted_count=0)
+        self.fake.db.market_quotes.bulk_write = missing
+        self.assertIs(self.run_entry().get("success"), False)
+
+    def test_rejected_target_not_success_when_other_symbol_written(self):
+        self.fake.provider._batch = {"600000": {"close": None}, "600001": self.quote}
+        self.assertIs(self.run_entry().get("success"), False)
+        self.assertEqual(len(self.bulk_calls[0]), 1)
+
+    def test_single_provider_batch_requires_target_confirmation(self):
+        self.fake.provider._quote = {
+            "_from_batch": True, "_batch_data": {"600001": self.quote}}
+        self.assertFalse(asyncio.run(self.fake._get_and_save_quotes("600000")))
+        self.assertEqual(len(self.bulk_calls), 1)
+
+    def test_later_failed_batch_preserves_only_prior_confirmations(self):
+        async def bulk(operations, ordered=False):
+            self.bulk_calls.append(operations)
+            if len(self.bulk_calls) == 2:
+                raise RuntimeError("second batch failed, possibly partially written")
+            return types.SimpleNamespace(acknowledged=True, matched_count=len(operations),
+                                         modified_count=0, upserted_count=0)
+        self.fake.db.market_quotes.bulk_write = bulk
+        payload = {str(600000 + i): self.quote for i in range(101)}
+        confirmed = asyncio.run(self.fake._batch_update_quotes_to_db(payload, NOW))
+        self.assertEqual(confirmed, set(list(payload)[:100]))
+
+    def test_independent_calls_do_not_share_confirmation_state(self):
+        async def concurrent():
+            return await asyncio.gather(
+                self.fake._batch_update_quotes_to_db({"600000": self.quote}, NOW),
+                self.fake._batch_update_quotes_to_db({"600001": self.quote}, NOW))
+        self.assertEqual(asyncio.run(concurrent()), [{"600000"}, {"600001"}])
+
+
 class TestWriteGateCoverage(unittest.TestCase):
     """写闸必须覆盖所有已知 market_quotes 写入点，而不是只覆盖 AKShare 批量路径。"""
 
@@ -255,6 +359,36 @@ class TestWriteGateCoverage(unittest.TestCase):
         for path in self.WRITERS:
             text = pathlib.Path(path).read_text(encoding="utf-8")
             self.assertTrue("quotes_write_enabled" in text or "prepare_quote_write" in text, path)
+
+    def test_other_writers_refuse_without_database_access(self):
+        def forbidden_db():
+            raise AssertionError("写闸关闭时不得取得数据库")
+
+        class ForbiddenDB:
+            def __getattr__(self, name):
+                raise AssertionError("写闸关闭时不得访问集合")
+
+        adapter = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_realtime_quotes=lambda: {"600000": {"close": 10}})
+        cases = [
+            ("app/services/quotes_ingestion_service.py", "_bulk_upsert",
+             ({"600000": {"close": 10}}, "2026-10-27")),
+            ("app/services/stock_data_service.py", "update_market_quotes",
+             ("600000", {"close": 10})),
+            ("app/worker/qmt_sync_service.py", "sync_realtime_quotes", ()),
+        ]
+        for path, name, args in cases:
+            with self.subTest(writer=path):
+                tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"))
+                node = next(n for n in ast.walk(tree)
+                            if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
+                ns = {"quotes_write_enabled": lambda: False, "get_mongo_db": forbidden_db,
+                      "logger": _Logger(), "datetime": datetime, "Dict": Dict, "Any": Any,
+                      "Optional": Optional, "List": list}
+                exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), ns)
+                fake = types.SimpleNamespace(adapter=adapter, db=ForbiddenDB())
+                asyncio.run(ns[name](fake, *args))
 
     def test_history_backfill_skips_when_gate_closed(self):
         """个股历史同步回写 market_quotes 不得绕过写闸。"""

@@ -5,7 +5,7 @@ AKShare数据同步服务
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 import pymongo
 
 from app.core.database import bind_loop_safe_mongo_db, get_mongo_db
@@ -544,18 +544,17 @@ class AKShareSyncService:
                                 if quotes_map:
                                     # 🔥 全量同步成功，批量更新所有数据到数据库
                                     logger.info(f"✅ 全量同步成功，获取到 {len(quotes_map)} 只股票数据，开始批量更新到数据库...")
-                                    updated_count = await self._batch_update_quotes_to_db(quotes_map, captured_at)
-                                    logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
+                                    confirmed = await self._batch_update_quotes_to_db(quotes_map, captured_at)
+                                    logger.info(f"✅ 批量写入已确认 {len(confirmed)} 只股票数据")
                                     
-                                    # 以「实际被写入」为准，而不是「返回载荷里有」
-                                    accepted = getattr(self, "_last_batch_accepted", set())
-                                    if symbol in accepted:
+                                    # 只接受本次数据库已确认的结果，不共享可被并发覆盖的实例状态。
+                                    if symbol in confirmed:
                                         stats["success_count"] = 1
                                     else:
                                         stats["error_count"] = 1
                                         stats["errors"].append({
                                             "code": symbol,
-                                            "error": "全量同步中未找到该股票数据",
+                                            "error": "全量同步未确认该股票写入（缺失、拒写或数据库失败）",
                                             "context": "sync_realtime_quotes_single_fallback"
                                         })
                                 else:
@@ -887,10 +886,7 @@ class AKShareSyncService:
     
     async def _batch_update_quotes_to_db(
         self, quotes_map: Dict[str, Dict[str, Any]], captured_at: Optional[datetime] = None
-    ) -> int:
-        # 记录本次真正被契约接受的代码，供「单股回退」等调用方判断成功与否，
-        # 不能仅凭「返回载荷里有这只票」就算成功。
-        self._last_batch_accepted = set()
+    ) -> Set[str]:
         """
         批量更新行情数据到数据库
         
@@ -898,9 +894,12 @@ class AKShareSyncService:
             quotes_map: 股票代码到行情数据的映射字典
             
         Returns:
-            成功更新的股票数量
+            本次数据库已确认写入的代码；幂等更新也算成功。
+
+        批次抛错或未确认时，不把该批候选代码计为成功。无序批次可能已部分
+        写入，故空结果仅表示未确认，不能据此宣称数据库没有变化。
         """
-        updated_count = 0
+        confirmed: Set[str] = set()
         batch_size = 100  # 每批处理100只股票
         
         try:
@@ -909,6 +908,7 @@ class AKShareSyncService:
             for i in range(0, len(symbols_list), batch_size):
                 batch = symbols_list[i:i + batch_size]
                 operations = []
+                batch_symbols = set()
                 
                 for symbol in batch:
                     quotes = quotes_map.get(symbol)
@@ -940,18 +940,24 @@ class AKShareSyncService:
                                 upsert=True
                             )
                         )
-                        self._last_batch_accepted.add(symbol)
+                        batch_symbols.add(symbol)
                 
                 if operations:
                     # 批量执行更新操作
                     result = await self.db.market_quotes.bulk_write(operations, ordered=False)
-                    updated_count += result.modified_count + result.upserted_count
-                    logger.debug(f"📊 批量更新进度: {min(i + batch_size, len(symbols_list))}/{len(symbols_list)} (已更新: {updated_count})")
+                    if not result.acknowledged:
+                        raise RuntimeError("行情批量写入未获得数据库确认")
+                    # upsert=True：每条操作应匹配已有记录或插入新记录。
+                    # modified_count=0 可以是合法的幂等更新，不能据此判失败。
+                    if result.matched_count + result.upserted_count != len(operations):
+                        raise RuntimeError("行情批量写入确认数量与提交数量不一致")
+                    confirmed.update(batch_symbols)
+                    logger.debug(f"📊 批量更新进度: {min(i + batch_size, len(symbols_list))}/{len(symbols_list)} (已确认: {len(confirmed)})")
             
-            return updated_count
+            return confirmed
         except Exception as e:
             logger.error(f"❌ 批量更新行情数据失败: {e}", exc_info=True)
-            return updated_count
+            return confirmed
     
     async def _get_and_save_quotes(self, symbol: str) -> bool:
         """获取并保存单个股票行情"""
@@ -991,8 +997,9 @@ class AKShareSyncService:
                 if from_batch and batch_data:
                     # 🔥 通过批量接口获取的，批量更新全市场数据到数据库
                     logger.info(f"📊 检测到批量接口数据，开始批量更新 {len(batch_data)} 只股票的行情到数据库...")
-                    updated_count = await self._batch_update_quotes_to_db(batch_data, captured_at)
-                    logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
+                    confirmed = await self._batch_update_quotes_to_db(batch_data, captured_at)
+                    logger.info(f"✅ 批量写入已确认 {len(confirmed)} 只股票数据")
+                    return symbol in confirmed
                 else:
                     # 单个股票数据，单独保存（与批量路径共用同一规范化实现）
                     quotes_data, _unset, _doc_reason = prepare_quote_write(
