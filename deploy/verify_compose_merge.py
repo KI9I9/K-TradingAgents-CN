@@ -1,56 +1,108 @@
 #!/usr/bin/env python3
-"""比对「重建前/重建后」的 compose 合并结果，防止改挂载时动到别的东西。
+"""比对 compose 合并结果与运行容器，确保「只新增指定挂载」且其它配置未漂移。
 
-只用标准库：`docker compose config --format json` 输出的 image 已是镜像 ID，
-因此可以直接做等价比较，不需要拉取或猜测 tag。
+只用标准库。`docker compose config --format json` 的 image 是否已是镜像 ID
+取决于输入写法，因此本脚本**不假设**，而是额外与运行容器的 Image ID 比对。
 
 用法：
     python3 verify_compose_merge.py before.json after.json \
-        --allow backend:/app/app/routers/paper.py,/app/app/services/quote_contract.py
+        --allow backend:/app/app/routers/paper.py=/srv/paper.py \
+        --allow backend:/app/app/services/quote_contract.py=/srv/quote_contract.py \
+        [--running before-backend.json]
 
-退出码 0 表示通过；任何一项不符即非 0，调用方必须停止，不得继续重建。
+`--allow` 语法：service:target=source，默认还要求 read_only=True。
+退出码非 0 即必须停止，不得继续重建。
 """
 import argparse
 import json
 import sys
 
 
-def norm_entry(value):
-    if value is None:
-        return []
-    return list(value)
+def norm_list(value):
+    return list(value) if value else []
 
 
-def norm_volumes(service):
-    """把 compose 的挂载列表规范化为 (type, source, target, read_only) 集合。"""
+def norm_env(service):
+    env = service.get("environment") or {}
+    if isinstance(env, list):
+        out = {}
+        for item in env:
+            key, _, val = str(item).partition("=")
+            out[key] = val
+        return out
+    return {str(k): "" if v is None else str(v) for k, v in env.items()}
+
+
+def mount_map(service):
     out = {}
     for item in service.get("volumes") or []:
         if not isinstance(item, dict):
             raise SystemExit(f"不支持的挂载写法: {item!r}")
-        key = (item.get("type"), item.get("source"), item.get("target"), bool(item.get("read_only")))
-        out[key] = item
+        out[(item.get("type"), item.get("source"), item.get("target"),
+             bool(item.get("read_only")))] = item
     return out
 
 
-def describe(key):
+def desc(key):
     return f"{key[0]}|{key[1]}|{key[2]}|ro={key[3]}"
+
+
+def parse_allow(specs):
+    allowed = {}
+    for spec in specs:
+        try:
+            svc, rest = spec.split(":", 1)
+            target, source = rest.split("=", 1)
+        except ValueError:
+            raise SystemExit(f"--allow 格式应为 service:target=source，收到 {spec!r}")
+        allowed.setdefault(svc, {})[target.strip()] = source.strip()
+    return allowed
+
+
+def compare_running(inspect_path, merged_before, errors):
+    raw = json.load(open(inspect_path))
+    c = raw[0] if isinstance(raw, list) else raw
+    backend = merged_before["services"]["backend"]
+
+    if c.get("Image") != backend.get("image"):
+        errors.append(
+            f"[running] 运行容器镜像 ID 与合并配置不一致: {c.get('Image')} vs {backend.get('image')}"
+        )
+    if norm_list(c.get("Config", {}).get("Entrypoint")) != norm_list(backend.get("entrypoint")):
+        errors.append("[running] entrypoint 与合并配置不一致")
+    if norm_list(c.get("Config", {}).get("Cmd")) != norm_list(backend.get("command")):
+        errors.append("[running] command 与合并配置不一致")
+
+    running = {}
+    for m in c.get("Mounts") or []:
+        running[(m.get("Type"), m.get("Source"), m.get("Destination"), not m.get("RW", True))] = m
+    compose = mount_map(backend)
+
+    missing = [desc(k) for k in running if k not in compose]
+    extra = [desc(k) for k in compose if k not in running]
+    if missing:
+        errors.append(f"[running] 运行容器有、合并配置没有: {missing}")
+    if extra:
+        errors.append(f"[running] 合并配置有、运行容器没有: {extra}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("before")
     ap.add_argument("after")
-    ap.add_argument("--allow", action="append", default=[],
-                    help="service:target1,target2 —— 允许新增的挂载目标")
+    ap.add_argument("--allow", action="append", default=[])
+    ap.add_argument("--allow-env", action="append", default=[],
+                    help="service:KEY —— 允许变化的环境变量")
+    ap.add_argument("--running", help="重建前的 docker inspect JSON，用于核对无漂移")
     args = ap.parse_args()
 
     before = json.load(open(args.before))
     after = json.load(open(args.after))
-
-    allowed = {}
-    for spec in args.allow:
-        svc, targets = spec.split(":", 1)
-        allowed.setdefault(svc, set()).update(t.strip() for t in targets.split(",") if t.strip())
+    allowed = parse_allow(args.allow)
+    allowed_env = {}
+    for spec in args.allow_env:
+        svc, key = spec.split(":", 1)
+        allowed_env.setdefault(svc, set()).add(key)
 
     errors = []
 
@@ -64,31 +116,38 @@ def main():
 
         if b.get("image") != a.get("image"):
             errors.append(f"[{name}] 镜像变化: {b.get('image')} -> {a.get('image')}")
+        if norm_list(b.get("entrypoint")) != norm_list(a.get("entrypoint")):
+            errors.append(f"[{name}] entrypoint 变化")
+        if norm_list(b.get("command")) != norm_list(a.get("command")):
+            errors.append(f"[{name}] command 变化")
 
-        if norm_entry(b.get("entrypoint")) != norm_entry(a.get("entrypoint")):
-            errors.append(f"[{name}] entrypoint 变化: {b.get('entrypoint')} -> {a.get('entrypoint')}")
+        be, ae = norm_env(b), norm_env(a)
+        for key in sorted(set(be) | set(ae)):
+            if be.get(key) != ae.get(key) and key not in allowed_env.get(name, set()):
+                errors.append(f"[{name}] 环境变量变化: {key} {be.get(key)!r} -> {ae.get(key)!r}")
 
-        if norm_entry(b.get("command")) != norm_entry(a.get("command")):
-            errors.append(f"[{name}] command 变化: {b.get('command')} -> {a.get('command')}")
-
-        bv, av = norm_volumes(b), norm_volumes(a)
-        missing = [describe(k) for k in bv if k not in av]
+        bv, av = mount_map(b), mount_map(a)
+        missing = [desc(k) for k in bv if k not in av]
         if missing:
-            errors.append(f"[{name}] 原有挂载缺失: {missing}")
+            errors.append(f"[{name}] 原有挂载缺失或属性变化: {missing}")
 
         added = [k for k in av if k not in bv]
-        unexpected = [describe(k) for k in added if k[2] not in allowed.get(name, set())]
-        if unexpected:
-            errors.append(f"[{name}] 出现非预期挂载: {unexpected}")
+        expect = allowed.get(name, {})
+        for key in added:
+            if key[2] not in expect:
+                errors.append(f"[{name}] 出现非预期挂载: {desc(key)}")
+                continue
+            if not key[3]:
+                errors.append(f"[{name}] 新增挂载未设只读: {desc(key)}")
+            if key[1] != expect[key[2]]:
+                errors.append(f"[{name}] 新增挂载源不符: {key[2]} 期望 {expect[key[2]]} 实际 {key[1]}")
 
-        expect_added = allowed.get(name, set())
-        if expect_added:
-            got = {k[2] for k in added}
-            if got != expect_added:
-                errors.append(f"[{name}] 新增挂载不符预期: 期望 {sorted(expect_added)} 实际 {sorted(got)}")
-            for key in added:
-                if not key[1] or not key[1].startswith("/"):
-                    errors.append(f"[{name}] 新增挂载 source 不是绝对路径: {describe(key)}")
+        got = {k[2] for k in added}
+        if expect and got != set(expect):
+            errors.append(f"[{name}] 新增挂载集合不符: 期望 {sorted(expect)} 实际 {sorted(got)}")
+
+    if args.running:
+        compare_running(args.running, before, errors)
 
     if errors:
         print("MERGE_CHECK_FAILED")
@@ -97,7 +156,7 @@ def main():
         return 1
 
     summary = ", ".join(
-        f"{n}={len(norm_volumes(after['services'][n]))}" for n in sorted(after["services"])
+        f"{n}={len(mount_map(after['services'][n]))}" for n in sorted(after["services"])
     )
     print(f"MERGE_CHECK_OK services_mounts[{summary}]")
     return 0

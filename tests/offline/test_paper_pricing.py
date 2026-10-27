@@ -93,6 +93,7 @@ def quote_doc(**kw):
         "code": "600000", "trade_date": "2026-10-27",
         "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0,
         "quote_time_source": "fetch",
+        "trading_status": "trading",
         "fetched_at": (NOW - timedelta(minutes=10)).isoformat(),
         "snapshot_interval_seconds": 1800,
         "updated_at": NOW.isoformat(),
@@ -104,7 +105,8 @@ def quote_doc(**kw):
 def bar_doc(**kw):
     base = {
         "trade_date": "2026-10-27", "open": 9.5, "high": 11.0, "low": 9.0,
-        "close": 10.0, "updated_at": "2026-10-27T15:10:00+08:00",
+        "close": 10.0, "is_final": True, "trading_status": "trading",
+        "updated_at": "2026-10-27T15:10:00+08:00",
     }
     base.update(kw)
     return base
@@ -167,11 +169,34 @@ class TestPaperRangeChain(unittest.TestCase):
         self.assertEqual(basis["source"], "market_quotes")
 
     def test_limit_notice_mentions_specified_price(self):
-        ns = load_paper_functions(("_build_limit_notice",), {}, NOW)
-        text = ns["_build_limit_notice"](10.5, {"channel": "fetch"}, 11.0, 9.0)
+        ns = load_paper_functions(("_build_limit_notice", "_format_hhmmss"), {}, NOW)
+        text = ns["_build_limit_notice"](
+            10.5,
+            {"channel": "fetch", "as_of": "2026-10-27T14:00:00+08:00",
+             "delay_seconds": 600, "max_delay_seconds": 1920},
+            11.0, 9.0)
         self.assertIn("指定", text)
         self.assertIn("10.50", text)
+        self.assertIn("14:00:00", text)
+        self.assertIn("有效期", text)
         self.assertIn("上游报价时间未知", text)
+
+    def test_limit_notice_upstream_does_not_claim_unknown(self):
+        ns = load_paper_functions(("_build_limit_notice", "_format_hhmmss"), {}, NOW)
+        text = ns["_build_limit_notice"](
+            10.5, {"channel": "upstream", "as_of": "2026-10-27T13:50:00+08:00"}, 11.0, 9.0)
+        self.assertIn("上游行情时间 13:50:00", text)
+        self.assertNotIn("上游报价时间未知", text)
+
+    def test_display_falls_back_when_quote_price_invalid(self):
+        """评审 P2-5：应按「价格不可用」回退，而不是「记录不存在」。"""
+        ns = load_paper_functions(
+            ("_load_cn_candidates", "_get_last_price_detail"),
+            {"market_quotes": quote_doc(close=0), "stock_basic_info": {"current_price": 10.0}},
+            NOW)
+        price, basis, reason = asyncio.run(ns["_get_last_price_detail"]("600000", "CN", False))
+        self.assertEqual(price, 10.0)
+        self.assertEqual(basis["source"], "stock_basic_info")
 
 
 class TestPaperStructure(unittest.TestCase):

@@ -306,7 +306,7 @@ async def _load_cn_candidates(
         "stock_daily_quotes": None,
     }
 
-    if mode == "display" and candidates["market_quotes"] is None:
+    if mode == "display":
         candidates["stock_basic_info"] = await db["stock_basic_info"].find_one(
             code_filter, {"_id": 0, "current_price": 1, "updated_at": 1}
         )
@@ -436,13 +436,35 @@ def _build_market_notice(basis: Optional[Dict[str, Any]]) -> Optional[str]:
     return basis.get("notice") if isinstance(basis, dict) else None
 
 
+def _format_hhmmss(value: Any) -> str:
+    text = str(value or "")
+    return text[11:19] if len(text) >= 19 else "未知时刻"
+
+
 def _build_limit_notice(
     price: float, basis: Optional[Dict[str, Any]], high: float, low: float
 ) -> str:
-    channel = (basis or {}).get("channel")
-    source = "当日日线" if channel == "daily_close" else "近实时行情"
+    """指定价单的告知：说明「区间」来自哪条依据，以及该依据的时效边界。
+
+    成交价是用户给的，所以不能照抄市价单的「按快照定价」；这里描述的是区间校验依据。
+    """
+    basis = basis or {}
+    channel = basis.get("channel")
+    span = f"区间 {low:.2f}–{high:.2f}"
+
+    if channel == "daily_close":
+        day = basis.get("trade_date") or "当日"
+        return f"按你指定的价格 {price:.2f} 成交；{span} 取自 {day} 收盘日线校验。"
+
+    stamp = _format_hhmmss(basis.get("as_of"))
+    if channel == "upstream":
+        return f"按你指定的价格 {price:.2f} 成交；{span} 取自上游行情时间 {stamp} 的行情校验。"
+
+    minutes = int((basis.get("max_delay_seconds") or 0) // 60)
+    elapsed = int(max(0, basis.get("delay_seconds") or 0) // 60)
     return (
-        f"按你指定的价格 {price:.2f} 成交；区间 {low:.2f}–{high:.2f} 取自{source}校验。"
+        f"按你指定的价格 {price:.2f} 成交；{span} 取自 {stamp} 采集的快照校验，"
+        f"距采集已 {elapsed} 分钟，采集后有效期为 {minutes} 分钟。"
         f"上游报价时间未知，可能存在额外延迟。"
     )
 

@@ -5,8 +5,11 @@
 """
 
 import ast
+import os
 import sys
 import unittest
+
+os.environ.setdefault("QUOTES_WRITE_ENABLED", "1")
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -64,7 +67,8 @@ class TestUpdateSpec(unittest.TestCase):
             "quote_time_source": "upstream", "fetched_at": "2026-10-26T14:00:05+08:00",
         }
         doc, unset, reason = prepare_quote_write(
-            {"close": 10.0, "high": 11.0, "low": 9.0, "symbol": "600000"},
+            {"close": 10.0, "high": 11.0, "low": 9.0, "symbol": "600000",
+             "trading_status": "trading"},
             "600000", "2026-10-27", NOW, 1800)
         self.assertEqual(reason, "ok")
         merged = apply_spec(existing, self.spec_builder(doc, unset))
@@ -80,8 +84,8 @@ class TestCapturedAtSemantics(unittest.TestCase):
         captured = datetime(2026, 10, 27, 14, 0, tzinfo=CN_TZ)
         write_at = datetime(2026, 10, 27, 15, 10, tzinfo=CN_TZ)
         doc, _, _ = prepare_quote_write(
-            {"close": 10.0, "high": 11.0, "low": 9.0}, "600000", "2026-10-27",
-            write_at, 1800, captured_at=captured)
+            {"close": 10.0, "high": 11.0, "low": 9.0, "trading_status": "trading"},
+            "600000", "2026-10-27", write_at, 1800, captured_at=captured)
         self.assertTrue(doc["fetched_at"].startswith("2026-10-27T14:00:00"))
         self.assertTrue(doc["updated_at"].startswith("2026-10-27T15:10:00"))
         # 15:10 已过 15:30 之前但超出采集后有效期 → 必须拒绝

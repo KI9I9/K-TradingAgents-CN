@@ -540,6 +540,7 @@ class AKShareSyncService:
                             all_symbols = await self._get_all_listed_symbols()
                             if all_symbols:
                                 quotes_map = await self.provider.get_batch_stock_quotes(all_symbols)
+                                captured_at = cn_now()
                                 if quotes_map:
                                     # 🔥 全量同步成功，批量更新所有数据到数据库
                                     logger.info(f"✅ 全量同步成功，获取到 {len(quotes_map)} 只股票数据，开始批量更新到数据库...")
@@ -737,6 +738,10 @@ class AKShareSyncService:
                     await mark_job_completed(job_id, stats)
                 except Exception as e:
                     logger.warning(f"⚠️ 更新任务完成状态失败: {e}")
+
+            # 全部失败必须显式失败：只塞 errors 会被调度层记成成功
+            if stats["success_count"] == 0 and stats["error_count"] > 0:
+                stats["success"] = False
 
             return stats
 

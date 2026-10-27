@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import math
+import os
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +56,21 @@ SNAPSHOT_SESSION_END = time(15, 30)
 QUOTE_TIME_SOURCE_UPSTREAM = "upstream"
 QUOTE_TIME_SOURCE_FETCH = "fetch"
 
+# —— 写入总闸 ——
+# 供给隔离期间默认关闭：所有写入路径（定时、手动、单只、批量）都经过
+# prepare_quote_write，因此这一处即可覆盖全部入口，不依赖调度任务是否暂停。
+DEFAULT_QUOTES_WRITE_ENABLED = False
+
+# —— 交易状态 ——
+# 状态未知不等于可交易；只有明确「交易中」才允许作为成交依据。
+TRADING_STATUS_VALUES = ("trading", "normal", "交易", "交易中", "正常", "连续竞价")
+SUSPENDED_VALUES = ("suspended", "halted", "停牌")
+ALLOW_MISSING_TRADING_STATUS = False
+
+# —— 日线最终性 ——
+# 只认显式最终标记；写入时间不能证明数据完整或口径正确。
+BAR_FINAL_STATES = ("final", "closed", "finished", "已收盘", "最终")
+
 # 日线回退：必须在收盘后，且该日线本身是收盘后写入的（完成状态代理）。
 DAILY_BAR_FINAL_AFTER = time(15, 0)
 DAILY_FALLBACK_AFTER = time(15, 5)
@@ -76,6 +92,46 @@ ALIAS_TO_STANDARD = (("open", "open_price"), ("high", "high_price"), ("low", "lo
 VOLUME_UNIT_LOT = "lot"
 VOLUME_UNIT_SHARE = "share"
 _SHARE_UNITS = ("share", "shares", "股")
+
+
+def quotes_write_enabled(env=None) -> bool:
+    """行情写入总闸。默认关闭；只有显式开启才允许写库。
+
+    覆盖全部入口的关键：定时任务、手动同步、单只保存、批量写入都必须经过
+    `prepare_quote_write`，闸门放在这里，就不需要依赖「任务是否暂停」这一假设。
+    """
+    environ = env if env is not None else os.environ
+    raw = environ.get("QUOTES_WRITE_ENABLED")
+    if raw is None:
+        return DEFAULT_QUOTES_WRITE_ENABLED
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def trading_status_ok(record: Dict[str, Any]) -> Tuple[Optional[bool], str]:
+    """返回 (是否可交易, 原因)。None 表示未知，调用方必须拒绝。"""
+    raw = (record or {}).get("trading_status")
+    if raw is None:
+        if ALLOW_MISSING_TRADING_STATUS:
+            return True, "trading_status_assumed"
+        return None, "trading_status_missing"
+    if not isinstance(raw, str):
+        return None, "trading_status_invalid"
+    text = raw.strip().lower()
+    if text in TRADING_STATUS_VALUES:
+        return True, "ok"
+    if text in SUSPENDED_VALUES:
+        return None, "security_suspended"
+    return None, f"trading_status_unknown:{raw}"
+
+
+def bar_finality_ok(bar: Dict[str, Any]) -> Tuple[bool, str]:
+    """日线最终性证据：只认显式标记，不用写入时间代替。"""
+    if (bar or {}).get("is_final") is True:
+        return True, "ok"
+    raw = (bar or {}).get("final_state")
+    if isinstance(raw, str) and raw.strip().lower() in BAR_FINAL_STATES:
+        return True, "ok"
+    return False, "bar_finality_unproven"
 
 
 def cn_now() -> datetime:
@@ -237,6 +293,10 @@ def quote_is_usable(
     if require_trade_date and not is_same_trade_date(quote.get("trade_date"), now.date()):
         return False, f"trade_date_mismatch:{quote.get('trade_date')}"
 
+    status_ok, status_reason = trading_status_ok(quote)
+    if not status_ok:
+        return False, status_reason
+
     raw_quote_time = quote.get("quote_time")
     if raw_quote_time not in (None, ""):
         quote_time = parse_quote_time(raw_quote_time)
@@ -357,6 +417,9 @@ def quote_price_and_basis(
     usable, reason = quote_is_usable(quote, now)
     if not usable:
         return None, None, reason
+    high, low, range_reason = validate_price_range(quote)
+    if high is None:
+        return None, None, f"range_{range_reason}"
     price, price_reason = validate_price(quote.get("close"))
     if price is None:
         return None, None, f"close_{price_reason}"
@@ -534,6 +597,14 @@ def daily_bar_is_final(bar: Dict[str, Any], now: datetime) -> Tuple[bool, str]:
     if not is_same_trade_date(bar.get("trade_date"), now.date()):
         return False, f"bar_trade_date_mismatch:{bar.get('trade_date')}"
 
+    final_ok, final_reason = bar_finality_ok(bar)
+    if not final_ok:
+        return False, final_reason
+
+    status_ok, status_reason = trading_status_ok(bar)
+    if not status_ok:
+        return False, status_reason
+
     written_at = parse_quote_time(bar.get("updated_at"))
     if written_at is None:
         return False, "bar_write_time_missing"
@@ -628,6 +699,9 @@ def prepare_quote_write(
     - `quote_time` 只透传上游；上游给了但解析不了 → 整条拒写（不降级成快照）；
     - 没有 `quote_time` 时返回 `["quote_time"]` 作为 `$unset`，防止旧通道字段残留。
     """
+    if not quotes_write_enabled():
+        return None, [], "quotes_write_disabled"
+
     payload: Dict[str, Any] = dict(quotes_data or {})
 
     for standard, alias in ALIAS_TO_STANDARD:

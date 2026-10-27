@@ -8,8 +8,11 @@
 - 数值与类型边界（inf / bool / 非字符串来源 / 未来写入时间）。
 """
 
+import os
 import sys
 import unittest
+
+os.environ.setdefault("QUOTES_WRITE_ENABLED", "1")
 from datetime import datetime, timedelta
 
 sys.path.insert(0, ".")
@@ -45,6 +48,7 @@ def q(**kw):
         "trade_date": "2026-10-27",
         "open": 10.0, "high": 11.0, "low": 9.0, "close": 10.0,
         "quote_time_source": "fetch",
+        "trading_status": "trading",
         "fetched_at": (NOW - timedelta(minutes=10)).isoformat(),
         "snapshot_interval_seconds": 1800,
         "updated_at": NOW.isoformat(),
@@ -57,6 +61,7 @@ def bar(**kw):
     base = {
         "symbol": "600000", "trade_date": "2026-10-27",
         "open": 9.5, "high": 11.0, "low": 9.0, "close": 10.0,
+        "is_final": True, "trading_status": "trading",
         "updated_at": "2026-10-27T15:10:00+08:00",
     }
     base.update(kw)
@@ -237,7 +242,7 @@ class TestBasisSameSource(unittest.TestCase):
         price, basis, reason = quote_price_and_basis(q(close=0), NOW)
         self.assertIsNone(price)
         self.assertIsNone(basis)
-        self.assertTrue(reason.startswith("close_"))
+        self.assertIn("close", reason)
 
     def test_display_basis_marks_not_tradable(self):
         price, basis = display_price_and_basis(q(trade_date="2026-10-20"), "market_quotes", NOW)
@@ -480,6 +485,80 @@ class TestSyncGate(unittest.TestCase):
         stats = build_failure_stats("pool_empty", "ctx")
         self.assertFalse(stats["success"])
         self.assertEqual(stats["error_count"], 1)
+
+
+class TestWriteGate(unittest.TestCase):
+    def test_default_is_disabled(self):
+        from app.services.quote_contract import quotes_write_enabled
+
+        self.assertFalse(quotes_write_enabled({}))
+
+    def test_enabled_values(self):
+        from app.services.quote_contract import quotes_write_enabled
+
+        for raw in ("1", "true", "on", "YES"):
+            self.assertTrue(quotes_write_enabled({"QUOTES_WRITE_ENABLED": raw}), raw)
+
+    def test_prepare_refused_when_disabled(self):
+        saved = os.environ.pop("QUOTES_WRITE_ENABLED", None)
+        try:
+            doc, unset, reason = prepare_quote_write(
+                {"close": 10, "high": 11, "low": 9}, "600000", "2026-10-27", NOW)
+            self.assertIsNone(doc)
+            self.assertEqual(unset, [])
+            self.assertEqual(reason, "quotes_write_disabled")
+        finally:
+            if saved is not None:
+                os.environ["QUOTES_WRITE_ENABLED"] = saved
+
+
+class TestTradingStatus(unittest.TestCase):
+    def test_missing_rejected(self):
+        item = q()
+        item.pop("trading_status")
+        self.assertEqual(quote_is_usable(item, NOW), (False, "trading_status_missing"))
+
+    def test_suspended_rejected(self):
+        self.assertEqual(quote_is_usable(q(trading_status="停牌"), NOW),
+                         (False, "security_suspended"))
+
+    def test_unknown_value_rejected(self):
+        ok, reason = quote_is_usable(q(trading_status="weird"), NOW)
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith("trading_status_unknown"), reason)
+
+    def test_wrong_type_rejected(self):
+        self.assertEqual(quote_is_usable(q(trading_status=1), NOW),
+                         (False, "trading_status_invalid"))
+
+    def test_trading_passes(self):
+        self.assertTrue(quote_is_usable(q(trading_status="交易中"), NOW)[0])
+
+
+class TestBarFinality(unittest.TestCase):
+    def test_unproven_rejected(self):
+        item = bar()
+        item.pop("is_final")
+        self.assertEqual(daily_bar_is_final(item, CLOSE), (False, "bar_finality_unproven"))
+
+    def test_final_state_string(self):
+        item = bar()
+        item.pop("is_final")
+        item["final_state"] = "closed"
+        self.assertTrue(daily_bar_is_final(item, CLOSE)[0])
+
+    def test_suspended_bar_rejected(self):
+        self.assertEqual(daily_bar_is_final(bar(trading_status="停牌"), CLOSE),
+                         (False, "security_suspended"))
+
+
+class TestRangeConsistency(unittest.TestCase):
+    def test_strict_price_also_checks_range(self):
+        """评审 P2-4：市价取价必须与区间校验同口径。"""
+        price, basis, reason = quote_price_and_basis(q(close=12, high=11, low=9), NOW)
+        self.assertIsNone(price)
+        self.assertIsNone(basis)
+        self.assertIn("close_out_of_range", reason)
 
 
 if __name__ == "__main__":
