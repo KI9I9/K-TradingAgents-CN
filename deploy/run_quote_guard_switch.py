@@ -58,12 +58,12 @@ def main():
             for key,suffix in [('before','-config.json'),('after','-v12-config.json')]
         }
     launcher = r'''
-import hashlib,json,os,pathlib,subprocess,sys
+import datetime,hashlib,json,os,pathlib,subprocess,sys,uuid
 request=json.load(sys.stdin)
 root=pathlib.Path('/home/ubuntu/k-tradingagents-paper-guard-v12')
-script=root/'switch_quote_guard_v12.py'
 data=request['code'].encode()
 if hashlib.sha256(data).hexdigest()!=request['code_sha256']:raise RuntimeError('script_hash_invalid')
+script=root/('switch_quote_guard_v12-'+request['code_sha256']+'.py')
 if script.exists():
     if script.read_bytes()!=data:raise RuntimeError('existing_switch_script_differs')
 else:
@@ -73,13 +73,23 @@ pidfile=root/'switch-process.json'
 if pidfile.exists():
     prior=json.loads(pidfile.read_text())['pid']
     cmdline=pathlib.Path('/proc')/str(prior)/'cmdline'
-    if cmdline.exists() and str(script).encode() in cmdline.read_bytes():raise RuntimeError('switch_already_active')
+    if cmdline.exists() and str(root/'switch_quote_guard_v12').encode() in cmdline.read_bytes():raise RuntimeError('switch_already_active')
+    # Preserve every previous attempt before reusing the current-state filenames.
+    archive=root/'attempts'/(datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+uuid.uuid4().hex[:8])
+    archive.mkdir(parents=True,mode=0o700)
+    for name in ['switch-state.json','switch-process.json','switch-process.log','last-command-failure.json',
+                 'runtime-before-switch.json','db-before-stop.json','jobs-immediate-before.json',
+                 'db-stopped-baseline.json','runtime-module-hashes.json','installed-smoke.json',
+                 'jobs-after-backend.json','frontend-http.json','db-after-switch.json','completion.json',
+                 'jobs-after-rollback.json']:
+        source=root/name
+        if source.exists():source.rename(archive/name)
 logfd=os.open(root/'switch-process.log',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
 with os.fdopen(logfd,'ab') as log:
     child=subprocess.Popen(['python3','-B',str(script)],stdin=subprocess.PIPE,stdout=log,stderr=log,start_new_session=True)
     child.stdin.write(json.dumps(request['payload']).encode())
     child.stdin.close()
-report={'pid':child.pid,'check_only':request['payload']['check_only'],'script_sha256':request['code_sha256']}
+report={'pid':child.pid,'check_only':request['payload']['check_only'],'script_sha256':request['code_sha256'],'script_path':str(script)}
 fd=os.open(pidfile,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
 with os.fdopen(fd,'w') as f:json.dump(report,f)
 print(json.dumps(report))

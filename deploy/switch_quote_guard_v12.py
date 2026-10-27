@@ -1,6 +1,7 @@
 """One-off v12 guarded switch. Auth arrives only on stdin; no secret logging."""
 import hashlib
 import importlib.util
+import inspect as source_inspect
 import json
 import os
 from pathlib import Path
@@ -190,6 +191,37 @@ def smoke():
     private_json('installed-smoke.json', {'result': result})
 
 
+def verify_frontend_resources(expected, timeout=45):
+    """Wait for the listener, but never retry HTTP errors or mismatched bytes."""
+    import hashlib
+    import time
+    import urllib.error
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + timeout
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            for path, expected_hash in expected.items():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError('frontend_http_ready_timeout')
+                with opener.open('http://frontend/' + path, timeout=min(5, remaining)) as response:
+                    data = response.read()
+                if hashlib.sha256(data).hexdigest() != expected_hash:
+                    raise RuntimeError('frontend_http_hash_mismatch')
+            return {'verified_http_resources': len(expected), 'attempts': attempts}
+        except urllib.error.HTTPError:
+            raise RuntimeError('frontend_http_status_failed') from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('frontend_http_ready_timeout') from None
+            time.sleep(min(1, remaining))
+
+
 def frontend_http_probe():
     index = (STAGED/'frontend-dist/index.html').read_text()
     paths = ['index.html'] + re.findall(r'(?:src|href)=["\'](/(?:js|css|assets)/[^"\']+)["\']', index)
@@ -198,10 +230,8 @@ def frontend_http_probe():
         path = value.lstrip('/')
         require('..' not in Path(path).parts, 'unsafe_asset_path')
         checks[path] = digest((STAGED/'frontend-dist'/path).read_bytes())
-    code = 'import urllib.request,hashlib,json\nexpected=' + repr(checks) + '\n'
-    code += "opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
-    code += "for path,expected_hash in expected.items():\n with opener.open('http://frontend/'+path,timeout=10) as r: data=r.read()\n if hashlib.sha256(data).hexdigest()!=expected_hash: raise RuntimeError('frontend_http_hash_mismatch')\n"
-    code += "print(json.dumps({'verified_http_resources':len(expected)}))\n"
+    code = source_inspect.getsource(verify_frontend_resources)
+    code += '\nimport json\nprint(json.dumps(verify_frontend_resources(' + repr(checks) + ')))\n'
     return json.loads(in_backend(code))
 
 

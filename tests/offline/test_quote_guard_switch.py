@@ -3,7 +3,9 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+import io
+import urllib.error
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -119,6 +121,46 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(self.m.STATE['stage'],'rolled_back')
         self.assertEqual(self.calls[-2:],[('up','backend',False),('up','frontend',False)])
         self.assertEqual(self.source.read_bytes(),b'original_long_content')
+
+
+class FrontendReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load()
+        self.expected = {'index.html': self.m.digest(b'expected')}
+
+    def test_connection_refused_then_ready_checks_bytes(self):
+        opener = Mock()
+        opener.open.side_effect = [urllib.error.URLError(ConnectionRefusedError()), io.BytesIO(b'expected')]
+        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep:
+            result = self.m.verify_frontend_resources(self.expected)
+        self.assertEqual(result, {'verified_http_resources': 1, 'attempts': 2})
+        sleep.assert_called_once()
+
+    def test_wrong_content_is_not_retried(self):
+        opener = Mock()
+        opener.open.return_value = io.BytesIO(b'wrong')
+        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError, 'frontend_http_hash_mismatch'):
+                self.m.verify_frontend_resources(self.expected)
+        sleep.assert_not_called()
+
+    def test_http_error_is_not_retried(self):
+        opener = Mock()
+        opener.open.side_effect = urllib.error.HTTPError('http://frontend/index.html', 404, 'missing', {}, None)
+        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep:
+            with self.assertRaisesRegex(RuntimeError, 'frontend_http_status_failed'):
+                self.m.verify_frontend_resources(self.expected)
+        sleep.assert_not_called()
+
+    def test_unavailable_listener_has_bounded_deadline(self):
+        opener = Mock()
+        opener.open.side_effect = urllib.error.URLError(ConnectionRefusedError())
+        with patch('urllib.request.build_opener', return_value=opener), patch('time.sleep') as sleep, \
+                patch('time.monotonic', side_effect=[0, 0, 45]):
+            with self.assertRaisesRegex(RuntimeError, 'frontend_http_ready_timeout'):
+                self.m.verify_frontend_resources(self.expected)
+        self.assertEqual(opener.open.call_count, 1)
+        sleep.assert_not_called()
 
 
 if __name__=='__main__':
