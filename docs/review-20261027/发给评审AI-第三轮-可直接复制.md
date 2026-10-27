@@ -2,7 +2,7 @@
 
 仓库：~/projects/K-TradingAgents-CN-osaka-safety-20261016
 分支：fix/quotes-field-contract-20261027
-HEAD：5c46157（若已漂移，以 git log -1 为准；代码差异锚定 9dd06bd，不受 docs 提交影响）
+HEAD：以 `git log -1` 为准（工作区应干净；代码差异锚定 9dd06bd，不受 docs 提交影响）
 基线：9dd06bd（已用哈希证实与生产一致：10 个关键文件逐一相同）
 
 先读（自包含，含改动说明 + 测试输出 + 6 个待质疑点）：
