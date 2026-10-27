@@ -15,7 +15,7 @@ HEAD：以 `git log -1` 为准（代码在 ad70bee；工作区应干净；文档
 基线：9dd06bd（已用哈希证实与生产一致）
 
 git diff 9dd06bd..HEAD -- app/ tradingagents/ tests/ frontend/ deploy/
-# 2598 行，sha256 d3c19ef99cd817d2299ac97d69941ab5d866401804811fabd0cf8162f9f5b0fc
+# 2711 行，sha256 742775048c3afc3479e879ea5a81d22f6949017191bfa245115e2733f61afc5c
 
 python3 -B tests/offline/test_quote_contract.py          # 74
 python3 -B tests/offline/test_paper_pricing.py           # 9（AST 抽取真实 paper 函数）
