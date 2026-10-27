@@ -53,6 +53,13 @@ class ComposeTests(unittest.TestCase):
     def test_exact_addition(self):
         self.assertEqual(self.check(), [])
 
+    def test_compose_config_omits_false_create_host_path(self):
+        # 生产只读 config 探针：false/{} 均输出 bind:{}；true 明确保留。
+        self.a["services"]["backend"]["volumes"][-1]["bind"] = {}
+        self.assertEqual(self.check(), [])
+        self.a["services"]["backend"]["volumes"][-1]["bind"] = {"create_host_path": True}
+        self.assertTrue(self.check())
+
     def test_all_service_fields_checked_without_secret_values(self):
         for key in ["privileged", "restart", "networks", "healthcheck", "environment"]:
             with self.subTest(key=key):

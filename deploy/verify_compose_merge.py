@@ -96,8 +96,9 @@ def compare(before, after, allowed):
             if (v.get("type") != "bind" or v.get("source") != expect[target]
                     or v.get("read_only") is not True):
                 errors.append(f"[{name}] 新挂载必须为指定源的只读 bind: {target}")
-            # create_host_path=false 防止源缺失时 Docker 自动创建目录。
-            if v.get("bind") != {"create_host_path": False} or set(v) != {
+            # Compose config 的 JSON 会省略 false（实测 false 和空 bind 均输出 {}），
+            # true 则保留。接受这两个等价表示，仍拒绝 true 和任何其他 bind 选项。
+            if v.get("bind") not in ({}, {"create_host_path": False}) or set(v) != {
                     "type", "source", "target", "read_only", "bind"}:
                 errors.append(f"[{name}] 新挂载选项不符: {target}")
     return errors
