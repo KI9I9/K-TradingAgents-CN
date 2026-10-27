@@ -11,12 +11,9 @@ from app.core.response import ok
 from app.services.database.serialization import serialize_document
 from app.services.quote_contract import (
     cn_now,
-    daily_bar_is_final,
-    daily_fallback_allowed,
-    quote_is_usable,
-    quote_pricing_basis,
+    resolve_cn_price,
+    resolve_cn_range,
     validate_price,
-    validate_price_range,
 )
 
 router = APIRouter(prefix="/paper", tags=["paper"])
@@ -292,271 +289,162 @@ async def _get_stock_name(code: str, market: str) -> str:
         return f"股票{code}"
 
 
-async def _get_last_price(code: str, market: str, strict: bool = False) -> Optional[float]:
-    """
-    获取股票最新价格（支持多市场）
+async def _load_cn_candidates(
+    db, code: str, code6: str, now: datetime, mode: str
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """只负责取数，判定交给 quote_contract.resolve_cn_*（取数与判定分开才好测）。"""
+    projection = {
+        "_id": 0, "close": 1, "high": 1, "low": 1, "open": 1, "trade_date": 1,
+        "updated_at": 1, "quote_time": 1, "quote_time_source": 1,
+        "fetched_at": 1, "snapshot_interval_seconds": 1,
+    }
+    code_filter = {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]}
+    candidates: Dict[str, Optional[Dict[str, Any]]] = {
+        "market_quotes": await db["market_quotes"].find_one(code_filter, projection),
+        "stock_basic_info": None,
+        "etf_daily_quotes": None,
+        "stock_daily_quotes": None,
+    }
 
-    Args:
-        code: 股票代码
-        market: 市场类型 (CN/HK/US)
-        strict: True 时只接受「当日 + 有可信行情时间」的行情（下单用）；
-                False 为展示用途，允许回退到无时间戳的 current_price 与最近收盘价
+    if mode == "display" and candidates["market_quotes"] is None:
+        candidates["stock_basic_info"] = await db["stock_basic_info"].find_one(
+            code_filter, {"_id": 0, "current_price": 1, "updated_at": 1}
+        )
 
-    Returns:
-        最新价格，如果获取失败返回 None
+    if mode == "display":
+        daily_query: Dict[str, Any] = {"symbol": code6, "period": "daily"}
+    else:
+        daily_query = {"symbol": code6, "period": "daily", "trade_date": now.date().isoformat()}
+
+    candidates["etf_daily_quotes"] = await db["etf_daily_quotes"].find_one(
+        {"code": code6},
+        {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1, "trade_date": 1, "updated_at": 1},
+        sort=[("trade_date", -1)],
+    )
+    candidates["stock_daily_quotes"] = await db["stock_daily_quotes"].find_one(
+        daily_query,
+        {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1, "trade_date": 1, "updated_at": 1},
+        sort=[("trade_date", -1)],
+    )
+    return candidates
+
+
+async def _get_last_price_detail(
+    code: str, market: str, strict: bool = True
+) -> Tuple[Optional[float], Optional[Dict[str, Any]], str]:
+    """返回 (价格, 与价格同源的依据, 原因码)。
+
+    价格与依据出自**同一条记录**，不再成交后二次查库补说明（并发下会 A 价配 B 说明）。
     """
     db = get_mongo_db()
 
-    # A股：从数据库获取
     if market in {"CN", "ETF"}:
         code6 = str(code or "").strip().zfill(6)
         now = cn_now()
+        mode = "strict" if strict else "display"
+        candidates = await _load_cn_candidates(db, code, code6, now, mode)
+        return resolve_cn_price(candidates, now, strict=strict)
 
-        # 1. 近实时行情
-        q = await db["market_quotes"].find_one(
-            {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
-            {"_id": 0, "close": 1, "trade_date": 1, "updated_at": 1,
-             "quote_time": 1, "quote_time_source": 1, "fetched_at": 1,
-             "snapshot_interval_seconds": 1}
-        )
-        if q:
-            usable, reason = quote_is_usable(q, now) if strict else (True, "non_strict")
-            if not usable:
-                logger.warning(f"⚠️ market_quotes 行情不可用 {code6}: {reason}")
-            else:
-                price, price_reason = validate_price(q.get("close"))
-                if price is None:
-                    logger.warning(f"⚠️ market_quotes 价格无效 {code6}: {price_reason}")
-                else:
-                    logger.debug(f"✅ 从 market_quotes 获取价格: {code6} = {price}")
-                    return price
-
-        # 2. current_price 没有行情时间，无法证明新鲜 —— 只允许展示用途使用
-        if not strict:
-            basic_info = await db["stock_basic_info"].find_one(
-                {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
-                {"_id": 0, "current_price": 1}
-            )
-            if basic_info:
-                price, price_reason = validate_price(basic_info.get("current_price"))
-                if price is not None:
-                    logger.debug(f"✅ 从 stock_basic_info 获取价格: {code6} = {price}")
-                    return price
-
-        # 3. 日线回退：只认「收盘后写入的当日日线」
-        allowed, gate_reason = daily_fallback_allowed(now)
-        if not allowed:
-            logger.warning(f"⚠️ {code6} 日线回退被拒: {gate_reason}")
-            logger.error(f"❌ 无法从数据库获取A股/ETF价格: {code} (strict={strict})")
-            return None
-
-        etf_daily = await db["etf_daily_quotes"].find_one(
-            {"code": code6},
-            sort=[("trade_date", -1)],
-            projection={"_id": 0, "close": 1, "high": 1, "low": 1, "trade_date": 1, "updated_at": 1}
-        )
-        if etf_daily:
-            final, final_reason = daily_bar_is_final(etf_daily, now)
-            if final:
-                price, _ = validate_price(etf_daily.get("close"))
-                if price is not None:
-                    logger.debug(f"✅ 从 etf_daily_quotes 获取价格: {code6} = {price}")
-                    return price
-            else:
-                logger.warning(f"⚠️ etf_daily_quotes 不可用 {code6}: {final_reason}")
-
-        daily = await db["stock_daily_quotes"].find_one(
-            {"symbol": code6, "period": "daily", "trade_date": now.date().isoformat()},
-            {"_id": 0, "close": 1, "high": 1, "low": 1, "trade_date": 1, "updated_at": 1}
-        )
-        if daily:
-            final, final_reason = daily_bar_is_final(daily, now)
-            if final:
-                price, _ = validate_price(daily.get("close"))
-                if price is not None:
-                    logger.debug(f"✅ 从 stock_daily_quotes（当日）获取价格: {code6} = {price}")
-                    return price
-            else:
-                logger.warning(f"⚠️ stock_daily_quotes 不可用 {code6}: {final_reason}")
-
-        logger.error(f"❌ 无法从数据库获取A股/ETF价格: {code} (strict={strict})")
-        return None
-
-    # 港股/美股：使用 ForeignStockService
-    elif market in ['HK', 'US']:
+    if market in {"HK", "US"}:
         try:
             from app.services.foreign_stock_service import ForeignStockService
-            db = get_mongo_db()
+
             service = ForeignStockService(db=db)
-
             quote = await service.get_quote(market, code, force_refresh=False)
-
             if quote:
-                # 尝试多个可能的价格字段
-                price = quote.get("price") or quote.get("current_price") or quote.get("close")
-                validated, _ = validate_price(price)
-                if validated is not None:
-                    logger.debug(f"✅ 从 ForeignStockService 获取{market}价格: {code} = {validated}")
-                    return validated
+                price, _ = validate_price(
+                    quote.get("price") or quote.get("current_price") or quote.get("close")
+                )
+                if price is None:
+                    return None, None, "price_invalid"
+                basis = {
+                    "source": "foreign_stock_service",
+                    "channel": "external",
+                    "as_of": None,
+                    "trade_date": None,
+                    "delay_seconds": None,
+                    "max_delay_seconds": None,
+                    "notice": "模拟成交按外部行情服务返回的最新价定价；未提供行情时间，可能存在延迟。",
+                }
+                return price, basis, "ok"
+            return None, None, "quote_missing"
         except Exception as e:
             logger.error(f"❌ 获取{market}股价格失败 {code}: {e}")
-            return None
+            return None, None, f"foreign_error:{e}"
 
-    logger.error(f"❌ 无法获取股票价格: {code} (market={market})")
-    return None
+    return None, None, "market_unsupported"
+
+
+async def _get_last_price(code: str, market: str, strict: bool = False) -> Optional[float]:
+    """兼容旧调用：只返回价格。需要依据时用 _get_last_price_detail。"""
+    price, _basis, reason = await _get_last_price_detail(code, market, strict=strict)
+    if price is None:
+        logger.warning(f"⚠️ 取价失败 {code} ({market}, strict={strict}): {reason}")
+    return price
+
+
+async def _get_today_price_range_detail(
+    code: str, market: str
+) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, Any]], str]:
+    """返回 (区间, 与区间同源的依据, 原因码)。用于指定价格单的校验。"""
+    db = get_mongo_db()
+
+    if market in {"CN", "ETF"}:
+        code6 = str(code or "").strip().zfill(6)
+        now = cn_now()
+        candidates = await _load_cn_candidates(db, code, code6, now, "strict")
+        return resolve_cn_range(candidates, now)
+
+    if market in {"HK", "US"}:
+        try:
+            from app.services.foreign_stock_service import ForeignStockService
+
+            service = ForeignStockService(db=db)
+            quote = await service.get_quote(market, code, force_refresh=False)
+            if quote:
+                high, _ = validate_price(quote.get("high") or quote.get("day_high"))
+                low, _ = validate_price(quote.get("low") or quote.get("day_low"))
+                if high is not None and low is not None and low <= high:
+                    basis = {
+                        "source": "foreign_stock_service",
+                        "channel": "external",
+                        "as_of": None,
+                        "trade_date": None,
+                        "delay_seconds": None,
+                        "max_delay_seconds": None,
+                        "notice": "价格区间取自外部行情服务；未提供行情时间，可能存在延迟。",
+                    }
+                    return {"high": high, "low": low}, basis, "ok"
+                return None, None, "range_invalid"
+            return None, None, "quote_missing"
+        except Exception as e:
+            logger.error(f"❌ 获取{market}股价格区间失败 {code}: {e}")
+            return None, None, f"foreign_error:{e}"
+
+    return None, None, "market_unsupported"
 
 
 async def _get_today_price_range(code: str, market: str) -> Optional[Dict[str, float]]:
-    """
-    获取股票当天的最高价和最低价（支持多市场）
-
-    只接受可证明「属于今天且可用于成交」的行情：
-    - market_quotes：trade_date 为今日，且 quote_time 在容忍窗口内
-    - etf_daily_quotes / stock_daily_quotes：仅收盘后，且该日线是收盘后写入的
-      （盘中若存在当日未完成日线，用它当区间会得到残缺区间，故一律拒绝）
-    拿不到可信数据时拒绝下单，绝不用昨日区间凑合。
-
-    Args:
-        code: 股票代码
-        market: 市场类型 (CN/HK/US)
-
-    Returns:
-        包含 high 和 low 的字典，如果获取失败返回 None
-    """
-    db = get_mongo_db()
-
-    # A股/ETF：从数据库获取
-    if market in {"CN", "ETF"}:
-        code6 = str(code or "").strip().zfill(6)
-        now = cn_now()
-
-        q = await db["market_quotes"].find_one(
-            {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
-            {"_id": 0, "high": 1, "low": 1, "trade_date": 1, "updated_at": 1,
-             "quote_time": 1, "quote_time_source": 1, "fetched_at": 1,
-             "snapshot_interval_seconds": 1}
-        )
-        if q:
-            usable, reason = quote_is_usable(q, now)
-            if not usable:
-                logger.warning(f"⚠️ market_quotes 价格区间不可用 {code6}: {reason}")
-            else:
-                high, low, why = validate_price_range(q)
-                if high is not None:
-                    logger.debug(f"✅ 从 market_quotes 获取价格区间: {code6} = high:{high}, low:{low}")
-                    return {"high": high, "low": low}
-                logger.warning(f"⚠️ market_quotes 价格区间无效 {code6}: {why}")
-
-        allowed, gate_reason = daily_fallback_allowed(now)
-        if not allowed:
-            logger.warning(f"⚠️ {code6} 日线回退被拒: {gate_reason}")
-            logger.warning(f"⚠️ 无法从数据库获取A股/ETF当日价格区间: {code}")
-            return None
-
-        etf_daily = await db["etf_daily_quotes"].find_one(
-            {"code": code6},
-            sort=[("trade_date", -1)],
-            projection={"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1,
-                        "trade_date": 1, "updated_at": 1}
-        )
-        if etf_daily:
-            final, final_reason = daily_bar_is_final(etf_daily, now)
-            if final:
-                high, low, why = validate_price_range(etf_daily)
-                if high is not None:
-                    logger.debug(f"✅ 从 etf_daily_quotes 获取价格区间: {code6} = high:{high}, low:{low}")
-                    return {"high": high, "low": low}
-                logger.warning(f"⚠️ etf_daily_quotes 价格区间无效 {code6}: {why}")
-            else:
-                logger.warning(f"⚠️ etf_daily_quotes 不可用 {code6}: {final_reason}")
-
-        daily = await db["stock_daily_quotes"].find_one(
-            {"symbol": code6, "period": "daily", "trade_date": now.date().isoformat()},
-            {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1,
-             "trade_date": 1, "updated_at": 1}
-        )
-        if daily:
-            final, final_reason = daily_bar_is_final(daily, now)
-            if final:
-                high, low, why = validate_price_range(daily)
-                if high is not None:
-                    logger.debug(f"✅ 从 stock_daily_quotes（当日）获取价格区间: {code6} = high:{high}, low:{low}")
-                    return {"high": high, "low": low}
-                logger.warning(f"⚠️ stock_daily_quotes 价格区间无效 {code6}: {why}")
-            else:
-                logger.warning(f"⚠️ stock_daily_quotes 不可用 {code6}: {final_reason}")
-
-        logger.warning(f"⚠️ 无法从数据库获取A股/ETF当日价格区间: {code}")
-        return None
-
-    # 港股/美股：使用 ForeignStockService
-    elif market in ['HK', 'US']:
-        try:
-            from app.services.foreign_stock_service import ForeignStockService
-            service = ForeignStockService(db=db)
-
-            quote = await service.get_quote(market, code, force_refresh=False)
-
-            if quote:
-                high = quote.get("high") or quote.get("day_high")
-                low = quote.get("low") or quote.get("day_low")
-                high_val, _ = validate_price(high)
-                low_val, _ = validate_price(low)
-                if high_val is not None and low_val is not None and low_val <= high_val:
-                    logger.debug(f"✅ 从 ForeignStockService 获取{market}价格区间: {code} = high:{high_val}, low:{low_val}")
-                    return {"high": high_val, "low": low_val}
-        except Exception as e:
-            logger.error(f"❌ 获取{market}股价格区间失败 {code}: {e}")
-            return None
-
-    logger.warning(f"⚠️ 无法获取股票价格区间: {code} (market={market})")
-    return None
+    """兼容旧调用：只返回区间。"""
+    price_range, _basis, reason = await _get_today_price_range_detail(code, market)
+    if price_range is None:
+        logger.warning(f"⚠️ 无法获取当日价格区间 {code} ({market}): {reason}")
+    return price_range
 
 
-async def _get_quote_basis(code: str) -> Optional[Dict[str, Any]]:
-    """返回本次成交的定价依据（来源、时间、延迟边界、用户提示）。
+def _build_market_notice(basis: Optional[Dict[str, Any]]) -> Optional[str]:
+    return basis.get("notice") if isinstance(basis, dict) else None
 
-    只做「解释」，不参与放行判定 —— 放行与否由 _get_last_price / _get_today_price_range
-    里的 quote_is_usable / daily_bar_is_final 决定，避免两处口径不一致。
-    """
-    db = get_mongo_db()
-    now = cn_now()
-    code6 = str(code or "").strip().zfill(6)
 
-    q = await db["market_quotes"].find_one(
-        {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
-        {"_id": 0, "trade_date": 1, "updated_at": 1, "quote_time": 1,
-         "quote_time_source": 1, "fetched_at": 1, "snapshot_interval_seconds": 1}
+def _build_limit_notice(
+    price: float, basis: Optional[Dict[str, Any]], high: float, low: float
+) -> str:
+    channel = (basis or {}).get("channel")
+    source = "当日日线" if channel == "daily_close" else "近实时行情"
+    return (
+        f"按你指定的价格 {price:.2f} 成交；区间 {low:.2f}–{high:.2f} 取自{source}校验。"
+        f"上游报价时间未知，可能存在额外延迟。"
     )
-    if q:
-        usable, _ = quote_is_usable(q, now)
-        if usable:
-            return quote_pricing_basis(q, now)
-
-    allowed, _ = daily_fallback_allowed(now)
-    if not allowed:
-        return None
-
-    for collection, query, sort in (
-        ("etf_daily_quotes", {"code": code6}, [("trade_date", -1)]),
-        ("stock_daily_quotes",
-         {"symbol": code6, "period": "daily", "trade_date": now.date().isoformat()}, None),
-    ):
-        doc = await db[collection].find_one(
-            query,
-            sort=sort,
-            projection={"_id": 0, "high": 1, "low": 1, "close": 1,
-                        "trade_date": 1, "updated_at": 1},
-        )
-        if doc and daily_bar_is_final(doc, now)[0]:
-            return {
-                "source": "daily_close",
-                "as_of": doc.get("updated_at"),
-                "delay_seconds": None,
-                "max_delay_seconds": None,
-                "notice": "模拟成交按当日收盘价定价（非盘中实时价）。",
-            }
-    return None
 
 
 def _zfill_code(code: str) -> str:
@@ -669,34 +557,45 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
     # 3. 获取账户
     acc = await _get_or_create_account(current_user["id"])
 
-    # 4. 获取价格
+    # 4. 获取价格（价格与其定价依据出自同一条记录，不再二次查库）
+    pricing_basis: Optional[Dict[str, Any]] = None
+    pricing_notice: Optional[str] = None
+
     if specified_price is not None and specified_price > 0:
-        # 🔥 如果指定了价格，验证价格是否在当天最高最低价范围内
-        price_range = await _get_today_price_range(normalized_code, market)
+        # 指定价格单：区间只用于校验，成交价是用户给的价格
+        price_range, range_basis, range_reason = await _get_today_price_range_detail(
+            normalized_code, market
+        )
         if not price_range:
+            logger.warning(f"⚠️ [模拟交易] 区间校验失败 {normalized_code}: {range_reason}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"行情缺失、过期或无效，暂不可下单（{normalized_code}）。"
+                    f"行情缺失、过期或无效，暂不可校验价格，请稍后再试（{normalized_code}）。"
                     f"具体原因见服务端日志"
                 )
             )
-        
-        high = price_range.get("high", 0)
-        low = price_range.get("low", 0)
-        
+
+        high = price_range.get("high", 0.0)
+        low = price_range.get("low", 0.0)
+
         if specified_price < low or specified_price > high:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"指定价格 {specified_price:.2f} 超出当天价格区间 [{low:.2f}, {high:.2f}]，模拟交易不能成功"
             )
-        
+
         price = float(specified_price)
+        pricing_basis = range_basis
+        pricing_notice = _build_limit_notice(price, range_basis, high, low)
         logger.info(f"✅ [模拟交易] 使用指定价格: {normalized_code} = {price:.2f} (区间: [{low:.2f}, {high:.2f}])")
     else:
-        # 未指定价格，使用当前实时价格
-        price = await _get_last_price(normalized_code, market, strict=True)
-        if price is None or price <= 0:
+        # 市价单：成交价必须是可证明「属于今天且可用于成交」的行情
+        price, pricing_basis, price_reason = await _get_last_price_detail(
+            normalized_code, market, strict=True
+        )
+        if price is None:
+            logger.warning(f"⚠️ [模拟交易] 市价单取价失败 {normalized_code}: {price_reason}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -704,25 +603,21 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
                     f"具体原因见服务端日志"
                 )
             )
+        pricing_notice = _build_market_notice(pricing_basis)
         logger.info(f"✅ [模拟交易] 使用实时价格: {normalized_code} = {price:.2f}")
 
-    # 4.1 记录定价依据（来源 / 时间 / 延迟边界），并据此生成用户提示
-    try:
-        pricing_basis = await _get_quote_basis(normalized_code)
-    except Exception as basis_err:
-        # 定价依据只用于回报与日志，取不到不影响成交判定
-        logger.warning(f"⚠️ [模拟交易] 获取定价依据失败（不影响成交）: {basis_err}")
-        pricing_basis = None
+    # 4.1 记录定价依据（来源 / 时间 / 采集后有效期），与成交同源
     if pricing_basis:
         logger.info(
-            "📌 [模拟交易] 定价依据: source=%s, as_of=%s, delay=%ss, 上限=%ss",
+            "📌 [模拟交易] 定价依据: source=%s channel=%s as_of=%s delay=%ss 有效期=%ss",
             pricing_basis.get("source"),
+            pricing_basis.get("channel"),
             pricing_basis.get("as_of"),
             pricing_basis.get("delay_seconds"),
             pricing_basis.get("max_delay_seconds"),
         )
-        if pricing_basis.get("notice"):
-            logger.warning("⚠️ [模拟交易] %s", pricing_basis["notice"])
+    if pricing_notice:
+        logger.warning("⚠️ [模拟交易] %s", pricing_notice)
 
     # 5. 计算金额
     notional = round(price * qty, 2)
@@ -882,8 +777,8 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
 
     order_payload = {k: v for k, v in order_doc.items() if k != "_id"}
     response_payload: Dict[str, Any] = {"order": order_payload}
-    if isinstance(pricing_basis, dict) and pricing_basis.get("notice"):
-        response_payload["pricing_notice"] = pricing_basis["notice"]
+    if pricing_notice:
+        response_payload["pricing_notice"] = pricing_notice
     return ok(response_payload)
 
 

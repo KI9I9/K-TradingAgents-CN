@@ -490,6 +490,12 @@ function openOrderDialog() {
   }
 }
 
+function notifyPricingNotice(notice?: string) {
+  // 定价依据必须让用户看到：API 返回了字段不等于用户被告知
+  if (!notice) return
+  ElMessage({ message: notice, type: "warning", duration: 8000, showClose: true })
+}
+
 async function submitOrder() {
   try {
     const payload: any = { 
@@ -512,6 +518,7 @@ async function submitOrder() {
     const res = await paperApi.placeOrder(payload)
     if (res.success) {
       ElMessage.success('下单成功')
+      notifyPricingNotice((res as any)?.data?.pricing_notice)
       orderDialog.value = false
       // 重置订单表单
       order.value = { side: 'buy', code: '', qty: 100, price: undefined }
@@ -682,6 +689,7 @@ async function sellPosition(position: any) {
     const res = await paperApi.placeOrder(payload)
     if (res.success) {
       ElMessage.success('卖出成功')
+      notifyPricingNotice((res as any)?.data?.pricing_notice)
       await refreshAll()
     } else {
       ElMessage.error(res.message || '卖出失败')

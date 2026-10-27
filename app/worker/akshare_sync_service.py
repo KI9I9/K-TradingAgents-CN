@@ -22,6 +22,16 @@ from tradingagents.dataflows.providers.china.akshare import get_akshare_provider
 
 logger = logging.getLogger(__name__)
 
+
+def _mongo_update_spec(doc: dict, unset_fields) -> dict:
+    """拼 $set/$unset。通道切换时 `$set` 删不掉旧字段，必须显式 $unset。"""
+    spec = {"$set": doc}
+    fields = [f for f in (unset_fields or []) if f not in doc]
+    if fields:
+        spec["$unset"] = {f: "" for f in fields}
+    return spec
+
+
 ETF_SH_PREFIXES = ("50", "51", "52", "56", "58")
 ETF_SZ_PREFIXES = ("15", "16", "18")
 
@@ -533,7 +543,7 @@ class AKShareSyncService:
                                 if quotes_map:
                                     # 🔥 全量同步成功，批量更新所有数据到数据库
                                     logger.info(f"✅ 全量同步成功，获取到 {len(quotes_map)} 只股票数据，开始批量更新到数据库...")
-                                    updated_count = await self._batch_update_quotes_to_db(quotes_map)
+                                    updated_count = await self._batch_update_quotes_to_db(quotes_map, captured_at)
                                     logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
                                     
                                     # 检查目标股票是否在更新结果中
@@ -620,6 +630,9 @@ class AKShareSyncService:
                 if symbols_to_sync:
                     logger.info(f"📡 获取 {sync_count} 只股票的实时行情快照...")
                     quotes_map = await self.provider.get_batch_stock_quotes(symbols_to_sync)
+                    # 采集时刻在拿到该批快照的那一刻固定，整批沿用；
+                    # 写库时不得重新起算，否则「等了 10 分钟才写」会被洗成刚采集。
+                    captured_at = cn_now()
 
                     if not quotes_map:
                         logger.warning("⚠️ 获取全市场快照失败，回退到逐个获取模式")
@@ -664,9 +677,10 @@ class AKShareSyncService:
                                         # 统一规范化：只有 close/high/low 齐全才允许写。
                                         # 不完整快照整条拒写 —— 否则旧价格会被盖上今天的日期与时间，
                                         # 再被消费侧当成「当日新鲜行情」放行。
-                                        quotes_data, _doc_reason = prepare_quote_write(
+                                        quotes_data, _unset, _doc_reason = prepare_quote_write(
                                             quotes_data, symbol, resolved_trade_date, cn_now(),
                                             self.snapshot_interval_seconds,
+                                            captured_at=captured_at,
                                         )
                                         if quotes_data is None:
                                             stats["error_count"] += 1
@@ -680,7 +694,7 @@ class AKShareSyncService:
                                         # 更新到数据库
                                         await self.db.market_quotes.update_one(
                                             {"code": symbol},
-                                            {"$set": quotes_data},
+                                            _mongo_update_spec(quotes_data, _unset),
                                             upsert=True
                                         )
                                         stats["success_count"] += 1
@@ -752,6 +766,7 @@ class AKShareSyncService:
             # 一次性获取全市场快照（避免频繁调用接口）
             logger.debug(f"📊 获取全市场快照以处理 {len(batch)} 只股票...")
             quotes_map = await self.provider.get_batch_stock_quotes(batch)
+            captured_at = cn_now()
 
             if not quotes_map:
                 logger.warning("⚠️ 获取全市场快照失败，回退到逐个获取")
@@ -771,16 +786,20 @@ class AKShareSyncService:
                         else:
                             quotes_data = quotes
 
-                        # 确保 symbol 和 code 字段存在
-                        if "symbol" not in quotes_data:
-                            quotes_data["symbol"] = symbol
-                        if "code" not in quotes_data:
-                            quotes_data["code"] = symbol
+                        # 与其它三条路径共用同一契约：不完整快照整条拒写
+                        quotes_data, _unset, _doc_reason = prepare_quote_write(
+                            quotes_data, symbol,
+                            getattr(self, "_run_trade_date", None), cn_now(),
+                            self.snapshot_interval_seconds,
+                            captured_at=captured_at,
+                        )
+                        if quotes_data is None:
+                            raise ValueError(f"行情快照不完整，整条拒写: {_doc_reason}")
 
                         # 更新到数据库
                         await self.db.market_quotes.update_one(
                             {"code": symbol},
-                            {"$set": quotes_data},
+                            _mongo_update_spec(quotes_data, _unset),
                             upsert=True
                         )
                         batch_stats["success_count"] += 1
@@ -860,7 +879,9 @@ class AKShareSyncService:
             logger.error(f"❌ 获取股票列表失败: {e}")
             return []
     
-    async def _batch_update_quotes_to_db(self, quotes_map: Dict[str, Dict[str, Any]]) -> int:
+    async def _batch_update_quotes_to_db(
+        self, quotes_map: Dict[str, Dict[str, Any]], captured_at: Optional[datetime] = None
+    ) -> int:
         """
         批量更新行情数据到数据库
         
@@ -892,10 +913,11 @@ class AKShareSyncService:
                             quotes_data = quotes
                         
                         # 统一规范化（与批量循环、单只保存共用同一实现）
-                        quotes_data, _doc_reason = prepare_quote_write(
+                        quotes_data, _unset, _doc_reason = prepare_quote_write(
                             quotes_data, symbol,
                             getattr(self, "_run_trade_date", None), cn_now(),
                             self.snapshot_interval_seconds,
+                            captured_at=captured_at,
                         )
                         if quotes_data is None:
                             logger.warning(f"⚠️ {symbol} 行情快照不完整，整条拒写: {_doc_reason}")
@@ -905,7 +927,7 @@ class AKShareSyncService:
                         operations.append(
                             pymongo.UpdateOne(
                                 {"code": symbol},
-                                {"$set": quotes_data},
+                                _mongo_update_spec(quotes_data, _unset),
                                 upsert=True
                             )
                         )
@@ -942,6 +964,7 @@ class AKShareSyncService:
             
             # 数据超过15分钟或不存在，进行同步
             quotes = await self.provider.get_stock_quotes(symbol)
+            captured_at = cn_now()
             if quotes:
                 # 转换为字典格式
                 if hasattr(quotes, 'model_dump'):
@@ -958,14 +981,15 @@ class AKShareSyncService:
                 if from_batch and batch_data:
                     # 🔥 通过批量接口获取的，批量更新全市场数据到数据库
                     logger.info(f"📊 检测到批量接口数据，开始批量更新 {len(batch_data)} 只股票的行情到数据库...")
-                    updated_count = await self._batch_update_quotes_to_db(batch_data)
+                    updated_count = await self._batch_update_quotes_to_db(batch_data, captured_at)
                     logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
                 else:
                     # 单个股票数据，单独保存（与批量路径共用同一规范化实现）
-                    quotes_data, _doc_reason = prepare_quote_write(
+                    quotes_data, _unset, _doc_reason = prepare_quote_write(
                         quotes_data, symbol,
                         getattr(self, "_run_trade_date", None), cn_now(),
                         self.snapshot_interval_seconds,
+                        captured_at=captured_at,
                     )
                     if quotes_data is None:
                         logger.error(f"❌ {symbol} 行情快照不完整，整条拒写: {_doc_reason}")
@@ -985,7 +1009,7 @@ class AKShareSyncService:
                     # 更新到数据库
                     result = await self.db.market_quotes.update_one(
                         {"code": symbol},
-                        {"$set": quotes_data},
+                        _mongo_update_spec(quotes_data, _unset),
                         upsert=True
                     )
 

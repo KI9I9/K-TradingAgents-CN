@@ -1,28 +1,34 @@
 """行情时间与字段契约（纯标准库，可离线测试）。
 
-五条硬约定：
+六条硬约定：
 1. **时间三态**：BSON date（pymongo 默认解出 naive UTC）、ISO 字符串（`+08:00` / `Z`）、
    缺失或非法。前两者可解析；第三者一律**拒绝**。
 2. **行情时间 ≠ 采集时间**。`quote_time` 只来自上游；上游没给就保持 None，
-   **绝不用采集时间伪造 quote_time**。采集时间单独放 `fetched_at`。
+   **绝不用采集时间伪造 quote_time**。采集时间单独放 `fetched_at`，且**在取得该批
+   快照的那一刻固定**，写库时不得重新起算（`updated_at` 才是写入时间）。
 3. **无 quote_time 时的准入是有边界的**：只接受「采集时刻 + 声明的快照周期」构成的
    近实时快照，且必须满足：交易日为今日、当前处于交易时段、年龄 ≤
    `快照周期 + 余量`、快照周期本身不超过硬上限。凭据类型记在 `quote_time_source`。
-4. **完整快照才可写**：close/high/low 必须同一次载荷齐全且有效；不完整载荷**整条拒写**，
-   既不刷新价格，也不刷新日期与时间 —— 失败不得续期。
-5. **交易所时区固定 UTC+8**，不跟随进程 TZ、不跟随展示时区。
+   这约束的是**采集后有效期**，不是上游报价的真实延迟——上游若返回缓存旧值，
+   本系统无法感知，提示文案必须如实说明。
+4. **完整快照才可写**：close/high/low 必须同一次载荷齐全且有效（含 low ≤ close ≤ high）；
+   不完整载荷**整条拒写**，既不刷新价格，也不刷新日期与时间 —— 失败不得续期。
+   通道切换（upstream → fetch）必须显式 `$unset` 旧 `quote_time`，`$set` 删不掉字段。
+5. **定价依据必须与成交同源**：`*_and_basis()` 从**同一条记录**同时产出价格与依据，
+   禁止成交后再查一次库补说明（并发下会拿 A 价配 B 说明）。
+6. **交易所时区固定 UTC+8**，不跟随进程 TZ、不跟随展示时区。
 
 关于第 3 条的业务含义（King 2026-10-27 决策）：
-允许「有明确延迟边界的近实时快照」用于模拟成交，但延迟边界必须可计算、可展示、
-可拒绝。因此本模块不提供「开关式放行」，而是把边界写成数据：
-写入侧记录 `snapshot_interval_seconds`，消费侧据此计算允许延迟并在成交时回报。
+允许「有明确延迟边界的近实时快照」用于模拟成交，但边界必须可计算、可展示、可拒绝。
+因此本模块不提供「开关式放行」，而是把边界写成数据：写入侧记录
+`snapshot_interval_seconds` 与 `fetched_at`，消费侧据此计算采集后有效期并在成交时回报。
 """
 
 from __future__ import annotations
 
 import math
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # A 股交易所时区。固定 UTC+8，中国不实行夏令时。
 CN_TZ = timezone(timedelta(hours=8))
@@ -65,6 +71,11 @@ PROTECTED_FIELDS = (
 
 # 批量接口历史字段名 → 标准字段名
 ALIAS_TO_STANDARD = (("open", "open_price"), ("high", "high_price"), ("low", "low_price"))
+
+# 成交量单位：库内标准是「手」。
+VOLUME_UNIT_LOT = "lot"
+VOLUME_UNIT_SHARE = "share"
+_SHARE_UNITS = ("share", "shares", "股")
 
 
 def cn_now() -> datetime:
@@ -147,6 +158,7 @@ def validate_price(value: Any) -> Tuple[Optional[float], str]:
 
 
 def validate_price_range(quote: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str]:
+    """校验 high/low；若带 close，则必须满足 low ≤ close ≤ high。"""
     if not quote:
         return None, None, "quote_missing"
     high, high_reason = validate_price(quote.get("high"))
@@ -157,6 +169,13 @@ def validate_price_range(quote: Dict[str, Any]) -> Tuple[Optional[float], Option
         return None, None, f"low_{low_reason}"
     if low > high:
         return None, None, "low_gt_high"
+
+    if quote.get("close") is not None:
+        close, close_reason = validate_price(quote.get("close"))
+        if close is None:
+            return None, None, f"close_{close_reason}"
+        if close < low or close > high:
+            return None, None, f"close_out_of_range:{close}"
     return high, low, "ok"
 
 
@@ -164,22 +183,29 @@ def validate_price_range(quote: Dict[str, Any]) -> Tuple[Optional[float], Option
 # 近实时快照的延迟边界
 # --------------------------------------------------------------------------- #
 def snapshot_delay_bound(quote: Dict[str, Any]) -> Tuple[Optional[int], str]:
-    """计算该快照允许的最大年龄（秒）。
+    """计算该快照允许的采集后有效期（秒）。
 
     依据写入侧声明的 `snapshot_interval_seconds`：
     - 未声明 → 用 `DEFAULT_SNAPSHOT_INTERVAL_SECONDS`
-    - 声明值 ≤0 或 > 硬上限 → 拒绝（不做自动放大，避免「声明 24 小时」绕过边界）
+    - 声明值 ≤0 / > 硬上限 / 非有限数 / 非数值 → 拒绝（不自动放大）
     """
     raw = (quote or {}).get("snapshot_interval_seconds")
     if raw is None:
         interval = DEFAULT_SNAPSHOT_INTERVAL_SECONDS
-    else:
-        if isinstance(raw, bool):
+    elif isinstance(raw, bool):
+        return None, "snapshot_interval_invalid"
+    elif isinstance(raw, float):
+        if not math.isfinite(raw):
             return None, "snapshot_interval_invalid"
+        interval = int(raw)
+    elif isinstance(raw, int):
+        interval = raw
+    else:
         try:
-            interval = int(raw)
+            interval = int(str(raw).strip())
         except (TypeError, ValueError):
             return None, "snapshot_interval_invalid"
+
     if interval <= 0 or interval > MAX_SNAPSHOT_INTERVAL_SECONDS:
         return None, "snapshot_interval_invalid"
     return min(interval + SNAPSHOT_DELAY_MARGIN_SECONDS, MAX_SNAPSHOT_INTERVAL_SECONDS), "ok"
@@ -203,7 +229,7 @@ def quote_is_usable(
 
     优先看 `quote_time`（上游行情时间）。没有 `quote_time` 时，只有在声明了快照周期、
     处于交易时段、且采集时间在「周期 + 余量」之内，才以近实时快照身份放行，
-    原因码带 `ok_fetch_snapshot:<allowed>s`，便于调用方展示延迟边界。
+    原因码带 `ok_fetch_snapshot:<allowed>s`，便于调用方展示采集后有效期。
     """
     if not quote:
         return False, "quote_missing"
@@ -211,8 +237,12 @@ def quote_is_usable(
     if require_trade_date and not is_same_trade_date(quote.get("trade_date"), now.date()):
         return False, f"trade_date_mismatch:{quote.get('trade_date')}"
 
-    quote_time = parse_quote_time(quote.get("quote_time"))
-    if quote_time is not None:
+    raw_quote_time = quote.get("quote_time")
+    if raw_quote_time not in (None, ""):
+        quote_time = parse_quote_time(raw_quote_time)
+        if quote_time is None:
+            # 上游给了时间但不可解析：既不能用它放行，也不能悄悄退化成「快照」。
+            return False, "quote_time_invalid"
         age = (now - quote_time).total_seconds()
         if age > max_age_seconds:
             return False, f"quote_stale:{int(age)}s"
@@ -221,8 +251,12 @@ def quote_is_usable(
         return True, "ok"
 
     # —— 近实时快照分支 ——
-    source = (quote.get("quote_time_source") or "").lower()
-    if source != QUOTE_TIME_SOURCE_FETCH:
+    source = quote.get("quote_time_source")
+    if source is None:
+        return False, "quote_time_missing"
+    if not isinstance(source, str):
+        return False, "quote_time_source_invalid"
+    if source.strip().lower() != QUOTE_TIME_SOURCE_FETCH:
         return False, "quote_time_missing"
 
     allowed, bound_reason = snapshot_delay_bound(quote)
@@ -244,42 +278,248 @@ def quote_is_usable(
     return True, f"ok_fetch_snapshot:{allowed}s"
 
 
+# --------------------------------------------------------------------------- #
+# 定价依据（必须与成交同源）
+# --------------------------------------------------------------------------- #
+def _notice_upstream(quote_time: datetime) -> str:
+    return (
+        f"按上游行情时间 {quote_time.astimezone(CN_TZ).strftime('%H:%M:%S')} 的行情模拟定价。"
+    )
+
+
+def _notice_fetch(fetched_at: datetime, delay_seconds: int, allowed: int) -> str:
+    local = fetched_at.astimezone(CN_TZ)
+    elapsed = max(0, delay_seconds) // 60
+    minutes = max(1, allowed // 60)
+    return (
+        f"按 {local.strftime('%H:%M:%S')} 采集的快照模拟定价；距采集已 {elapsed} 分钟，"
+        f"采集后有效期为 {minutes} 分钟。上游报价时间未知，可能存在额外延迟。"
+    )
+
+
+def _notice_daily(trade_date: Optional[str]) -> str:
+    day = coerce_trade_date(trade_date) or "当日"
+    return f"按 {day} 收盘价模拟定价；上游报价时间未知。"
+
+
 def quote_pricing_basis(quote: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
-    """给成交回报用的「定价依据」。不参与放行判定，只负责把边界讲清楚。"""
+    """单条行情（market_quotes）的定价依据。不参与放行判定。"""
     if not quote:
         return None
 
     quote_time = parse_quote_time(quote.get("quote_time"))
     if quote_time is not None:
-        delay = int((now - quote_time).total_seconds())
         return {
-            "source": QUOTE_TIME_SOURCE_UPSTREAM,
-            "as_of": quote_time.isoformat(),
-            "delay_seconds": delay,
+            "source": "market_quotes",
+            "channel": QUOTE_TIME_SOURCE_UPSTREAM,
+            "as_of": quote_time.astimezone(CN_TZ).isoformat(),
+            "trade_date": coerce_trade_date(quote.get("trade_date")),
+            "delay_seconds": int((now - quote_time).total_seconds()),
             "max_delay_seconds": DEFAULT_MAX_QUOTE_AGE_SECONDS,
-            "notice": None,
+            "notice": _notice_upstream(quote_time),
         }
 
     allowed, _ = snapshot_delay_bound(quote)
-    if allowed is None:
-        return None
     fetched_at = parse_quote_time(quote.get("fetched_at"))
-    if fetched_at is None:
+    if allowed is None or fetched_at is None:
         return None
     delay = int((now - fetched_at).total_seconds())
-    minutes = max(1, allowed // 60)
     return {
-        "source": QUOTE_TIME_SOURCE_FETCH,
+        "source": "market_quotes",
+        "channel": QUOTE_TIME_SOURCE_FETCH,
         "as_of": fetched_at.astimezone(CN_TZ).isoformat(),
+        "trade_date": coerce_trade_date(quote.get("trade_date")),
         "delay_seconds": delay,
         "max_delay_seconds": allowed,
-        "notice": (
-            f"模拟成交按 {fetched_at.astimezone(CN_TZ).strftime('%H:%M:%S')} 采集的行情快照定价，"
-            f"该快照最大延迟约 {minutes} 分钟；非交易所逐笔成交价。"
-        ),
+        "notice": _notice_fetch(fetched_at, delay, allowed),
     }
 
 
+def bar_pricing_basis(bar: Dict[str, Any], source: str, now: datetime) -> Dict[str, Any]:
+    """日线记录的定价依据。"""
+    written_at = parse_quote_time(bar.get("updated_at"))
+    trade_date = coerce_trade_date(bar.get("trade_date"))
+    return {
+        "source": source,
+        "channel": "daily_close",
+        "as_of": written_at.astimezone(CN_TZ).isoformat() if written_at else None,
+        "trade_date": trade_date,
+        "delay_seconds": None,
+        "max_delay_seconds": None,
+        "notice": _notice_daily(trade_date),
+    }
+
+
+def quote_price_and_basis(
+    quote: Dict[str, Any], now: datetime
+) -> Tuple[Optional[float], Optional[Dict[str, Any]], str]:
+    """从**同一条** market_quotes 记录产出价格与依据。"""
+    usable, reason = quote_is_usable(quote, now)
+    if not usable:
+        return None, None, reason
+    price, price_reason = validate_price(quote.get("close"))
+    if price is None:
+        return None, None, f"close_{price_reason}"
+    basis = quote_pricing_basis(quote, now)
+    if basis is None:
+        return None, None, "basis_unavailable"
+    return price, basis, "ok"
+
+
+def quote_range_and_basis(
+    quote: Dict[str, Any], now: datetime
+) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, Any]], str]:
+    """从**同一条** market_quotes 记录产出区间与依据。"""
+    usable, reason = quote_is_usable(quote, now)
+    if not usable:
+        return None, None, reason
+    high, low, range_reason = validate_price_range(quote)
+    if high is None:
+        return None, None, f"range_{range_reason}"
+    basis = quote_pricing_basis(quote, now)
+    if basis is None:
+        return None, None, "basis_unavailable"
+    return {"high": high, "low": low}, basis, "ok"
+
+
+def bar_price_and_basis(
+    bar: Dict[str, Any], source: str, now: datetime
+) -> Tuple[Optional[float], Optional[Dict[str, Any]], str]:
+    """从**同一条**日线记录产出收盘价与依据。"""
+    final, reason = daily_bar_is_final(bar, now)
+    if not final:
+        return None, None, reason
+    price, price_reason = validate_price(bar.get("close"))
+    if price is None:
+        return None, None, f"close_{price_reason}"
+    return price, bar_pricing_basis(bar, source, now), "ok"
+
+
+def bar_range_and_basis(
+    bar: Dict[str, Any], source: str, now: datetime
+) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, Any]], str]:
+    """从**同一条**日线记录产出区间与依据。"""
+    final, reason = daily_bar_is_final(bar, now)
+    if not final:
+        return None, None, reason
+    high, low, range_reason = validate_price_range(bar)
+    if high is None:
+        return None, None, f"range_{range_reason}"
+    return {"high": high, "low": low}, bar_pricing_basis(bar, source, now), "ok"
+
+
+def display_price_and_basis(
+    record: Dict[str, Any], source: str, now: datetime
+) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
+    """展示用参考价：**不做时效与完成状态校验**，只要求数值有效。
+
+    与严格成交路径分开，避免「为了禁止旧价成交」把持仓估值一起打死。
+    """
+    if not record:
+        return None, None
+    price, _ = validate_price(record.get("close", record.get("current_price")))
+    if price is None:
+        return None, None
+    trade_date = coerce_trade_date(record.get("trade_date"))
+    basis = {
+        "source": source,
+        "channel": "display",
+        "as_of": record.get("updated_at"),
+        "trade_date": trade_date,
+        "delay_seconds": None,
+        "max_delay_seconds": None,
+        "notice": f"展示用参考价（{trade_date or '最近可得'}），不可用于成交。",
+    }
+    return price, basis
+
+
+# --------------------------------------------------------------------------- #
+# 组合解析：把「查哪些表」与「怎么判定」分开，判定部分纯函数可测
+# --------------------------------------------------------------------------- #
+def resolve_cn_price(
+    candidates: Dict[str, Optional[Dict[str, Any]]],
+    now: datetime,
+    strict: bool = True,
+) -> Tuple[Optional[float], Optional[Dict[str, Any]], str]:
+    """A 股/ETF 取价：返回 (价格, 与价格同源的依据, 原因码)。
+
+    candidates 键：`market_quotes` / `stock_basic_info` / `etf_daily_quotes` / `stock_daily_quotes`
+    """
+    candidates = candidates or {}
+    quote = candidates.get("market_quotes")
+
+    if strict:
+        price, basis, reason = quote_price_and_basis(quote, now) if quote else (None, None, "quote_missing")
+        if price is not None:
+            return price, basis, "ok"
+
+        allowed, gate_reason = daily_fallback_allowed(now)
+        if not allowed:
+            return None, None, f"{reason}|{gate_reason}"
+
+        for key in ("etf_daily_quotes", "stock_daily_quotes"):
+            record = candidates.get(key)
+            if not record:
+                continue
+            price, basis, bar_reason = bar_price_and_basis(record, key, now)
+            if price is not None:
+                return price, basis, "ok"
+            reason = f"{reason}|{key}:{bar_reason}"
+        return None, None, reason
+
+    # —— 展示路径：不限时效，逐级回退，但必须标明这是展示价 ——
+    if quote:
+        price, basis = display_price_and_basis(quote, "market_quotes", now)
+        if price is not None:
+            return price, basis, "display"
+
+    basic = candidates.get("stock_basic_info")
+    if basic:
+        price, basis = display_price_and_basis(basic, "stock_basic_info", now)
+        if price is not None:
+            return price, basis, "display"
+
+    for key in ("etf_daily_quotes", "stock_daily_quotes"):
+        record = candidates.get(key)
+        if record:
+            price, basis = display_price_and_basis(record, key, now)
+            if price is not None:
+                return price, basis, "display"
+    return None, None, "display_unavailable"
+
+
+def resolve_cn_range(
+    candidates: Dict[str, Optional[Dict[str, Any]]],
+    now: datetime,
+) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, Any]], str]:
+    """A 股/ETF 当日价格区间（用于指定价格单校验）。只走严格口径。"""
+    candidates = candidates or {}
+    quote = candidates.get("market_quotes")
+    if quote:
+        rng, basis, reason = quote_range_and_basis(quote, now)
+        if rng is not None:
+            return rng, basis, "ok"
+    else:
+        reason = "quote_missing"
+
+    allowed, gate_reason = daily_fallback_allowed(now)
+    if not allowed:
+        return None, None, f"{reason}|{gate_reason}"
+
+    for key in ("etf_daily_quotes", "stock_daily_quotes"):
+        record = candidates.get(key)
+        if not record:
+            continue
+        rng, basis, bar_reason = bar_range_and_basis(record, key, now)
+        if rng is not None:
+            return rng, basis, "ok"
+        reason = f"{reason}|{key}:{bar_reason}"
+    return None, None, reason
+
+
+# --------------------------------------------------------------------------- #
+# 日线完成度
+# --------------------------------------------------------------------------- #
 def daily_fallback_allowed(now: datetime) -> Tuple[bool, str]:
     """日线回退的时间闸门：只在收盘之后。"""
     if now.time() < DAILY_FALLBACK_AFTER:
@@ -302,6 +542,9 @@ def daily_bar_is_final(bar: Dict[str, Any], now: datetime) -> Tuple[bool, str]:
         return False, f"bar_written_other_day:{local_written.date()}"
     if local_written.time() < DAILY_BAR_FINAL_AFTER:
         return False, f"bar_written_intraday:{local_written.strftime('%H:%M')}"
+    # 写入时间不能来自未来：否则「今晚 23:00 写」会提前满足完成条件
+    if (local_written - now.astimezone(CN_TZ)).total_seconds() > DEFAULT_MAX_FUTURE_SECONDS:
+        return False, f"bar_write_time_in_future:{local_written.strftime('%H:%M')}"
 
     high, low, reason = validate_price_range(bar)
     if high is None:
@@ -347,33 +590,43 @@ def build_failure_stats(reason: str, context: str) -> Dict[str, Any]:
     }
 
 
-def _normalize_volume(value: Any, unit: Optional[str]) -> Any:
-    """把成交量统一为「手」：库内标准是手，单只接口历史上写的是股。"""
-    if value is None:
-        return None
-    if (unit or "lot").lower() in ("share", "shares", "股"):
+def _normalize_volume(value: Any, unit: Optional[str]) -> Tuple[Any, str]:
+    """把成交量统一为「手」，并返回应写入的单位标记。
+
+    只有**显式声明**为股/份的才换算；未声明时按「手」处理（现有两个写入源的真实口径），
+    但换算成功后必须把 `volume_unit` 同步改成 `lot`，否则库里单位与数值不一致。
+    """
+    unit_text = (unit or VOLUME_UNIT_LOT)
+    if not isinstance(unit_text, str):
+        return value, VOLUME_UNIT_LOT
+    if unit_text.strip().lower() in _SHARE_UNITS:
         try:
-            return float(value) / 100.0
+            return float(value) / 100.0, VOLUME_UNIT_LOT
         except (TypeError, ValueError):
-            return value
-    return value
+            return value, VOLUME_UNIT_LOT
+    return value, VOLUME_UNIT_LOT
 
 
+# --------------------------------------------------------------------------- #
+# 写入侧规范化
+# --------------------------------------------------------------------------- #
 def prepare_quote_write(
     quotes_data: Dict[str, Any],
     symbol: str,
     trade_date: Optional[str],
     now: datetime,
     snapshot_interval_seconds: Optional[int] = None,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    """把上游字典规范化为「可提交写入」的文档。
+    captured_at: Optional[datetime] = None,
+) -> Tuple[Optional[Dict[str, Any]], List[str], str]:
+    """把上游字典规范化为「可提交写入」的文档与 `$unset` 列表。
 
-    返回 (doc, reason)。reason != "ok" 时 doc 为 None，调用方**不得写库**。
+    返回 (doc, unset_fields, reason)。reason != "ok" 时 doc 为 None，调用方**不得写库**。
 
     - 成交要用的 close/high/low 必须同一次载荷齐全且有效，否则整条拒写；
-    - `quote_time` 只透传上游，**不伪造**；没有就留空，用 `quote_time_source="fetch"`
-      标记这是采集时刻；
-    - 写入 `snapshot_interval_seconds`，让消费侧能算出延迟边界。
+    - `fetched_at` 是**采集时刻**，取 payload 自带值，否则用调用方传入的 `captured_at`，
+      再否则才退回 `now`；`updated_at` 一律是写入时刻，二者不混用；
+    - `quote_time` 只透传上游；上游给了但解析不了 → 整条拒写（不降级成快照）；
+    - 没有 `quote_time` 时返回 `["quote_time"]` 作为 `$unset`，防止旧通道字段残留。
     """
     payload: Dict[str, Any] = dict(quotes_data or {})
 
@@ -384,41 +637,66 @@ def prepare_quote_write(
     for field in REQUIRED_PRICE_FIELDS:
         _, reason = validate_price(payload.get(field))
         if reason != "ok":
-            return None, f"incomplete_snapshot:{field}_{reason}"
+            return None, [], f"incomplete_snapshot:{field}_{reason}"
 
     high, low, range_reason = validate_price_range(payload)
     if high is None:
-        return None, f"incomplete_snapshot:{range_reason}"
+        return None, [], f"incomplete_snapshot:{range_reason}"
 
-    payload["volume"] = _normalize_volume(payload.get("volume"), payload.get("volume_unit"))
+    # —— 时间语义 ——
+    raw_quote_time = payload.get("quote_time")
+    quote_time: Optional[datetime] = None
+    if raw_quote_time not in (None, ""):
+        quote_time = parse_quote_time(raw_quote_time)
+        if quote_time is None:
+            return None, [], "quote_time_invalid"
+
+    raw_fetched = payload.get("fetched_at")
+    fetched_at: Optional[datetime]
+    if raw_fetched not in (None, ""):
+        fetched_at = parse_quote_time(raw_fetched)
+        if fetched_at is None:
+            return None, [], "fetched_at_invalid"
+    else:
+        fetched_at = captured_at or now
+    if (fetched_at - now).total_seconds() > DEFAULT_MAX_FUTURE_SECONDS:
+        return None, [], "fetched_at_from_future"
+
+    interval = snapshot_interval_seconds
+    if interval is None:
+        interval = payload.get("snapshot_interval_seconds")
+    if interval is None:
+        interval = DEFAULT_SNAPSHOT_INTERVAL_SECONDS
+    _, interval_reason = snapshot_delay_bound({"snapshot_interval_seconds": interval})
+    if interval_reason != "ok":
+        return None, [], interval_reason
+
+    volume, volume_unit = _normalize_volume(payload.get("volume"), payload.get("volume_unit"))
 
     doc: Dict[str, Any] = dict(payload)
     doc["symbol"] = doc.get("symbol") or symbol
     doc["code"] = doc.get("code") or symbol
-
     if not doc.get("trade_date") and trade_date:
         doc["trade_date"] = trade_date
 
-    quote_time = parse_quote_time(doc.get("quote_time"))
+    unset: List[str] = []
     if quote_time is not None:
         doc["quote_time"] = quote_time.isoformat()
+        doc["quote_time_source"] = QUOTE_TIME_SOURCE_UPSTREAM
     else:
-        # 不伪造行情时间：没有就删掉，靠 quote_time_source 说明依据
         doc.pop("quote_time", None)
-    doc["quote_time_source"] = QUOTE_TIME_SOURCE_UPSTREAM if quote_time else QUOTE_TIME_SOURCE_FETCH
+        unset.append("quote_time")
+        doc["quote_time_source"] = QUOTE_TIME_SOURCE_FETCH
 
-    interval = snapshot_interval_seconds
-    if interval is None:
-        interval = doc.get("snapshot_interval_seconds")
-    if interval is None:
-        interval = DEFAULT_SNAPSHOT_INTERVAL_SECONDS
     doc["snapshot_interval_seconds"] = int(interval)
-
-    doc["fetched_at"] = now.isoformat()
-    # updated_at 仅表示「本条记录被写入的时间」，不代表报价新鲜；保留以兼容旧读取方。
+    doc["fetched_at"] = fetched_at.isoformat()
+    # updated_at 仅表示「本条记录被写入的时间」，不代表报价新鲜。
     doc["updated_at"] = now.isoformat()
+    if volume is not None:
+        doc["volume"] = volume
+        doc["volume_unit"] = volume_unit
 
     for key in list(doc.keys()):
         if key in PROTECTED_FIELDS and key not in REQUIRED_PRICE_FIELDS and doc[key] is None:
             doc.pop(key)
-    return doc, "ok"
+    return doc, unset, "ok"
