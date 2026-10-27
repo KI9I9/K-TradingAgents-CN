@@ -51,6 +51,9 @@ class AKShareSyncService:
         self.db = None
         self.batch_size = 100
         self._run_trade_date = None  # 本轮行情所属交易日（由时间闸门写入）
+        # 声明的快照周期：与 AKSHARE_QUOTES_SYNC_CRON 的 30 分钟对齐。
+        # 消费侧据此计算允许延迟（周期 + 余量），超期即拒绝成交。
+        self.snapshot_interval_seconds = 30 * 60
         self.rate_limit_delay = 0.2  # AKShare建议的延迟
         self._current_job_id = None  # 🔥 当前任务ID，用于进度跟踪和停止检查
 
@@ -662,7 +665,8 @@ class AKShareSyncService:
                                         # 不完整快照整条拒写 —— 否则旧价格会被盖上今天的日期与时间，
                                         # 再被消费侧当成「当日新鲜行情」放行。
                                         quotes_data, _doc_reason = prepare_quote_write(
-                                            quotes_data, symbol, resolved_trade_date, cn_now()
+                                            quotes_data, symbol, resolved_trade_date, cn_now(),
+                                            self.snapshot_interval_seconds,
                                         )
                                         if quotes_data is None:
                                             stats["error_count"] += 1
@@ -890,7 +894,8 @@ class AKShareSyncService:
                         # 统一规范化（与批量循环、单只保存共用同一实现）
                         quotes_data, _doc_reason = prepare_quote_write(
                             quotes_data, symbol,
-                            getattr(self, "_run_trade_date", None), cn_now()
+                            getattr(self, "_run_trade_date", None), cn_now(),
+                            self.snapshot_interval_seconds,
                         )
                         if quotes_data is None:
                             logger.warning(f"⚠️ {symbol} 行情快照不完整，整条拒写: {_doc_reason}")
@@ -959,7 +964,8 @@ class AKShareSyncService:
                     # 单个股票数据，单独保存（与批量路径共用同一规范化实现）
                     quotes_data, _doc_reason = prepare_quote_write(
                         quotes_data, symbol,
-                        getattr(self, "_run_trade_date", None), cn_now()
+                        getattr(self, "_run_trade_date", None), cn_now(),
+                        self.snapshot_interval_seconds,
                     )
                     if quotes_data is None:
                         logger.error(f"❌ {symbol} 行情快照不完整，整条拒写: {_doc_reason}")

@@ -1,21 +1,21 @@
 """行情时间与字段契约（纯标准库，可离线测试）。
 
-为什么单独抽一个模块：
-- 供给侧（写入）与消费侧（下单）必须用**同一套**时间/日期判定，否则两边各写一份，
-  迟早出现「写的时候认为是今天、读的时候认为是昨天」的分歧。
-- 本模块不依赖 pandas / pymongo / fastapi，可在无第三方包的机器上直接跑行为测试。
-
-四条硬约定：
+五条硬约定：
 1. **时间三态**：BSON date（pymongo 默认解出 naive UTC）、ISO 字符串（`+08:00` / `Z`）、
-   缺失或非法。前两者可解析；第三者一律**拒绝**——放行等于护栏失效。
-2. **行情时间 ≠ 采集时间**。`quote_time` 是上游声明的行情发生时间；`fetched_at` 是我们
-   拉取的时刻。AKShare 快照接口不提供逐行行情时间，因此 `quote_time` 为 None，
-   `quote_time_source="fetch"`。严格成交路径默认**不接受**这种弱证据（见
-   `ALLOW_FETCH_TIME_AS_QUOTE_TIME`）——用「我刚拉过」冒充「报价很新」是本轮评审
-   明确否决的做法。
-3. **完整快照才可写**。成交要用的 close/high/low 必须同一次载荷齐全且有效；不完整载荷
-   **整条拒写**，既不刷新旧价格，也不刷新旧价格的日期与时间。
-4. **交易所时区固定 UTC+8**，不跟随进程 TZ、不跟随展示时区。A 股无夏令时。
+   缺失或非法。前两者可解析；第三者一律**拒绝**。
+2. **行情时间 ≠ 采集时间**。`quote_time` 只来自上游；上游没给就保持 None，
+   **绝不用采集时间伪造 quote_time**。采集时间单独放 `fetched_at`。
+3. **无 quote_time 时的准入是有边界的**：只接受「采集时刻 + 声明的快照周期」构成的
+   近实时快照，且必须满足：交易日为今日、当前处于交易时段、年龄 ≤
+   `快照周期 + 余量`、快照周期本身不超过硬上限。凭据类型记在 `quote_time_source`。
+4. **完整快照才可写**：close/high/low 必须同一次载荷齐全且有效；不完整载荷**整条拒写**，
+   既不刷新价格，也不刷新日期与时间 —— 失败不得续期。
+5. **交易所时区固定 UTC+8**，不跟随进程 TZ、不跟随展示时区。
+
+关于第 3 条的业务含义（King 2026-10-27 决策）：
+允许「有明确延迟边界的近实时快照」用于模拟成交，但延迟边界必须可计算、可展示、
+可拒绝。因此本模块不提供「开关式放行」，而是把边界写成数据：
+写入侧记录 `snapshot_interval_seconds`，消费侧据此计算允许延迟并在成交时回报。
 """
 
 from __future__ import annotations
@@ -27,19 +27,27 @@ from typing import Any, Dict, Optional, Tuple
 # A 股交易所时区。固定 UTC+8，中国不实行夏令时。
 CN_TZ = timezone(timedelta(hours=8))
 
-# 连续竞价 09:30-11:30 / 13:00-15:00；15:00-15:30 为收盘缓冲（等收盘价落库）。
+# 连续竞价 09:30-11:30 / 13:00-15:00；15:00-15:30 为收盘缓冲。
 SESSION_OPEN = time(9, 30)
 SESSION_CLOSE = time(15, 30)
 
-# 报价允许的最大陈旧时长（作用于 quote_time，不是采集时间）。
+# 上游直接给出 quote_time 时，允许的最大陈旧时长。
 DEFAULT_MAX_QUOTE_AGE_SECONDS = 30 * 60
 # 允许的时钟正向漂移。
 DEFAULT_MAX_FUTURE_SECONDS = 60
 
-# 严格成交路径是否允许把「采集时间」当作行情时间。
-#   False（默认）：拿不到上游行情时间就拒绝成交 —— 评审要求「不得用当前时间代替证据」。
-#   True：退化为「采集时刻 + 会话内」的弱保证，仅用于本地联调，生产不建议。
-ALLOW_FETCH_TIME_AS_QUOTE_TIME = False
+# —— 近实时快照（无 quote_time）的准入边界 ——
+# 写入侧未声明周期时的默认值：与 30 分钟 cron 对齐。
+DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 30 * 60
+# 周期未声明或声明值不合理时的硬上限：超过即拒绝，不做「自动放大」。
+MAX_SNAPSHOT_INTERVAL_SECONDS = 40 * 60
+# 采集延迟余量（网络 + 抓取耗时）。
+SNAPSHOT_DELAY_MARGIN_SECONDS = 2 * 60
+# 快照仅在交易时段内可被用于成交。
+SNAPSHOT_SESSION_END = time(15, 30)
+
+QUOTE_TIME_SOURCE_UPSTREAM = "upstream"
+QUOTE_TIME_SOURCE_FETCH = "fetch"
 
 # 日线回退：必须在收盘后，且该日线本身是收盘后写入的（完成状态代理）。
 DAILY_BAR_FINAL_AFTER = time(15, 0)
@@ -68,14 +76,7 @@ def cn_now() -> datetime:
 # 时间解析
 # --------------------------------------------------------------------------- #
 def parse_quote_time(value: Any) -> Optional[datetime]:
-    """把时间统一解析为 aware datetime；无法解析返回 None。
-
-    支持：
-    - `datetime`：naive 视为 **UTC**（pymongo 默认 BSON 解码就是这样），aware 原样返回
-    - `str`：ISO 8601（含 `Z`、`+08:00`、无时区）、`YYYY-MM-DD HH:MM:SS`
-      * 无时区字符串按**交易所时区**解释
-    - 其他类型（None / 数字 / bool / list / dict）→ None，调用方必须拒绝
-    """
+    """把时间统一解析为 aware datetime；无法解析返回 None。"""
     if isinstance(value, datetime):
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
@@ -122,7 +123,6 @@ def coerce_trade_date(value: Any) -> Optional[str]:
 
 
 def is_same_trade_date(value: Any, today: date) -> bool:
-    """行情所属交易日是否等于 `today`（交易所时区下的日期）。"""
     return coerce_trade_date(value) == today.isoformat()
 
 
@@ -147,7 +147,6 @@ def validate_price(value: Any) -> Tuple[Optional[float], str]:
 
 
 def validate_price_range(quote: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str]:
-    """校验并返回 (high, low)。任何一项不合法都返回 (None, None, 原因)。"""
     if not quote:
         return None, None, "quote_missing"
     high, high_reason = validate_price(quote.get("high"))
@@ -162,6 +161,35 @@ def validate_price_range(quote: Dict[str, Any]) -> Tuple[Optional[float], Option
 
 
 # --------------------------------------------------------------------------- #
+# 近实时快照的延迟边界
+# --------------------------------------------------------------------------- #
+def snapshot_delay_bound(quote: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    """计算该快照允许的最大年龄（秒）。
+
+    依据写入侧声明的 `snapshot_interval_seconds`：
+    - 未声明 → 用 `DEFAULT_SNAPSHOT_INTERVAL_SECONDS`
+    - 声明值 ≤0 或 > 硬上限 → 拒绝（不做自动放大，避免「声明 24 小时」绕过边界）
+    """
+    raw = (quote or {}).get("snapshot_interval_seconds")
+    if raw is None:
+        interval = DEFAULT_SNAPSHOT_INTERVAL_SECONDS
+    else:
+        if isinstance(raw, bool):
+            return None, "snapshot_interval_invalid"
+        try:
+            interval = int(raw)
+        except (TypeError, ValueError):
+            return None, "snapshot_interval_invalid"
+    if interval <= 0 or interval > MAX_SNAPSHOT_INTERVAL_SECONDS:
+        return None, "snapshot_interval_invalid"
+    return min(interval + SNAPSHOT_DELAY_MARGIN_SECONDS, MAX_SNAPSHOT_INTERVAL_SECONDS), "ok"
+
+
+def in_snapshot_session(now: datetime) -> bool:
+    return SESSION_OPEN <= now.time() <= SNAPSHOT_SESSION_END
+
+
+# --------------------------------------------------------------------------- #
 # 消费侧判定
 # --------------------------------------------------------------------------- #
 def quote_is_usable(
@@ -173,8 +201,9 @@ def quote_is_usable(
 ) -> Tuple[bool, str]:
     """判断一条行情能否用于「按今天的价格成交」。
 
-    只看 `quote_time`（上游行情时间）。`fetched_at` / `updated_at` 是采集时间，
-    默认**不作为**新鲜度证据。
+    优先看 `quote_time`（上游行情时间）。没有 `quote_time` 时，只有在声明了快照周期、
+    处于交易时段、且采集时间在「周期 + 余量」之内，才以近实时快照身份放行，
+    原因码带 `ok_fetch_snapshot:<allowed>s`，便于调用方展示延迟边界。
     """
     if not quote:
         return False, "quote_missing"
@@ -183,39 +212,83 @@ def quote_is_usable(
         return False, f"trade_date_mismatch:{quote.get('trade_date')}"
 
     quote_time = parse_quote_time(quote.get("quote_time"))
-    if quote_time is None:
-        if not ALLOW_FETCH_TIME_AS_QUOTE_TIME:
-            return False, "quote_time_missing"
-        quote_time = parse_quote_time(quote.get("fetched_at") or quote.get("updated_at"))
-        if quote_time is None:
-            return False, "quote_time_and_fetch_time_missing"
+    if quote_time is not None:
+        age = (now - quote_time).total_seconds()
+        if age > max_age_seconds:
+            return False, f"quote_stale:{int(age)}s"
+        if age < -max_future_seconds:
+            return False, f"quote_from_future:{int(-age)}s"
+        return True, "ok"
 
-    age = (now - quote_time).total_seconds()
-    if age > max_age_seconds:
-        return False, f"quote_stale:{int(age)}s"
+    # —— 近实时快照分支 ——
+    source = (quote.get("quote_time_source") or "").lower()
+    if source != QUOTE_TIME_SOURCE_FETCH:
+        return False, "quote_time_missing"
+
+    allowed, bound_reason = snapshot_delay_bound(quote)
+    if allowed is None:
+        return False, bound_reason
+
+    if not in_snapshot_session(now):
+        return False, f"outside_snapshot_session:{now.strftime('%H:%M')}"
+
+    fetched_at = parse_quote_time(quote.get("fetched_at"))
+    if fetched_at is None:
+        return False, "fetched_at_missing"
+
+    age = (now - fetched_at).total_seconds()
+    if age > allowed:
+        return False, f"snapshot_too_old:{int(age)}s>{allowed}s"
     if age < -max_future_seconds:
-        return False, f"quote_from_future:{int(-age)}s"
-    return True, "ok"
+        return False, f"snapshot_from_future:{int(-age)}s"
+    return True, f"ok_fetch_snapshot:{allowed}s"
+
+
+def quote_pricing_basis(quote: Dict[str, Any], now: datetime) -> Optional[Dict[str, Any]]:
+    """给成交回报用的「定价依据」。不参与放行判定，只负责把边界讲清楚。"""
+    if not quote:
+        return None
+
+    quote_time = parse_quote_time(quote.get("quote_time"))
+    if quote_time is not None:
+        delay = int((now - quote_time).total_seconds())
+        return {
+            "source": QUOTE_TIME_SOURCE_UPSTREAM,
+            "as_of": quote_time.isoformat(),
+            "delay_seconds": delay,
+            "max_delay_seconds": DEFAULT_MAX_QUOTE_AGE_SECONDS,
+            "notice": None,
+        }
+
+    allowed, _ = snapshot_delay_bound(quote)
+    if allowed is None:
+        return None
+    fetched_at = parse_quote_time(quote.get("fetched_at"))
+    if fetched_at is None:
+        return None
+    delay = int((now - fetched_at).total_seconds())
+    minutes = max(1, allowed // 60)
+    return {
+        "source": QUOTE_TIME_SOURCE_FETCH,
+        "as_of": fetched_at.astimezone(CN_TZ).isoformat(),
+        "delay_seconds": delay,
+        "max_delay_seconds": allowed,
+        "notice": (
+            f"模拟成交按 {fetched_at.astimezone(CN_TZ).strftime('%H:%M:%S')} 采集的行情快照定价，"
+            f"该快照最大延迟约 {minutes} 分钟；非交易所逐笔成交价。"
+        ),
+    }
 
 
 def daily_fallback_allowed(now: datetime) -> Tuple[bool, str]:
-    """日线回退的时间闸门：只在收盘之后。
-
-    盘中若存在当日未完成日线，用它当成交价会拿到残缺区间，因此一律不允许。
-    """
+    """日线回退的时间闸门：只在收盘之后。"""
     if now.time() < DAILY_FALLBACK_AFTER:
         return False, "daily_fallback_before_close"
     return True, "ok"
 
 
 def daily_bar_is_final(bar: Dict[str, Any], now: datetime) -> Tuple[bool, str]:
-    """判断一根当日日线是否「已收盘、可用于成交」。
-
-    - trade_date 必须是今日
-    - 该行必须在收盘后写入（updated_at 的本地时间 >= 15:00）—— 这是「完成状态」的
-      可用代理：09:35 写入的当日行必然是盘中残缺数据
-    - OHLC 必须齐全且有效
-    """
+    """判断一根当日日线是否「已收盘、可用于成交」。"""
     if not bar:
         return False, "bar_missing"
     if not is_same_trade_date(bar.get("trade_date"), now.date()):
@@ -250,7 +323,6 @@ def sync_round_skip_reason(
     """本轮行情同步是否整轮跳过。返回 None 表示可以写。"""
     if not is_today_trade_day:
         return "not_trade_day"
-    # API 全失败时会退回「普通工作日」，无法区分节假日与交易日 —— 宁可整轮不写。
     if calendar_source not in ("tushare", "akshare"):
         return "calendar_unverified"
     local_time = now.time()
@@ -262,17 +334,11 @@ def sync_round_skip_reason(
 
 
 def resolve_trade_date(now: datetime) -> str:
-    """本轮写入使用的交易日（仅在闸门放行后调用）。"""
     return now.date().isoformat()
 
 
 def build_failure_stats(reason: str, context: str) -> Dict[str, Any]:
-    """构造调度层能识别为 failed 的结果。
-
-    `scheduler_runtime.outcome()` 对 dict 只看 `success is False`；
-    `unified_thread_pool_sync_service` 在方法不抛异常时无条件 `success = True`，
-    所以**必须**由被调方显式给出 `success=False`，否则空跑会被记成成功。
-    """
+    """构造调度层能识别为 failed 的结果。"""
     return {
         "success": False,
         "error": reason,
@@ -282,11 +348,7 @@ def build_failure_stats(reason: str, context: str) -> Dict[str, Any]:
 
 
 def _normalize_volume(value: Any, unit: Optional[str]) -> Any:
-    """把成交量统一为「手」。
-
-    库内标准是手（批量快照天然是手）。单只接口历史上把「总手」乘了 100 变成股，
-    这里按 `volume_unit` 显式换算，避免 100 倍偏差。
-    """
+    """把成交量统一为「手」：库内标准是手，单只接口历史上写的是股。"""
     if value is None:
         return None
     if (unit or "lot").lower() in ("share", "shares", "股"):
@@ -302,14 +364,16 @@ def prepare_quote_write(
     symbol: str,
     trade_date: Optional[str],
     now: datetime,
+    snapshot_interval_seconds: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     """把上游字典规范化为「可提交写入」的文档。
 
     返回 (doc, reason)。reason != "ok" 时 doc 为 None，调用方**不得写库**。
 
-    关键点（对应评审 P1-1）：成交要用的 close/high/low 必须同一次载荷齐全且有效，
-    否则整条拒写。这样旧记录的 close/high/low 与它的 trade_date/时间戳保持原样，
-    不会出现「旧价格 + 新时间」这种可被护栏放行的组合。
+    - 成交要用的 close/high/low 必须同一次载荷齐全且有效，否则整条拒写；
+    - `quote_time` 只透传上游，**不伪造**；没有就留空，用 `quote_time_source="fetch"`
+      标记这是采集时刻；
+    - 写入 `snapshot_interval_seconds`，让消费侧能算出延迟边界。
     """
     payload: Dict[str, Any] = dict(quotes_data or {})
 
@@ -317,7 +381,6 @@ def prepare_quote_write(
         if payload.get(standard) is None and payload.get(alias) is not None:
             payload[standard] = payload[alias]
 
-    # 完整性：成交必需字段
     for field in REQUIRED_PRICE_FIELDS:
         _, reason = validate_price(payload.get(field))
         if reason != "ok":
@@ -333,20 +396,29 @@ def prepare_quote_write(
     doc["symbol"] = doc.get("symbol") or symbol
     doc["code"] = doc.get("code") or symbol
 
-    # 交易日：优先保留上游/写入侧已确定的日期，缺省才注入
     if not doc.get("trade_date") and trade_date:
         doc["trade_date"] = trade_date
 
     quote_time = parse_quote_time(doc.get("quote_time"))
-    doc["quote_time"] = quote_time.isoformat() if quote_time else None
-    doc["quote_time_source"] = "upstream" if quote_time else "fetch"
+    if quote_time is not None:
+        doc["quote_time"] = quote_time.isoformat()
+    else:
+        # 不伪造行情时间：没有就删掉，靠 quote_time_source 说明依据
+        doc.pop("quote_time", None)
+    doc["quote_time_source"] = QUOTE_TIME_SOURCE_UPSTREAM if quote_time else QUOTE_TIME_SOURCE_FETCH
+
+    interval = snapshot_interval_seconds
+    if interval is None:
+        interval = doc.get("snapshot_interval_seconds")
+    if interval is None:
+        interval = DEFAULT_SNAPSHOT_INTERVAL_SECONDS
+    doc["snapshot_interval_seconds"] = int(interval)
+
     doc["fetched_at"] = now.isoformat()
-    # updated_at 仅表示「本条记录被写入的时间」，不代表报价新鲜；保留是为了兼容旧读取方。
+    # updated_at 仅表示「本条记录被写入的时间」，不代表报价新鲜；保留以兼容旧读取方。
     doc["updated_at"] = now.isoformat()
 
     for key in list(doc.keys()):
         if key in PROTECTED_FIELDS and key not in REQUIRED_PRICE_FIELDS and doc[key] is None:
             doc.pop(key)
-    if doc.get("quote_time") is None:
-        doc.pop("quote_time")
     return doc, "ok"

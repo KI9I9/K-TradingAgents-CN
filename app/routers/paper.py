@@ -14,6 +14,7 @@ from app.services.quote_contract import (
     daily_bar_is_final,
     daily_fallback_allowed,
     quote_is_usable,
+    quote_pricing_basis,
     validate_price,
     validate_price_range,
 )
@@ -315,7 +316,8 @@ async def _get_last_price(code: str, market: str, strict: bool = False) -> Optio
         q = await db["market_quotes"].find_one(
             {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
             {"_id": 0, "close": 1, "trade_date": 1, "updated_at": 1,
-             "quote_time": 1, "quote_time_source": 1, "fetched_at": 1}
+             "quote_time": 1, "quote_time_source": 1, "fetched_at": 1,
+             "snapshot_interval_seconds": 1}
         )
         if q:
             usable, reason = quote_is_usable(q, now) if strict else (True, "non_strict")
@@ -431,7 +433,8 @@ async def _get_today_price_range(code: str, market: str) -> Optional[Dict[str, f
         q = await db["market_quotes"].find_one(
             {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
             {"_id": 0, "high": 1, "low": 1, "trade_date": 1, "updated_at": 1,
-             "quote_time": 1, "quote_time_source": 1, "fetched_at": 1}
+             "quote_time": 1, "quote_time_source": 1, "fetched_at": 1,
+             "snapshot_interval_seconds": 1}
         )
         if q:
             usable, reason = quote_is_usable(q, now)
@@ -507,6 +510,52 @@ async def _get_today_price_range(code: str, market: str) -> Optional[Dict[str, f
             return None
 
     logger.warning(f"⚠️ 无法获取股票价格区间: {code} (market={market})")
+    return None
+
+
+async def _get_quote_basis(code: str) -> Optional[Dict[str, Any]]:
+    """返回本次成交的定价依据（来源、时间、延迟边界、用户提示）。
+
+    只做「解释」，不参与放行判定 —— 放行与否由 _get_last_price / _get_today_price_range
+    里的 quote_is_usable / daily_bar_is_final 决定，避免两处口径不一致。
+    """
+    db = get_mongo_db()
+    now = cn_now()
+    code6 = str(code or "").strip().zfill(6)
+
+    q = await db["market_quotes"].find_one(
+        {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]},
+        {"_id": 0, "trade_date": 1, "updated_at": 1, "quote_time": 1,
+         "quote_time_source": 1, "fetched_at": 1, "snapshot_interval_seconds": 1}
+    )
+    if q:
+        usable, _ = quote_is_usable(q, now)
+        if usable:
+            return quote_pricing_basis(q, now)
+
+    allowed, _ = daily_fallback_allowed(now)
+    if not allowed:
+        return None
+
+    for collection, query, sort in (
+        ("etf_daily_quotes", {"code": code6}, [("trade_date", -1)]),
+        ("stock_daily_quotes",
+         {"symbol": code6, "period": "daily", "trade_date": now.date().isoformat()}, None),
+    ):
+        doc = await db[collection].find_one(
+            query,
+            sort=sort,
+            projection={"_id": 0, "high": 1, "low": 1, "close": 1,
+                        "trade_date": 1, "updated_at": 1},
+        )
+        if doc and daily_bar_is_final(doc, now)[0]:
+            return {
+                "source": "daily_close",
+                "as_of": doc.get("updated_at"),
+                "delay_seconds": None,
+                "max_delay_seconds": None,
+                "notice": "模拟成交按当日收盘价定价（非盘中实时价）。",
+            }
     return None
 
 
@@ -657,6 +706,24 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
             )
         logger.info(f"✅ [模拟交易] 使用实时价格: {normalized_code} = {price:.2f}")
 
+    # 4.1 记录定价依据（来源 / 时间 / 延迟边界），并据此生成用户提示
+    try:
+        pricing_basis = await _get_quote_basis(normalized_code)
+    except Exception as basis_err:
+        # 定价依据只用于回报与日志，取不到不影响成交判定
+        logger.warning(f"⚠️ [模拟交易] 获取定价依据失败（不影响成交）: {basis_err}")
+        pricing_basis = None
+    if pricing_basis:
+        logger.info(
+            "📌 [模拟交易] 定价依据: source=%s, as_of=%s, delay=%ss, 上限=%ss",
+            pricing_basis.get("source"),
+            pricing_basis.get("as_of"),
+            pricing_basis.get("delay_seconds"),
+            pricing_basis.get("max_delay_seconds"),
+        )
+        if pricing_basis.get("notice"):
+            logger.warning("⚠️ [模拟交易] %s", pricing_basis["notice"])
+
     # 5. 计算金额
     notional = round(price * qty, 2)
 
@@ -790,6 +857,7 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
         "status": "filled",
         "created_at": now_iso,
         "filled_at": now_iso,
+        "pricing_basis": pricing_basis,
     }
     if analysis_id:
         order_doc["analysis_id"] = analysis_id
@@ -812,7 +880,11 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
         trade_doc["analysis_id"] = analysis_id
     await db["paper_trades"].insert_one(trade_doc)
 
-    return ok({"order": {k: v for k, v in order_doc.items() if k != "_id"}})
+    order_payload = {k: v for k, v in order_doc.items() if k != "_id"}
+    response_payload: Dict[str, Any] = {"order": order_payload}
+    if isinstance(pricing_basis, dict) and pricing_basis.get("notice"):
+        response_payload["pricing_notice"] = pricing_basis["notice"]
+    return ok(response_payload)
 
 
 @router.get("/positions", response_model=dict)
