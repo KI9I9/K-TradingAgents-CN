@@ -4,13 +4,20 @@ AKShare数据同步服务
 """
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone, time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 import pymongo
 
 from app.core.database import bind_loop_safe_mongo_db, get_mongo_db
 from app.services.historical_data_service import get_historical_data_service
 from app.services.news_data_service import get_news_data_service
+from app.services.quote_contract import (
+    build_failure_stats,
+    build_quote_doc,
+    cn_now,
+    resolve_trade_date,
+    sync_round_skip_reason,
+)
 from tradingagents.dataflows.providers.china.akshare import get_akshare_provider
 
 logger = logging.getLogger(__name__)
@@ -43,6 +50,7 @@ class AKShareSyncService:
         self.news_service = None  # 延迟初始化
         self.db = None
         self.batch_size = 100
+        self._run_trade_date = None  # 本轮行情所属交易日（由时间闸门写入）
         self.rate_limit_delay = 0.2  # AKShare建议的延迟
         self._current_job_id = None  # 🔥 当前任务ID，用于进度跟踪和停止检查
 
@@ -427,21 +435,43 @@ class AKShareSyncService:
         job_id = self._resolve_job_id(manual_mode)
 
         try:
-            # 0. 解析本次行情所属交易日，供写入侧使用。
-            #    规则：确认今天是交易日且已过 09:30（连续竞价开始）才用当天，
-            #    否则退回最近交易日。快照接口不带行情日期，直接把「当前日期」
-            #    当行情日期会在盘前/非交易日写入伪有效数据。
+            # 0. 供给侧时间闸门（整轮跳过，不写任何行情）：
+            #    - 非交易日 → not_trade_day
+            #    - 日历来自「所有 API 失败→退回工作日」的兜底 → calendar_unverified
+            #      （兜底无法区分节假日与交易日，宁可整轮不写）
+            #    - 09:30 前 → pre_open（盘前快照等价于昨收，写入只会制造「看起来新鲜」的假数据）
+            #    - 15:30 后 → after_close
+            #    注意：这里只保证「不写伪数据」，**不能替代**消费侧的交易日与行情时间校验。
             resolved_trade_date = None
+            skip_reason = None
             try:
                 from app.services.trading_calendar_service import get_trading_calendar_service
                 _cal = get_trading_calendar_service()
-                _now_cst = datetime.now(timezone(timedelta(hours=8)))
-                if await _cal.is_today_trade_day() and _now_cst.time() >= time(9, 30):
-                    resolved_trade_date = _now_cst.strftime("%Y-%m-%d")
-                else:
-                    resolved_trade_date = await _cal.get_last_trade_date()
+                _now_cn = cn_now()
+                _is_today_trade_day = await _cal.is_today_trade_day()
+                # get_last_trade_date() 只返回日期，不暴露来源；而「来源是否为 fallback」
+                # 正是节假日误判的唯一可用信号，故读取缓存。缓存由上一行调用刷新。
+                _cal_source = None
+                try:
+                    _cache = await _cal._read_cache()  # noqa: SLF001 - 只为取 source，不写缓存
+                    _cal_source = (_cache or {}).get("source")
+                except Exception as _cache_err:
+                    logger.warning(f"⚠️ 读取交易日历缓存失败: {_cache_err}")
+                skip_reason = sync_round_skip_reason(_now_cn, _is_today_trade_day, _cal_source)
+                if skip_reason is None:
+                    resolved_trade_date = resolve_trade_date(_now_cn)
             except Exception as _td_err:
-                logger.warning(f"⚠️ 无法解析交易日，本次不更新 trade_date: {_td_err}")
+                logger.error(f"❌ 交易日历不可用，本轮跳过: {_td_err}")
+                skip_reason = "calendar_unavailable"
+
+            if skip_reason:
+                logger.info(f"⏭️ 本轮行情同步跳过: {skip_reason}")
+                stats["skipped"] = True
+                stats["reason"] = skip_reason
+                return stats
+
+            self._run_trade_date = resolved_trade_date
+            logger.info(f"📅 本轮行情所属交易日: {resolved_trade_date}")
 
             # 1. 确定要同步的股票列表
             if symbols is None:
@@ -451,12 +481,15 @@ class AKShareSyncService:
                 symbols = await self._get_all_listed_symbols()
 
             if not symbols:
-                # 空池属于失败而非成功，避免「零计数且不报错」掩盖配置/数据问题
+                # 空池属于失败而非成功。必须显式给 success=False：
+                # unified_thread_pool_sync_service 在方法不抛异常时会无条件置 success=True，
+                # scheduler_runtime.outcome() 又只看 success is False，只塞 errors 会被记成成功。
                 logger.error("❌ 标的池为空，无法同步行情（检查 stock_basic_info 是否可读）")
-                stats["errors"].append({
-                    "error": "标的池为空",
-                    "context": "sync_realtime_quotes_no_symbols",
-                })
+                _failure = build_failure_stats("标的池为空", "sync_realtime_quotes_no_symbols")
+                stats["success"] = False
+                stats["error"] = _failure["error"]
+                stats["error_count"] = stats.get("error_count", 0) + 1
+                stats["errors"].append(_failure["errors"][0])
                 return stats
 
             stats["total_processed"] = len(symbols)
@@ -625,16 +658,11 @@ class AKShareSyncService:
                                         else:
                                             quotes_data = quotes
 
-                                        # 确保 symbol 和 code 字段存在
-                                        if "symbol" not in quotes_data:
-                                            quotes_data["symbol"] = symbol
-                                        if "code" not in quotes_data:
-                                            quotes_data["code"] = symbol
-
-                                        # trade_date 由本函数按交易日历统一注入（provider 不提供）。
-                                        # 只在缺失时补，避免覆盖 provider 将来给出的真实行情日期。
-                                        if resolved_trade_date and not quotes_data.get("trade_date"):
-                                            quotes_data["trade_date"] = resolved_trade_date
+                                        # 统一规范化：补 symbol/code、别名兜底、注入 trade_date、
+                                        # 剔除 None 的价格字段（避免空值覆盖有效行情）
+                                        quotes_data = build_quote_doc(
+                                            quotes_data, symbol, resolved_trade_date
+                                        )
 
                                         # 更新到数据库
                                         await self.db.market_quotes.update_one(
@@ -850,11 +878,10 @@ class AKShareSyncService:
                         else:
                             quotes_data = quotes
                         
-                        # 确保 symbol 和 code 字段存在
-                        if "symbol" not in quotes_data:
-                            quotes_data["symbol"] = symbol
-                        if "code" not in quotes_data:
-                            quotes_data["code"] = symbol
+                        # 统一规范化（与批量循环、单只保存共用同一实现）
+                        quotes_data = build_quote_doc(
+                            quotes_data, symbol, getattr(self, "_run_trade_date", None)
+                        )
                         
                         # 构建批量更新操作
                         operations.append(
@@ -916,10 +943,10 @@ class AKShareSyncService:
                     updated_count = await self._batch_update_quotes_to_db(batch_data)
                     logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
                 else:
-                    # 单个股票数据，单独保存
-                    # 确保 symbol 字段存在
-                    if "symbol" not in quotes_data:
-                        quotes_data["symbol"] = symbol
+                    # 单个股票数据，单独保存（与批量路径共用同一规范化实现）
+                    quotes_data = build_quote_doc(
+                        quotes_data, symbol, getattr(self, "_run_trade_date", None)
+                    )
 
                     # 🔥 打印即将保存到数据库的数据
                     logger.info(f"💾 准备保存 {symbol} 行情到数据库:")
