@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from app.services.quote_contract import quotes_write_enabled
 from datetime import datetime, time as dtime, timedelta
 from typing import Dict, Optional, Tuple, List
 from zoneinfo import ZoneInfo
@@ -392,6 +393,9 @@ class QuotesIngestionService:
             return True
 
     async def _bulk_upsert(self, quotes_map: Dict[str, Dict], trade_date: str, source: Optional[str] = None) -> None:
+        if not quotes_write_enabled():
+            logger.warning("⛔ 行情写入总闸已关闭，跳过批量入库")
+            return
         db = get_mongo_db()
         coll = db[self.collection_name]
         ops = []

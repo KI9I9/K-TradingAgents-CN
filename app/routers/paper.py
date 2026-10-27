@@ -296,7 +296,7 @@ async def _load_cn_candidates(
     projection = {
         "_id": 0, "close": 1, "high": 1, "low": 1, "open": 1, "trade_date": 1,
         "updated_at": 1, "quote_time": 1, "quote_time_source": 1,
-        "fetched_at": 1, "snapshot_interval_seconds": 1,
+        "fetched_at": 1, "snapshot_interval_seconds": 1, "trading_status": 1,
     }
     code_filter = {"$or": [{"code": code}, {"code": code6}, {"symbol": code}, {"symbol": code6}]}
     candidates: Dict[str, Optional[Dict[str, Any]]] = {
@@ -318,12 +318,14 @@ async def _load_cn_candidates(
 
     candidates["etf_daily_quotes"] = await db["etf_daily_quotes"].find_one(
         {"code": code6},
-        {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1, "trade_date": 1, "updated_at": 1},
+        {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1, "trade_date": 1,
+         "updated_at": 1, "is_final": 1, "final_state": 1, "trading_status": 1},
         sort=[("trade_date", -1)],
     )
     candidates["stock_daily_quotes"] = await db["stock_daily_quotes"].find_one(
         daily_query,
-        {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1, "trade_date": 1, "updated_at": 1},
+        {"_id": 0, "high": 1, "low": 1, "open": 1, "close": 1, "trade_date": 1,
+         "updated_at": 1, "is_final": 1, "final_state": 1, "trading_status": 1},
         sort=[("trade_date", -1)],
     )
     return candidates

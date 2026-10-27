@@ -33,7 +33,14 @@ class FakeCollection:
         self._doc = doc
 
     async def find_one(self, query=None, projection=None, sort=None, **kw):
-        return self._doc
+        """遵守 MongoDB 投影语义：投影里没有的字段不会返回。
+
+        之前原样返回整条记录，掩盖了「投影漏字段 → 准入判断误拒」的缺陷。
+        """
+        if not self._doc or not projection:
+            return self._doc
+        keep = {k for k, v in projection.items() if v and k != "_id"}
+        return {k: v for k, v in self._doc.items() if k in keep}
 
 
 class FakeDB:

@@ -10,6 +10,7 @@ QMT 数据同步服务
 """
 import asyncio
 import logging
+from app.services.quote_contract import quotes_write_enabled
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 import pandas as pd
@@ -282,6 +283,9 @@ class QMTSyncService:
                         "source": "qmt",
                         "updated_at": now,
                     }
+                    if not quotes_write_enabled():
+                        logger.warning("⛔ 行情写入总闸已关闭，跳过 QMT 行情写入")
+                        break
                     await self.db.market_quotes.update_one(
                         {"code": code},
                         {"$set": doc},

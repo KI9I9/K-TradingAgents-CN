@@ -547,8 +547,9 @@ class AKShareSyncService:
                                     updated_count = await self._batch_update_quotes_to_db(quotes_map, captured_at)
                                     logger.info(f"✅ 批量更新完成，共更新 {updated_count} 只股票数据")
                                     
-                                    # 检查目标股票是否在更新结果中
-                                    if symbol in quotes_map:
+                                    # 以「实际被写入」为准，而不是「返回载荷里有」
+                                    accepted = getattr(self, "_last_batch_accepted", set())
+                                    if symbol in accepted:
                                         stats["success_count"] = 1
                                     else:
                                         stats["error_count"] = 1
@@ -887,6 +888,9 @@ class AKShareSyncService:
     async def _batch_update_quotes_to_db(
         self, quotes_map: Dict[str, Dict[str, Any]], captured_at: Optional[datetime] = None
     ) -> int:
+        # 记录本次真正被契约接受的代码，供「单股回退」等调用方判断成功与否，
+        # 不能仅凭「返回载荷里有这只票」就算成功。
+        self._last_batch_accepted = set()
         """
         批量更新行情数据到数据库
         
@@ -936,6 +940,7 @@ class AKShareSyncService:
                                 upsert=True
                             )
                         )
+                        self._last_batch_accepted.add(symbol)
                 
                 if operations:
                     # 批量执行更新操作

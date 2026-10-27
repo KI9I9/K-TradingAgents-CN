@@ -64,14 +64,23 @@ def compare_running(inspect_path, merged_before, errors):
     c = raw[0] if isinstance(raw, list) else raw
     backend = merged_before["services"]["backend"]
 
-    if c.get("Image") != backend.get("image"):
+    compose_image = backend.get("image") or ""
+    if compose_image.startswith("sha256:"):
+        if c.get("Image") != compose_image:
+            errors.append(
+                f"[running] 运行容器镜像 ID 与合并配置不一致: {c.get('Image')} vs {compose_image}"
+            )
+    elif c.get("Config", {}).get("Image") != compose_image:
         errors.append(
-            f"[running] 运行容器镜像 ID 与合并配置不一致: {c.get('Image')} vs {backend.get('image')}"
+            f"[running] 镜像标签不一致: {c.get('Config', {}).get('Image')} vs {compose_image}"
         )
-    if norm_list(c.get("Config", {}).get("Entrypoint")) != norm_list(backend.get("entrypoint")):
-        errors.append("[running] entrypoint 与合并配置不一致")
-    if norm_list(c.get("Config", {}).get("Cmd")) != norm_list(backend.get("command")):
-        errors.append("[running] command 与合并配置不一致")
+    # 只在 compose 显式声明时比对：未声明时容器会用镜像默认值，直接比较会误判为漂移
+    if norm_list(backend.get("entrypoint")):
+        if norm_list(c.get("Config", {}).get("Entrypoint")) != norm_list(backend.get("entrypoint")):
+            errors.append("[running] entrypoint 与合并配置不一致")
+    if norm_list(backend.get("command")):
+        if norm_list(c.get("Config", {}).get("Cmd")) != norm_list(backend.get("command")):
+            errors.append("[running] command 与合并配置不一致")
 
     running = {}
     for m in c.get("Mounts") or []:

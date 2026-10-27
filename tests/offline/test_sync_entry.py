@@ -9,6 +9,7 @@
 
 import ast
 import asyncio
+import pathlib
 import os
 import sys
 import types
@@ -160,6 +161,7 @@ class FakeSelf:
 
     async def _batch_update_quotes_to_db(self, quotes_map, captured_at=None):
         self.batch_calls.append(captured_at)
+        self._last_batch_accepted = set(quotes_map)
         return len(quotes_map)
 
 
@@ -236,6 +238,57 @@ class TestSyncEntry(unittest.TestCase):
         stats = asyncio.run(entry(fake, symbols=["600000"], force=True))
         self.assertEqual(stats.get("reason"), "calendar_unverified")
         self.assertEqual(fake.db.writes, [])
+
+
+class TestWriteGateCoverage(unittest.TestCase):
+    """写闸必须覆盖所有已知 market_quotes 写入点，而不是只覆盖 AKShare 批量路径。"""
+
+    WRITERS = (
+        "app/routers/stock_sync.py",
+        "app/services/quotes_ingestion_service.py",
+        "app/services/stock_data_service.py",
+        "app/worker/qmt_sync_service.py",
+        "app/worker/akshare_sync_service.py",
+    )
+
+    def test_all_known_writers_reference_gate(self):
+        for path in self.WRITERS:
+            text = pathlib.Path(path).read_text(encoding="utf-8")
+            self.assertTrue("quotes_write_enabled" in text or "prepare_quote_write" in text, path)
+
+    def test_history_backfill_skips_when_gate_closed(self):
+        """个股历史同步回写 market_quotes 不得绕过写闸。"""
+        src = pathlib.Path("app/routers/stock_sync.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        node = None
+        for item in tree.body:
+            if isinstance(item, ast.AsyncFunctionDef) and item.name == "_sync_latest_to_market_quotes":
+                node = item
+                break
+        self.assertIsNotNone(node, "找不到 _sync_latest_to_market_quotes")
+
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        touched = {"db": False}
+
+        def forbidden_db():
+            touched["db"] = True
+            raise AssertionError("写闸关闭时不应访问数据库")
+
+        ns = {
+            "quotes_write_enabled": lambda: False,
+            "get_mongo_db": forbidden_db,
+            "logger": _Logger(),
+            "str": str,
+            "Dict": Dict,
+            "Any": Any,
+            "datetime": datetime,
+        }
+        exec(compile(module, "stock_sync.py", "exec"), ns)
+        result = asyncio.run(ns["_sync_latest_to_market_quotes"]("600000"))
+        self.assertIsNone(result)
+        self.assertFalse(touched["db"])
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ from app.worker.financial_data_sync_service import get_financial_sync_service
 from app.worker.etf_sync_service import get_etf_sync_service
 from app.services.data_validation_service import get_data_validation_service
 import logging
+
+from app.services.quote_contract import quotes_write_enabled
 import asyncio
 from datetime import datetime, timedelta
 from fastapi import Query
@@ -207,6 +209,10 @@ async def _sync_latest_to_market_quotes(symbol: str) -> None:
     Args:
         symbol: 股票代码（6位）
     """
+    if not quotes_write_enabled():
+        logger.warning("⛔ 行情写入总闸已关闭，跳过 market_quotes 回写")
+        return
+
     db = get_mongo_db()
     symbol6 = str(symbol).zfill(6)
 

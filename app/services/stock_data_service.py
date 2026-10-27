@@ -3,6 +3,7 @@
 基于现有MongoDB集合，提供标准化的数据访问服务
 """
 import logging
+from app.services.quote_contract import quotes_write_enabled
 from datetime import datetime, date
 from typing import Optional, Dict, Any, List
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -282,6 +283,9 @@ class StockDataService:
         symbol: str,
         quote_data: Dict[str, Any]
     ) -> bool:
+        if not quotes_write_enabled():
+            logger.warning("⛔ 行情写入总闸已关闭，拒绝更新 market_quotes")
+            return False
         """
         更新实时行情数据
         Args:
