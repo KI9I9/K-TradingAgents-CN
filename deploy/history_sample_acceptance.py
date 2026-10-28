@@ -55,9 +55,9 @@ def import_transport(root):
     return egress, manual, https
 
 
-def original_gate_hashes():
+def original_gate_hashes(extra=()):
     result = {}
-    for path in GLOBAL_GATES:
+    for path in [*GLOBAL_GATES, *extra]:
         root = Path(path)
         require((root / 'STOP').is_file(), 'original_stop_missing')
         for name in ('STOP', 'permit.json', 'state.json', 'gate.lock'):
@@ -214,6 +214,12 @@ def restrict_network(event, args):
         raise RuntimeError('acceptance_network_scope_violation')
 
 
+def permit_directory(request):
+    run = request.get('run_id')
+    require(run in ('v1', 'v2'), 'unapproved_run')
+    return '/app/runtime/history-acceptance-20261028-600000-' + run
+
+
 def main(request):
     os.umask(0o077)
     root = Path('/app')
@@ -221,8 +227,12 @@ def main(request):
     gate = None
     token = None
     prior = None
+    protected = []
     try:
         require(request['execute'] is True, 'execute_not_authorized')
+        directory = permit_directory(request)
+        if request['run_id'] == 'v2':
+            protected = ['/app/runtime/history-acceptance-20261028-600000-v1']
         require(request['symbol'] == '600000' and request['start'] == '20261021'
                 and request['end'] == '20261027' and request['budget'] == 2, 'scope_not_approved')
         require(datetime.now(BJ).date().isoformat() == '2026-10-28', 'approval_day_expired')
@@ -233,7 +243,7 @@ def main(request):
         env, effective = runtime.reconstruct('/app/deploy/migration_production_entrypoint.py', ENTRY_HASH, '/run/secrets')
         require(env.get('TA_TUSHARE_ROUTE') == 'mainland_unix', 'route_changed')
         require(str(env.get('TUSHARE_UNIFIED_ENABLED')).lower() == 'false', 'tushare_unified_enabled')
-        prior = original_gate_hashes()
+        prior = original_gate_hashes(protected)
         require(prior == request['original_gate_hashes'], 'original_gate_changed')
         # Read-only DB preflight and credential selection; closed before installing the network restriction.
         from pymongo import MongoClient
@@ -270,7 +280,7 @@ def main(request):
         token = None
         os.environ['TA_TUSHARE_ROUTE'] = 'mainland_unix'  # this isolated process only, verified above
         scope = {'codes': ['600000.SH'], 'start': request['start'], 'end': request['end']}
-        gate = provision('/app/runtime/history-acceptance-20261028-600000-v1', egress, scope)
+        gate = provision(directory, egress, scope)
         report['step'] = 'two_request_sample'
         job = SampleAuthority(gate, egress, scope, expected_dates)
         report.update(scope=scope, permit_directory=str(gate.directory), runtime=effective)
@@ -318,7 +328,7 @@ def main(request):
                 state = gate.read(fd)
                 report.update(real_attempts=state['used'], final_permit=state, sample_stop_exists=gate.stopped(fd))
         if prior is not None:
-            report['original_gates_unchanged'] = original_gate_hashes() == prior
+            report['original_gates_unchanged'] = original_gate_hashes(protected) == prior
             if not report['original_gates_unchanged']:
                 report['status'] = 'failed_original_gate_drift'
         print(json.dumps(report, allow_nan=False, default=str))

@@ -55,6 +55,36 @@ class SampleTests(unittest.TestCase):
             return response if response is not None else table(api)
         return self.job.perform(api, '', params or PARAMS, operation)
 
+    def test_run_paths_are_independent_and_unknown_run_rejected(self):
+        spec = importlib.util.spec_from_file_location('runner', ROOT / 'deploy/run_history_sample.py')
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        first, second = runner.run_configuration('v1'), runner.run_configuration('v2')
+        self.assertNotEqual(first['artifact'], second['artifact'])
+        self.assertNotEqual(first['result'], second['result'])
+        for key in ('driver', 'stage', 'execute', 'status'):
+            self.assertIn('20261028-600000-v2', second[key])
+            self.assertNotIn('20261028-600000-v1', second[key])
+            compile(second[key], '<generated>', 'exec')
+        self.assertIn(sample.permit_directory({'run_id': 'v2'}), second['driver'])
+        for invalid in ('v3', '../v1', None):
+            with self.assertRaises(ValueError):
+                runner.run_configuration(invalid)
+            with self.assertRaises(ValueError):
+                sample.permit_directory({'run_id': invalid})
+
+    def test_new_run_does_not_reset_failed_run(self):
+        self.send('daily')
+        self.gate.stop()
+        before = {p.name: p.read_bytes() for p in self.directory.iterdir()}
+        second = sample.provision(self.directory.parent / 'second-run', egress, SCOPE)
+        second_job = sample.SampleAuthority(second, egress, SCOPE, DATES)
+        second_job.perform('daily', '', PARAMS, lambda: table('daily'))
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.directory.iterdir()})
+        with self.assertRaises(egress.TushareEgressStopped):
+            self.send('adj_factor')
+        self.assertEqual(self.state()['used'], 1)
+
     def test_exact_two_then_no_third_request(self):
         self.send('daily'); self.send('adj_factor')
         self.job.assert_ready()

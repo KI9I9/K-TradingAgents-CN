@@ -106,11 +106,27 @@ def ssh(code, data=None):
     return json.loads(result.stdout)
 
 
+def run_configuration(run):
+    if run not in ('v1', 'v2'):
+        raise ValueError('unapproved_run')
+    suffix = '' if run == 'v1' else '-v2'
+    def render(code):
+        return code.replace('20261028-600000-v1', '20261028-600000-' + run)
+    return {
+        'artifact': EVIDENCE / ('history-sample-package' + suffix + '.json'),
+        'result': EVIDENCE / ('history-sample-production-result' + suffix + '.json'),
+        'driver': render(DRIVER), 'stage': render(STAGE),
+        'execute': render(EXECUTE), 'status': render(STATUS),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--action', choices=['freeze', 'stage', 'execute', 'status', 'collect'], required=True)
+    parser.add_argument('--run', choices=['v1', 'v2'], required=True)
     args = parser.parse_args()
-    artifact = EVIDENCE / 'history-sample-package.json'
+    config = run_configuration(args.run)
+    artifact = config['artifact']
     if args.action == 'freeze':
         require_clean = subprocess.check_output(['git', 'status', '--porcelain'], cwd=REPO)
         if require_clean:
@@ -118,16 +134,19 @@ def main():
         probe = json.loads((EVIDENCE / 'history-sampling-preflight.json').read_text())
         # Only old-gate bytes are read here; no provisioning or credential access.
         code = "import pathlib,hashlib,json\nout={}\n"
-        code += "for root in ['/app/runtime/tushare-egress','/app/runtime/tushare-manual-daily-v1']:\n"
+        protected = ['/app/runtime/tushare-egress', '/app/runtime/tushare-manual-daily-v1']
+        if args.run == 'v2':
+            protected.append('/app/runtime/history-acceptance-20261028-600000-v1')
+        code += 'for root in ' + repr(protected) + ':\n'
         code += " p=pathlib.Path(root)\n if not (p/'STOP').is_file():raise RuntimeError('STOP_missing')\n"
         code += " for name in ['STOP','permit.json','state.json','gate.lock']:\n  f=p/name\n  if f.exists():out[str(f)]=hashlib.sha256(f.read_bytes()).hexdigest()\n"
         code += 'print(json.dumps(out))\n'
         host = "import subprocess,json\np=subprocess.run(['docker','exec','-i','ta-live-088a60b962bf-backend-1','python3','-B','-'],input=" + repr(code) + ",text=True,capture_output=True)\nif p.returncode:raise RuntimeError('gate_read_failed')\nprint(p.stdout)"
         gates = ssh(host)
-        request = dict(execute=True, symbol='600000', start='20261021', end='20261027', budget=2,
+        request = dict(execute=True, run_id=args.run, symbol='600000', start='20261021', end='20261027', budget=2,
             source_hashes=probe['source_hashes'], original_gate_hashes=gates,
             runtime_tool=(REPO / 'deploy/quote_guard_runtime.py').read_text())
-        package = dict(schema=1, request=request, driver=DRIVER,
+        package = dict(schema=1, request=request, driver=config['driver'],
             code=(REPO / 'deploy/history_sample_acceptance.py').read_text(),
             source_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip())
         fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -135,9 +154,9 @@ def main():
         print(json.dumps({'frozen':str(artifact),'sha256':hashlib.sha256(artifact.read_bytes()).hexdigest(), 'upstream_requests':0}))
         return
     if args.action in ['status', 'collect']:
-        result = ssh(STATUS)
+        result = ssh(config['status'])
         if args.action == 'collect':
-            target = EVIDENCE / 'history-sample-production-result.json'
+            target = config['result']
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'w') as stream:json.dump(result, stream, indent=2)
         print(json.dumps({k:v for k,v in result.items() if k != 'result.json'}, ensure_ascii=False))
@@ -148,9 +167,9 @@ def main():
             str(artifact), 'osaka-migration:/home/ubuntu/history-sample-upload-' + sha + '.json'],
             capture_output=True, timeout=60)
         if copied.returncode:raise SystemExit('SCP_FAILED: no sample launched')
-        print(json.dumps(ssh(STAGE, {'sha256':sha})))
+        print(json.dumps(ssh(config['stage'], {'sha256':sha})))
     else:
-        print(json.dumps(ssh(EXECUTE, {'sha256':sha})))
+        print(json.dumps(ssh(config['execute'], {'sha256':sha})))
 
 
 if __name__ == '__main__':
