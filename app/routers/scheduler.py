@@ -735,6 +735,8 @@ async def resume_suspended_execution(
             raise HTTPException(status_code=400, detail=f"任务状态不是挂起状态，当前状态: {exec_record.get('status')}")
         
         job_id = exec_record.get("job_id")
+        from app.services.tushare_manual_sync import reject_scheduled_job
+        reject_scheduled_job(job_id)
         if not job_id:
             raise HTTPException(status_code=400, detail="执行记录中没有任务ID")
         
@@ -1262,7 +1264,6 @@ async def retry_failed_symbols(
     
     try:
         from bson import ObjectId
-        from app.worker.tushare_sync_service import get_tushare_sync_service
         
         db = service._get_db()
         
@@ -1272,6 +1273,8 @@ async def retry_failed_symbols(
             raise HTTPException(status_code=404, detail="执行记录不存在")
         
         job_id = exec_record.get("job_id")
+        from app.services.tushare_manual_sync import reject_scheduled_job
+        reject_scheduled_job(job_id)
         if not job_id:
             raise HTTPException(status_code=400, detail="执行记录中没有任务ID")
         

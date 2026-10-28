@@ -362,6 +362,8 @@ class SchedulerService:
             HTTPException: 如果有running记录且force=False，抛出409状态码，提示用户是否强制执行
         """
         from fastapi import HTTPException
+        from app.services.tushare_manual_sync import reject_scheduled_job
+        reject_scheduled_job(job_id)
         # 🔥 手动触发时，添加标记，允许任务函数跳过并发检查
         if kwargs is None:
             kwargs = {}

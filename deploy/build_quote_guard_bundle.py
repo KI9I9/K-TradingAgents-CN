@@ -23,6 +23,9 @@ REPLACEMENTS = {
         "app/worker/akshare_sync_service.py"),
 }
 BIND_ADDITIONS = (
+    "app/services/tushare_manual_sync.py",
+    "app/services/scheduler_service.py",
+    "app/routers/scheduler.py",
     "app/routers/paper.py",
     "app/services/quote_contract.py",
     "app/routers/stock_sync.py",

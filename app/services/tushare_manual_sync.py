@@ -1,9 +1,9 @@
 """Authenticated manual ingress and bounded background orchestration only."""
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi import HTTPException
 from tradingagents.utils.tushare_egress import TushareEgressStopped
-from tradingagents.utils.tushare_manual import DailyGate
+from tradingagents.utils.tushare_manual import DailyGate, scope, JOB_IDS
 
 _TASKS = set()  # Strong references until completion; no detached/restarted jobs.
 MESSAGES = {
@@ -24,7 +24,40 @@ def safe_message(error):
     return MESSAGES.get(reason, 'Tushare 同步未完成，已停止后续请求，需要人工核查。') + ' ['+reason+']'
 
 
+def reject_scheduled_job(job_id):
+    if job_id in JOB_IDS:
+        raise HTTPException(status_code=409, detail=(
+            "Tushare 全市场任务尚未开放；请在股票详情页使用受限手动历史同步，并先确认出口授权有效。"))
+
+
+async def preflight_series(approved, now=None):
+    """Read-only batch check before reserving authority or initializing a provider."""
+    from app.services.historical_data_service import HistoricalDataService
+    from app.services.historical_contract import HistoricalContractError
+    now = now or datetime.now(timezone(timedelta(hours=8)))
+    now = now.astimezone(timezone(timedelta(hours=8)))
+    end = datetime.strptime(approved['end'], '%Y%m%d').date()
+    start = datetime.strptime(approved['start'], '%Y%m%d').date()
+    if end > now.date() or (end == now.date() and now.hour < 18):
+        raise HTTPException(status_code=409, detail="当日历史日线须在北京时间 18:00 后同步；当前不会提交任务或请求上游。")
+    service = HistoricalDataService()  # no initialize(): no indexes/provider/network
+    for code in approved['codes']:
+        try:
+            rows = await service.validate_tushare_series(code[:6], 'daily', 'CN', 'qfq')
+        except HistoricalContractError:
+            raise HTTPException(status_code=409, detail=(
+                f"{code} 的旧 Tushare 序列或唯一索引未通过历史契约检查；"
+                "整批未提交，不会自动迁移旧数据或请求上游。")) from None
+        if rows:
+            latest = max(datetime.strptime(r['trade_date'], '%Y-%m-%d').date() for r in rows)
+            if end > latest and start > latest:
+                raise HTTPException(status_code=409, detail=(
+                    f"{code} 的请求区间缺少与现有前复权序列的重叠日；"
+                    "请在 30 天范围内包含最后已有交易日，不能直接拼接。"))
+
+
 async def sync_scope(job):
+    await preflight_series(job.approved)
     # New service object, unchanged local initialization and persistence logic.
     from app.worker.tushare_sync_service import create_tushare_sync_service
     service = await create_tushare_sync_service()
@@ -81,7 +114,20 @@ async def submit(request, task_type, current_user):
     from app.core.response import ok
     payload = _request_to_dict(request)
     try:
-        job = DailyGate().begin(payload)
+        approved = scope(payload)
+        gate = DailyGate()
+        status = gate.status()
+        if status['reason'] != 'none':
+            raise TushareEgressStopped(status['reason'])
+        if status['mode'] != 'manual':
+            raise TushareEgressStopped('not_authorized')
+        if status['busy']:
+            raise TushareEgressStopped('busy')
+        await preflight_series(approved)
+        job = gate.begin(payload)
+        if job.approved != approved:
+            job.fail('invalid_request')
+            raise TushareEgressStopped('invalid_request')
     except TushareEgressStopped as error:
         code = 422 if error.reason == 'invalid_request' else 429 if error.reason == 'budget_exhausted' else 409
         raise HTTPException(status_code=code, detail=safe_message(error)) from None
