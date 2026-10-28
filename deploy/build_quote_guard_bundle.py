@@ -29,6 +29,10 @@ BIND_ADDITIONS = (
     "app/services/quotes_ingestion_service.py",
     "app/services/stock_data_service.py",
     "app/worker/qmt_sync_service.py",
+    "app/services/historical_contract.py",
+    "app/services/historical_data_service.py",
+    "app/worker/tushare_sync_service.py",
+    "tradingagents/dataflows/providers/china/tushare.py",
 )
 BACKEND_FILES = tuple(REPLACEMENTS) + BIND_ADDITIONS
 FRONTEND_SOURCE = "frontend/src/views/PaperTrading/index.vue"
@@ -135,7 +139,7 @@ def build_bundle(repo, destination):
         "schema": 1, "baseline": BASELINE,
         "source_head": git(repo, "rev-parse", "HEAD").decode().strip(),
         "source_dirty": bool(git(repo, "status", "--porcelain")),
-        "purpose": "CN/ETF guard, writes disabled; not trading recovery",
+        "purpose": "CN/ETF guard and Tushare history contract; supply disabled, not trading recovery",
         "frontend_built": False,
         "frontend_source_sha256": sha256((repo / FRONTEND_SOURCE).read_bytes()),
         "entrypoint_sha256": sha256((repo / "deploy/migration_production_entrypoint.py").read_bytes()),
@@ -152,7 +156,7 @@ def build_bundle(repo, destination):
                         mode="replace" if path in REPLACEMENTS else "bind")
             if path in REPLACEMENTS:
                 item["host_source"] = REPLACEMENTS[path]
-            if path != "app/services/quote_contract.py":
+            if path not in ("app/services/quote_contract.py", "app/services/historical_contract.py"):
                 item["baseline_sha256"] = sha256(git(repo, "show", f"{BASELINE}:{path}"))
         else:
             item["mode"] = "tool"

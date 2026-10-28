@@ -9,7 +9,7 @@ os.environ['TS_DATA_DIR'] = os.environ['TS_CACHE_DIR']
 os.environ['TEMP'] = os.environ['TS_CACHE_DIR']
 
 from typing import Optional, Dict, Any, List, Union
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import pandas as pd
 import asyncio
 import logging
@@ -493,6 +493,9 @@ class TushareProvider(BaseStockDataProvider):
             end_date: 结束日期
             period: 数据周期 (daily/weekly/monthly)
         """
+        if period not in ('daily', 'weekly', 'monthly'):
+            raise ValueError('history_period_invalid')
+        raise_if_egress_blocked()
         if not self.is_available():
             availability_issues = []
             if not TUSHARE_AVAILABLE:
@@ -515,7 +518,7 @@ class TushareProvider(BaseStockDataProvider):
 
             # 格式化日期
             start_str = self._format_date(start_date)
-            end_str = self._format_date(end_date) if end_date else datetime.now().strftime('%Y%m%d')
+            end_str = self._format_date(end_date) if end_date else datetime.now(timezone(timedelta(hours=8))).strftime('%Y%m%d')
 
             # 🔧 使用 pro_bar 接口获取前复权数据（与同花顺一致）
             # 注意：Tushare 的 daily/weekly/monthly 接口不支持复权
@@ -531,6 +534,8 @@ class TushareProvider(BaseStockDataProvider):
             freq = freq_map.get(period, "D")
 
             is_etf = self._is_etf(ts_code)
+            if is_etf and period != 'daily':
+                raise ValueError('history_fund_period_unsupported')
 
             # ⏱️ 记录实际 API 调用时间（使用高精度计时）
             import time
@@ -624,8 +629,15 @@ class TushareProvider(BaseStockDataProvider):
 
             # 数据标准化
             df = self._standardize_historical_data(df)
+            df.attrs['historical_contract'] = {
+                'source': 'tushare', 'symbol': ts_code.split('.')[0], 'period': period,
+                'start_date': start_str, 'end_date': end_str,
+                'volume_unit': 'lot', 'amount_unit': 'thousand_CNY',
+                'endpoint': 'fund_daily' if is_etf else 'pro_bar',
+                'price_adjustment': 'none' if is_etf else 'qfq',
+            }
 
-            self.logger.info(f"✅ 获取{period}历史数据: {symbol} {len(df)}条记录 (前复权 qfq)")
+            self.logger.info(f"✅ 获取{period}历史数据: {symbol} {len(df)}条记录 ({df.attrs['historical_contract']['price_adjustment']})")
             return df
             
         except TushareEgressStopped:

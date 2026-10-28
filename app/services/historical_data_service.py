@@ -99,8 +99,10 @@ class HistoricalDataService:
             overwrite: 是否覆盖已存在的数据（默认True，保持向后兼容）
 
         Returns:
-            保存的记录数量
+            确认处理的记录数量。Tushare 包括内容相同的幂等重放；失败抛异常。
         """
+        if data_source == 'tushare':
+            return await self._save_tushare_history(symbol, data, market, period, overwrite)
         # 🔥 关键修复：每次使用时都重新获取数据库连接，确保使用正确的事件循环
         # 🔥 这样可以避免在 asyncio.gather 并行执行时的事件循环冲突
         from app.core.database import get_mongo_db
@@ -122,20 +124,6 @@ class HistoricalDataService:
 
             # ⏱️ 性能监控：单位转换
             convert_start = datetime.now()
-            # 🔥 在 DataFrame 层面做单位转换（向量化操作，比逐行快得多）
-            if data_source == "tushare":
-                # 成交额：千元 -> 元
-                if 'amount' in data.columns:
-                    data['amount'] = data['amount'] * 1000
-                elif 'turnover' in data.columns:
-                    data['turnover'] = data['turnover'] * 1000
-
-                # 成交量：手 -> 股
-                if 'volume' in data.columns:
-                    data['volume'] = data['volume'] * 100
-                elif 'vol' in data.columns:
-                    data['vol'] = data['vol'] * 100
-
             # 🔥 港股/美股数据：添加 pre_close 字段（从前一天的 close 获取）
             if market in ["HK", "US"] and 'pre_close' not in data.columns and 'close' in data.columns:
                 # 使用 shift(1) 将 close 列向下移动一行，得到前一天的收盘价
@@ -210,6 +198,69 @@ class HistoricalDataService:
         except Exception as e:
             logger.error(f"❌ 保存历史数据失败 {symbol}: {e}")
             return 0
+
+    async def _save_tushare_history(self, symbol, data, market, period, overwrite):
+        from app.services.historical_contract import (
+            HistoricalContractError, tushare_documents, validate_existing_series,
+        )
+        from pymongo import ReplaceOne, UpdateOne
+
+        if data is None or data.empty:
+            return 0
+        # Complete validation precedes writes, so one malformed row cannot leave a valid prefix.
+        documents = tushare_documents(symbol, data, market, period)
+        existing = await self.validate_tushare_series(symbol, period, market, documents[0]['price_adjustment'])
+        collection = self.db.stock_daily_quotes
+        series = {'symbol': symbol, 'data_source': 'tushare', 'period': period}
+        validate_existing_series(existing, documents)
+        old_by_day = {row['trade_date']: row for row in existing}
+        if len(old_by_day) != len(existing):
+            raise HistoricalContractError('history_existing_duplicate_dates')
+        operations = []
+        confirmed = 0
+        now = datetime.utcnow()
+        for doc in documents:
+            old = old_by_day.get(doc['trade_date'])
+            if old is not None:
+                comparable = {k: v for k, v in old.items() if k not in ('_id', 'created_at', 'updated_at')}
+                if not overwrite or comparable == doc:
+                    confirmed += 1
+                    continue
+            doc['created_at'] = old.get('created_at', now) if old else now
+            doc['updated_at'] = now
+            key = {**series, 'trade_date': doc['trade_date']}
+            operations.append(ReplaceOne(key, doc, upsert=True) if overwrite else
+                              UpdateOne(key, {'$setOnInsert': doc}, upsert=True))
+        for start in range(0, len(operations), 200):
+            batch = operations[start:start + 200]
+            result = await collection.bulk_write(batch, ordered=True)
+            if not result.acknowledged or result.upserted_count + result.matched_count != len(batch):
+                raise RuntimeError('history_write_not_confirmed')
+            confirmed += result.upserted_count + result.matched_count
+        return confirmed
+
+    async def validate_tushare_series(self, symbol, period, market='CN', adjustment='qfq'):
+        """Read-only preflight, also repeated before writing after the provider returns."""
+        from app.services.historical_contract import HistoricalContractError, validate_existing_contract
+        from app.core.database import get_mongo_db
+        self.db = get_mongo_db()
+        collection = self.db.stock_daily_quotes
+        indexes = await collection.index_information()
+        unique_key = [('symbol', 1), ('trade_date', 1), ('data_source', 1), ('period', 1)]
+        if not any(index.get('unique') is True and index.get('key') == unique_key
+                   and not index.get('partialFilterExpression') and not index.get('sparse')
+                   for index in indexes.values()):
+            raise HistoricalContractError('history_unique_index_missing')
+        series = {'symbol': symbol, 'data_source': 'tushare', 'period': period}
+        existing = await collection.find(series).to_list(length=20001)
+        if len(existing) > 20000:
+            raise HistoricalContractError('history_existing_series_too_large')
+        if any(row.get('market') != market for row in existing):
+            raise HistoricalContractError('history_existing_market_mismatch')
+        validate_existing_contract(existing, adjustment)
+        if len({row['trade_date'] for row in existing}) != len(existing):
+            raise HistoricalContractError('history_existing_duplicate_dates')
+        return existing
 
     async def _execute_bulk_write_with_retry(
         self,
@@ -493,7 +544,8 @@ class HistoricalDataService:
             logger.error(f"❌ 查询历史数据失败 {symbol}: {e}")
             return []
     
-    async def get_latest_date(self, symbol: str, data_source: str) -> Optional[str]:
+    async def get_latest_date(self, symbol: str, data_source: str, period: str = None,
+                              strict: bool = False) -> Optional[str]:
         """获取最新数据日期"""
         # 🔥 关键修复：检查 self.db 而不是 self.collection
         if self.db is None:
@@ -503,8 +555,11 @@ class HistoricalDataService:
         collection = self.db.stock_daily_quotes
         
         try:
+            query = {"symbol": symbol, "data_source": data_source}
+            if period is not None:
+                query['period'] = period
             result = await collection.find_one(
-                {"symbol": symbol, "data_source": data_source},
+                query,
                 sort=[("trade_date", -1)]
             )
             
@@ -514,6 +569,8 @@ class HistoricalDataService:
             
         except Exception as e:
             logger.error(f"❌ 获取最新日期失败 {symbol}: {e}")
+            if strict:
+                raise
             return None
     
     async def get_data_statistics(self) -> Dict[str, Any]:

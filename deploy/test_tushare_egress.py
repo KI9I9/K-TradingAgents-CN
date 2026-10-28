@@ -348,7 +348,9 @@ class IntegrationTests(unittest.TestCase):
         module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),cls],type_ignores=[])
         ns=dict(BaseStockDataProvider=object,os=os,asyncio=asyncio,datetime=datetime,date=date,timedelta=timedelta,
             TUSHARE_AVAILABLE=True,TushareEgressStopped=egress.TushareEgressStopped,logger=Mock(),
-            _manual_current=policy.CURRENT, _manual_frame=policy.validate_frame, **extra)
+            _manual_current=policy.CURRENT, _manual_frame=policy.validate_frame,
+            PERIODS=('daily','weekly','monthly'), raise_if_egress_blocked=Mock())
+        ns.update(extra)
         exec(compile(ast.fix_missing_locations(module),'<patched-class>','exec'),ns)
         obj=ns[classname].__new__(ns[classname]);obj.logger=Mock()
         return obj,ns
@@ -362,7 +364,7 @@ class IntegrationTests(unittest.TestCase):
                     for index,handler in enumerate(node.handlers):
                         if isinstance(handler.type,ast.Name) and handler.type.id=='Exception':
                             self.assertEqual(node.handlers[index-1].type.id,'TushareEgressStopped');count+=1
-        self.assertEqual(count,92)
+        self.assertEqual(count,91)  # Strict cursor no longer swallows read failures.
 
     def test_provider_does_not_try_second_token_after_stop(self):
         factory=Mock(side_effect=egress.TushareEgressStopped('usage_limit'))
@@ -402,14 +404,14 @@ class IntegrationTests(unittest.TestCase):
 
     def test_sdk_swallowed_error_is_surfaced(self):
         stopped=egress.TushareEgressStopped('usage_limit')
-        check=Mock(side_effect=stopped)
+        check=Mock(side_effect=[None, stopped])  # preflight permits; SDK then swallows stop
         obj,_=self.classes('tradingagents/dataflows/providers/china/tushare.py','TushareProvider',
             ts=types.SimpleNamespace(pro_bar=lambda **kw:None),raise_if_egress_blocked=check)
         obj.api=object();obj.is_available=lambda:True;obj._normalize_ts_code=lambda s:s
         obj._format_date=lambda s:s;obj._is_etf=lambda s:False
         with self.assertRaisesRegex(egress.TushareEgressStopped,'usage_limit'):
             asyncio.run(obj.get_historical_data('SYNTHETIC','20260101','20260102'))
-        check.assert_called_once()
+        self.assertEqual(check.call_count,2)
 
     def test_transport_factory_has_no_direct_query_path(self):
         tree=ast.parse(self.sources['tradingagents/utils/tushare_https.py'])
@@ -420,7 +422,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn('session',text)
 
     def test_sdk_replaced_error_is_surfaced(self):
-        check=Mock(side_effect=egress.TushareEgressStopped('usage_limit'))
+        check=Mock(side_effect=[None, egress.TushareEgressStopped('usage_limit')])
         sdk=types.SimpleNamespace(pro_bar=Mock(side_effect=OSError('ERROR.')))
         obj,_=self.classes('tradingagents/dataflows/providers/china/tushare.py','TushareProvider',
             ts=sdk,raise_if_egress_blocked=check)
@@ -428,7 +430,7 @@ class IntegrationTests(unittest.TestCase):
         obj._format_date=lambda s:s;obj._is_etf=lambda s:False
         with self.assertRaisesRegex(egress.TushareEgressStopped,'usage_limit'):
             asyncio.run(obj.get_historical_data('SYNTHETIC','20260101','20260102'))
-        check.assert_called_once()
+        self.assertEqual(check.call_count,2)
 
 
 

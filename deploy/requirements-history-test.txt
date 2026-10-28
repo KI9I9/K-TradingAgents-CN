@@ -1,0 +1,5 @@
+# Isolated local test environment only; no production dependency changes.
+pandas==2.3.3
+pymongo==4.15.5
+motor==3.7.1
+tushare==1.4.29

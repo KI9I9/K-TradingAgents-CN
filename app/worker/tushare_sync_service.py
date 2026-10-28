@@ -6,6 +6,9 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple
 import logging
+import re
+from app.services.quote_contract import cn_now
+from app.services.historical_contract import PERIODS, trade_date
 from tradingagents.utils.tushare_egress import TushareEgressStopped, raise_if_egress_blocked
 
 from tradingagents.dataflows.providers.china.tushare import TushareProvider
@@ -643,6 +646,9 @@ class TushareSyncService:
         }
 
         try:
+            if period not in PERIODS:
+                raise ValueError('history_period_invalid')
+            raise_if_egress_blocked()
             # 🔥 在线程池的线程中执行时，需要重新初始化数据库连接
             self.db = bind_loop_safe_mongo_db(self)
             
@@ -765,6 +771,10 @@ class TushareSyncService:
                         else:
                             raise
 
+            if symbols is not None:
+                if isinstance(symbols, str) or any(not isinstance(s, str) or not re.fullmatch(r'\d{6}', s) for s in symbols):
+                    raise ValueError('history_symbols_invalid')
+                symbols = list(dict.fromkeys(symbols))
             skipped_etf_symbols = []
             if symbols:
                 stock_symbols = []
@@ -787,6 +797,8 @@ class TushareSyncService:
                 stats["skipped_etf_symbols"] = skipped_etf_symbols
 
             if not symbols:
+                if not skipped_etf_symbols:
+                    return {**stats, 'success': False, 'reason': 'empty_symbol_pool', 'error_count': 1}
                 skip_message = "传入代码均为 ETF/FUND，已跳过股票历史同步，请使用 ETF 专用同步链路"
                 logger.info(skip_message)
                 stats["skipped"] = True
@@ -801,12 +813,17 @@ class TushareSyncService:
             stats["total_processed"] = len(symbols)
 
             # 2. 确定全局结束日期
-            if not end_date:
-                end_date = datetime.now().strftime('%Y-%m-%d')
+            current_time = cn_now()
+            end_date = trade_date(end_date or current_time.date())
+            if start_date is not None:
+                start_date = trade_date(start_date)
+                if start_date > end_date:
+                    raise ValueError('history_range_invalid')
+            if end_date > current_time.date().isoformat():
+                raise ValueError('history_future_end_date')
 
             # 🔥 增量同步时间检查：如果增量同步且结束日期是今天，且当前时间在18:00之前，则跳过同步
-            if incremental and end_date == datetime.now().strftime('%Y-%m-%d'):
-                current_time = datetime.now()
+            if incremental and end_date == current_time.date().isoformat():
                 cutoff_time = current_time.replace(hour=18, minute=0, second=0, microsecond=0)
                 
                 if current_time < cutoff_time:
@@ -901,6 +918,12 @@ class TushareSyncService:
                     # 速率限制
                     await self.rate_limiter.acquire()
 
+                    # 先拒绝旧口径/缺失唯一索引，避免消耗上游请求后才发现不能安全入库。
+                    if self.historical_service is None:
+                        from app.services.historical_data_service import HistoricalDataService
+                        self.historical_service = HistoricalDataService()
+                    await self.historical_service.validate_tushare_series(symbol, period)
+
                     # 确定该股票的起始日期
                     symbol_start_date = start_date
                     if not symbol_start_date:
@@ -908,7 +931,7 @@ class TushareSyncService:
                             symbol_start_date = "1990-01-01"
                         elif incremental:
                             # 增量同步：获取该股票的最后日期
-                            symbol_start_date = await self._get_last_sync_date(symbol)
+                            symbol_start_date = await self._get_last_sync_date(symbol, period=period)
                             logger.debug(f"📅 {symbol}: 从 {symbol_start_date} 开始同步")
                             
                             # 🔥 检查 start_date 是否大于 end_date（避免无效的日期范围）
@@ -1005,6 +1028,8 @@ class TushareSyncService:
                         # ⏱️ 性能监控：数据保存
                         save_start = datetime.now()
                         records_saved = await self._save_historical_data(symbol, df, period=period)
+                        if records_saved != len(df):
+                            raise RuntimeError('history_write_not_confirmed')
                         save_duration = (datetime.now() - save_start).total_seconds()
 
                         stats["success_count"] += 1
@@ -1329,6 +1354,8 @@ class TushareSyncService:
                         "retry_success_count": retry_success_count
                     }
 
+            stats['success'] = (stats['error_count'] == 0 and not stats.get('stopped')
+                                and not stats.get('cancelled'))
             # 🔥 更新任务状态为已完成（如果有 job_id）
             if job_id:
                 try:
@@ -1356,24 +1383,13 @@ class TushareSyncService:
                         except Exception as progress_error:
                             logger.warning(f"⚠️ 更新最终进度时出错: {progress_error}")
                     
-                    # 🔥 修改逻辑：如果成功率 >= 80%，即使有错误也不应该标记为失败
-                    # 🔥 进度应该显示为 100%（因为所有股票都处理完了），失败的项可以单独重试
-                    success_count = stats.get("success_count", 0)
-                    total_processed = stats.get("total_processed", 0)
+                    # 部分失败必须如实报告，不能按“成功率 >= 80%”掩盖入库失败。
                     error_count = stats.get("error_count", 0)
-                    
-                    # 计算成功率
-                    success_rate = (success_count / total_processed * 100) if total_processed > 0 else 0
-                    
-                    # 🔥 如果成功率 >= 80%，不设置 error_message，让 mark_job_completed 根据成功率判断状态
-                    # 🔥 这样即使有部分失败，只要大部分成功，任务也会标记为 success
                     error_message = None
-                    if error_count > 0 and success_rate < 80:
-                        # 只有成功率 < 80% 时才设置 error_message，标记为失败
+                    if not stats['success']:
                         error_messages = [e.get("error", "") for e in stats.get("errors", [])[:5]]
-                        error_message = f"同步完成但有 {error_count} 个错误: {', '.join(error_messages)}"
-                    # 如果成功率 >= 80%，即使有错误也不设置 error_message，让 mark_job_completed 标记为 success
-                    
+                        error_message = f"历史同步未完整成功（错误 {error_count}）: {', '.join(error_messages)}"
+
                     await mark_job_completed(job_id, stats, error_message)
                 except TushareEgressStopped:
                     raise
@@ -1393,6 +1409,8 @@ class TushareSyncService:
                 f"   错误信息: {str(e)}\n"
                 f"   堆栈跟踪:\n{error_details}"
             )
+            stats['success'] = False
+            stats['error_count'] = max(1, stats['error_count'])
             stats["errors"].append({
                 "error": str(e),
                 "error_type": type(e).__name__,
@@ -1438,7 +1456,7 @@ class TushareSyncService:
             raise
         except Exception as e:
             logger.error(f"❌ 保存{period}数据失败 {symbol}: {e}")
-            return 0
+            raise
 
     def _get_ts_code(self, symbol: str) -> str:
         """
@@ -1527,79 +1545,23 @@ class TushareSyncService:
             logger.debug(f"检查股票 {symbol} 是否存在时出错: {e}")
             return False  # 出错时返回 False，不影响主流程
     
-    async def _get_last_sync_date(self, symbol: str = None) -> str:
-        """
-        获取最后同步日期
-
-        Args:
-            symbol: 股票代码，如果提供则返回该股票的最后日期+1天
-
-        Returns:
-            日期字符串 (YYYY-MM-DD)
-        """
-        try:
-            # 🔥 确保 historical_service 已初始化（如果为 None，使用当前 db 连接创建）
-            if self.historical_service is None:
-                from app.services.historical_data_service import HistoricalDataService
-                self.historical_service = HistoricalDataService()
-                self.historical_service.db = self.db
-                self.historical_service.collection = self.db.stock_daily_quotes
-                await self.historical_service._ensure_indexes()
-
-            if symbol:
-                # 获取特定股票的最新日期
-                latest_date = await self.historical_service.get_latest_date(symbol, "tushare")
-                if latest_date:
-                    # 返回最后日期的下一天（避免重复同步）
-                    try:
-                        last_date_obj = datetime.strptime(latest_date, '%Y-%m-%d')
-                        next_date = last_date_obj + timedelta(days=1)
-                        next_date_str = next_date.strftime('%Y-%m-%d')
-                        
-                        # 🔥 如果加1天后的日期已经超过今天，则返回今天（避免 start_date > end_date）
-                        today_str = datetime.now().strftime('%Y-%m-%d')
-                        if next_date_str > today_str:
-                            logger.debug(
-                                f"📅 {symbol}: 数据库最新日期 {latest_date} +1天 = {next_date_str} "
-                                f"已超过今天 {today_str}，返回今天作为开始日期"
-                            )
-                            return today_str
-                        
-                        return next_date_str
-                    except:
-                        # 如果日期格式不对，直接返回
-                        return latest_date
-                else:
-                    # 🔥 没有历史数据时，从上市日期开始全量同步
-                    stock_info = await self.db.stock_basic_info.find_one(
-                        {"code": symbol},
-                        {"list_date": 1}
-                    )
-                    if stock_info and stock_info.get("list_date"):
-                        list_date = stock_info["list_date"]
-                        # 处理不同的日期格式
-                        if isinstance(list_date, str):
-                            # 格式可能是 "20100101" 或 "2010-01-01"
-                            if len(list_date) == 8 and list_date.isdigit():
-                                return f"{list_date[:4]}-{list_date[4:6]}-{list_date[6:]}"
-                            else:
-                                return list_date
-                        else:
-                            return list_date.strftime('%Y-%m-%d')
-
-                    # 如果没有上市日期，从1990年开始
-                    logger.warning(f"⚠️ {symbol}: 未找到上市日期，从1990-01-01开始同步")
-                    return "1990-01-01"
-
-            # 默认返回30天前（确保不漏数据）
-            return (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-
-        except TushareEgressStopped:
-            raise
-        except Exception as e:
-            logger.error(f"❌ 获取最后同步日期失败 {symbol}: {e}")
-            # 出错时返回30天前，确保不漏数据
-            return (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+    async def _get_last_sync_date(self, symbol: str = None, period: str = "daily") -> str:
+        """同源、同周期游标；重取最后一根用于修订与前复权连续性校验。"""
+        if period not in PERIODS:
+            raise ValueError('history_period_invalid')
+        if self.historical_service is None:
+            from app.services.historical_data_service import HistoricalDataService
+            self.historical_service = HistoricalDataService()
+            self.historical_service.db = self.db
+            self.historical_service.collection = self.db.stock_daily_quotes
+            await self.historical_service._ensure_indexes()
+        if symbol:
+            latest = await self.historical_service.get_latest_date(
+                symbol, 'tushare', period=period, strict=True)
+            if latest:
+                return trade_date(latest)
+        # 增量模式缺少游标时不隐式从上市/1990年重刷；全历史只能显式选择。
+        return (cn_now().date() - timedelta(days=365)).isoformat()
 
     # ==================== 财务数据同步 ====================
 
@@ -2682,6 +2644,7 @@ async def run_tushare_realtime_quotes_hourly(**kwargs):
 
 async def run_tushare_historical_sync(incremental: bool = True, **kwargs):
     """APScheduler任务：同步历史数据"""
+    raise_if_egress_blocked()
     job_id = "tushare_historical_sync"
     
     # 🔥 从kwargs中提取恢复位置信息、手动触发标记和强制执行标记
@@ -2746,11 +2709,13 @@ async def run_tushare_historical_sync(incremental: bool = True, **kwargs):
         
         if sync_result.success:
             result = sync_result.result
+            if not isinstance(result, dict) or result.get('success') is not True:
+                raise RuntimeError('tushare_history_sync_incomplete')
             logger.info(f"✅ [APScheduler] Tushare历史数据同步完成: {result}")
             return result
         else:
             # 🔥 检查是否是任务取消
-            if "取消" in sync_result.error or "cancelled" in sync_result.error.lower():
+            if "取消" in (sync_result.error or '') or "cancelled" in (sync_result.error or '').lower():
                 logger.info(f"ℹ️ [APScheduler] Tushare历史数据同步任务已被用户取消")
                 return {"cancelled": True, "message": sync_result.error}
             else:

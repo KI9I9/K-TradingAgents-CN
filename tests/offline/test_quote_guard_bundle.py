@@ -98,7 +98,7 @@ class TestBundle(unittest.TestCase):
             output = Path(temp) / "release"
             manifest = bundle.build_bundle(ROOT, output)
             backend = [item for item in manifest["files"] if item["mode"] != "tool"]
-            self.assertEqual(len(backend), 9)
+            self.assertEqual(len(backend), 13)
             self.assertEqual(sum(item["mode"] == "replace" for item in backend), 3)
             for item in manifest["files"]:
                 data = (output / item["path"]).read_bytes()
@@ -116,12 +116,12 @@ class TestBundle(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 bundle.build_bundle(ROOT, output)
 
-    def test_override_delivers_all_six_new_files_read_only(self):
+    def test_override_delivers_all_ten_added_files_read_only(self):
         root = "/srv/reviewed-release"
         volumes = bundle.backend_override(root)["services"]["backend"]["volumes"]
         self.assertEqual({v["target"] for v in volumes},
                          {"/app/" + p for p in bundle.BIND_ADDITIONS})
-        self.assertEqual(len(volumes), 6)
+        self.assertEqual(len(volumes), 10)
         for volume in volumes:
             self.assertEqual(volume["type"], "bind")
             self.assertTrue(volume["read_only"])

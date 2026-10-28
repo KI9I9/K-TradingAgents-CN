@@ -47,6 +47,7 @@ admin = types.SimpleNamespace(authorize_new=authorize_new)
 
 class Frame:
     empty = False
+    def __init__(self): self.attrs = {}
     def __len__(self): return 1
 
 
