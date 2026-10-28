@@ -141,7 +141,7 @@ def payload(check_only, credentials):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--action', choices=['stage', 'check', 'execute', 'status'], required=True)
+    parser.add_argument('--action', choices=['stage', 'check', 'execute', 'status', 'collect'], required=True)
     parser.add_argument('--credentials-file', type=Path)
     args = parser.parse_args()
     data = None
@@ -168,6 +168,21 @@ def main():
         code, data = LAUNCH, {'upload_sha256': sha, 'auth': auth}
     else:
         code = STATUS
+        if args.action == 'collect':
+            code = code.replace('print(json.dumps(out))', '''
+names=['process.json','state.json','completion.json','backup/complete.json',
+       'audit-before.json','audit-after.json','db-before.json','db-stopped.json','db-after.json',
+       'jobs-before.json','jobs-after.json','frontend-before.json','frontend-after.json',
+       'installed-module-hashes.json','installed-smoke.json','audit-rollback.json',
+       'jobs-rollback.json','frontend-rollback.json']
+out['evidence']={name:json.loads((directory/name).read_text()) for name in names if (directory/name).exists()}
+import subprocess
+current=json.loads(subprocess.check_output(['docker','inspect','ta-live-088a60b962bf-backend-1','ta-live-088a60b962bf-frontend-1']))
+out['current_services']=[{'name':c['Name'],'id':c['Id'],'image':c['Image'],'running':c['State']['Running'],
+    'health':c['State'].get('Health',{}).get('Status'),'started_at':c['State']['StartedAt'],
+    'mount_count':len(c['Mounts'])} for c in current]
+print(json.dumps(out))
+''')
     remote = 'sudo -n python3 -B -c ' + shlex.quote(code)
     try:
         result = subprocess.run(['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
@@ -178,9 +193,20 @@ def main():
         print('REMOTE_CALL_TIMED_OUT: inspect status before retrying; credentials withheld')
         return 1
     if result.returncode:
-        print('REMOTE_CALL_FAILED: inspect status before retrying; raw errors withheld')
+        fd = os.open(EVIDENCE / 'history-remote-error.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'returncode': result.returncode, 'stderr': result.stderr}, stream)
+        print('REMOTE_CALL_FAILED: exit=' + str(result.returncode) + '; inspect status before retrying; raw errors withheld')
         return 1
     report = json.loads(result.stdout)
+    if args.action == 'collect':
+        target = EVIDENCE / ('history-production-' + report['process']['attempt'] + '.json')
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(report, stream, indent=2)
+        print(json.dumps({'evidence_file': str(target), 'stage': report['state']['stage'],
+                          'current_services': report['current_services']}, ensure_ascii=False))
+        return 0
     print(json.dumps(report, ensure_ascii=False))
     if args.action in ['check', 'execute']:
         target = EVIDENCE / ('history-switch-' + report['attempt'] + '.json')
