@@ -198,6 +198,9 @@ def upload(local, remote):
     except subprocess.TimeoutExpired:
         raise SystemExit('ARTIFACT_UPLOAD_TIMED_OUT: no service action requested') from None
     if result.returncode:
+        fd = os.open(EVIDENCE / 'history-artifact-upload-error.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump({'returncode': result.returncode, 'stderr': result.stderr.decode(errors='replace')}, stream)
         raise SystemExit('ARTIFACT_UPLOAD_FAILED: no service action requested')
 
 
