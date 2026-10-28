@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = '/home/ubuntu/k-tradingagents-history-contract-v1-20261028'
@@ -36,7 +37,7 @@ import base64,hashlib,io,json,os,pathlib,sys,tarfile
 os.umask(0o077)
 p=json.load(sys.stdin)
 root=pathlib.Path('/home/ubuntu/k-tradingagents-history-contract-v1-20261028')
-raw=base64.b64decode(p['archive'])
+raw=pathlib.Path('/home/ubuntu/history-contract-46314396365f.tgz').read_bytes()
 if hashlib.sha256(raw).hexdigest()!=p['archive_sha256']:raise RuntimeError('archive_hash')
 root.mkdir(mode=0o700,exist_ok=True)
 stage=root/'staged'
@@ -69,7 +70,12 @@ print(json.dumps({'staged':True,'archive_sha256':p['archive_sha256'],'service_ch
 LAUNCH = r'''
 import datetime,hashlib,json,os,pathlib,subprocess,sys,uuid
 os.umask(0o077)
-p=json.load(sys.stdin)
+request=json.load(sys.stdin)
+uploaded=pathlib.Path('/home/ubuntu')/('history-switch-upload-'+request['upload_sha256']+'.json')
+raw=uploaded.read_bytes()
+if hashlib.sha256(raw).hexdigest()!=request['upload_sha256']:raise RuntimeError('upload_hash')
+p=json.loads(raw)
+p['payload']['auth']=request['auth']
 root=pathlib.Path('/home/ubuntu/k-tradingagents-history-contract-v1-20261028')
 code=p['code'].encode()
 sha=hashlib.sha256(code).hexdigest()
@@ -143,20 +149,34 @@ def main():
         raw = RELEASE.with_suffix('.tgz').read_bytes()
         if digest(raw) != ARCHIVE_SHA:
             raise SystemExit('local_archive_changed')
-        code, data = STAGE, {'archive': base64.b64encode(raw).decode(), 'archive_sha256': ARCHIVE_SHA}
+        upload(RELEASE.with_suffix('.tgz'), '/home/ubuntu/history-contract-46314396365f.tgz')
+        code, data = STAGE, {'archive_sha256': ARCHIVE_SHA}
     elif args.action in ['check', 'execute']:
         if args.credentials_file is None:
             parser.error('credentials file required')
         controller = (REPO / 'deploy/switch_history_contract.py').read_text()
-        code, data = LAUNCH, {'code': controller, 'code_sha256': digest(controller.encode()),
-                             'payload': payload(args.action == 'check', args.credentials_file)}
+        request = {'code': controller, 'code_sha256': digest(controller.encode()),
+                   'payload': payload(args.action == 'check', args.credentials_file)}
+        auth = request['payload'].pop('auth')
+        raw = json.dumps(request).encode()
+        sha = digest(raw)
+        # Large non-secret artifacts use SCP; credentials stay in the small SSH stdin message.
+        with tempfile.NamedTemporaryFile(prefix='history-switch-', suffix='.json') as stream:
+            stream.write(raw)
+            stream.flush()
+            upload(Path(stream.name), '/home/ubuntu/history-switch-upload-' + sha + '.json')
+        code, data = LAUNCH, {'upload_sha256': sha, 'auth': auth}
     else:
         code = STATUS
     remote = 'sudo -n python3 -B -c ' + shlex.quote(code)
-    result = subprocess.run(['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
-                             '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'osaka-migration', remote],
-                            input=json.dumps(data) if data is not None else None,
-                            text=True, capture_output=True, timeout=60)
+    try:
+        result = subprocess.run(['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
+                                 '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'osaka-migration', remote],
+                                input=json.dumps(data) if data is not None else None,
+                                text=True, capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        print('REMOTE_CALL_TIMED_OUT: inspect status before retrying; credentials withheld')
+        return 1
     if result.returncode:
         print('REMOTE_CALL_FAILED: inspect status before retrying; raw errors withheld')
         return 1
@@ -168,6 +188,17 @@ def main():
         with os.fdopen(fd, 'w') as stream:
             json.dump(report, stream, indent=2)
     return 0
+
+
+def upload(local, remote):
+    try:
+        result = subprocess.run(['scp', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
+                                 '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', str(local),
+                                 'osaka-migration:' + remote], capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise SystemExit('ARTIFACT_UPLOAD_TIMED_OUT: no service action requested') from None
+    if result.returncode:
+        raise SystemExit('ARTIFACT_UPLOAD_FAILED: no service action requested')
 
 
 if __name__ == '__main__':

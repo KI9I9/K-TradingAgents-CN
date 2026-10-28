@@ -1,10 +1,12 @@
 """Exercise the real deployment state machine; Docker, APIs and DB use doubles."""
 import importlib.util
+import contextlib
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -82,6 +84,29 @@ class HistorySwitchTests(unittest.TestCase):
     def test_active_or_missing_historical_job_rejected(self):
         with self.assertRaisesRegex(RuntimeError, 'job_active_or_missing'):
             self.m.check_jobs({'success': True, 'data': []})
+
+
+class HistoryLauncherTests(unittest.TestCase):
+    def test_credentials_only_in_stdin_not_uploaded_artifact(self):
+        spec = importlib.util.spec_from_file_location('history_launcher', ROOT / 'deploy/run_history_contract_switch.py')
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        with tempfile.TemporaryDirectory() as directory:
+            m.EVIDENCE = Path(directory)
+            auth = {'username': 'test-user', 'password': 'fixture-secret-do-not-upload'}
+            m.payload = Mock(return_value={'auth': auth, 'check_only': True})
+            captured = []
+            m.upload = Mock(side_effect=lambda local, remote: captured.append(local.read_text()))
+            completed = Mock(returncode=0, stdout=json.dumps({'attempt': 'test-attempt'}))
+            with patch('sys.argv', ['launcher', '--action', 'check', '--credentials-file', '/unused']), \
+                    patch.object(m.subprocess, 'run', return_value=completed) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(m.main(), 0)
+            self.assertEqual(len(captured), 1)
+            self.assertNotIn('fixture-secret-do-not-upload', captured[0])
+            self.assertNotIn('auth', json.loads(captured[0])['payload'])
+            self.assertEqual(json.loads(run.call_args.kwargs['input'])['auth'], auth)
+            self.assertNotIn('fixture-secret-do-not-upload', str(run.call_args.args))
 
 
 if __name__ == '__main__':
