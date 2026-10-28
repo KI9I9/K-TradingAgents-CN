@@ -26,7 +26,9 @@ def safe_message(error):
 
 def reject_scheduled_job(job_id):
     if job_id in JOB_IDS:
-        raise HTTPException(status_code=409, detail=(
+        # Existing scheduler UI treats every 409 as permission to offer force=True.
+        # This operation is unsupported, not a running-instance conflict.
+        raise HTTPException(status_code=400, detail=(
             "Tushare 全市场任务尚未开放；请在股票详情页使用受限手动历史同步，并先确认出口授权有效。"))
 
 

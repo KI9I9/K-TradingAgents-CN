@@ -121,7 +121,7 @@ class Ingress(unittest.IsolatedAsyncioTestCase):
         for force in (False,True):
             service=Mock();kwargs={}
             with self.assertRaises(HTTPException) as error:await fn(service,'tushare_historical_sync',kwargs,force)
-            self.assertEqual(error.exception.status_code,409);self.assertEqual(kwargs,{})
+            self.assertEqual(error.exception.status_code,400);self.assertEqual(kwargs,{})
             self.assertEqual(service.mock_calls,[])
         m.reject_scheduled_job('akshare_historical_sync')
 
@@ -133,7 +133,7 @@ class Ingress(unittest.IsolatedAsyncioTestCase):
             kwargs=dict(execution_id='000000000000000000000001',user={'is_admin':True},service=service)
             if name=='retry_failed_symbols':kwargs.update(start_date=None,end_date=None,period='daily')
             with self.assertRaises(HTTPException) as error:await fn(**kwargs)
-            self.assertEqual(error.exception.status_code,409)
+            self.assertEqual(error.exception.status_code,400)
             col.update_one.assert_not_called();col.update_many.assert_not_called();col.find.assert_not_called()
 
 if __name__=='__main__':unittest.main()
