@@ -19,6 +19,7 @@ from pymongo import MongoClient
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image',default='mongo:7.0')
+    parser.add_argument('--test', choices=['test_mongo_history.py', 'test_mongo_history_write.py'], default='test_mongo_history.py')
     args=parser.parse_args()
     docker=['sudo','-n','docker']
     name='ta-history-test-'+uuid.uuid4().hex[:12]
@@ -44,7 +45,7 @@ def main():
         if not ready: raise RuntimeError('test_mongodb_not_ready')
         env=dict(os.environ,HISTORY_TEST_MONGO_URI=uri)
         root=Path(__file__).resolve().parents[1]
-        result=subprocess.run([sys.executable,'-B',str(root/'tests/history/test_mongo_history.py')],
+        result=subprocess.run([sys.executable,'-B',str(root/'tests/history'/args.test)],
                                cwd=root,env=env,timeout=90)
         print(json.dumps({'image_id':info['Image'],'test_exit_code':result.returncode,
                           'production_access':False,'data':'synthetic only'}))
