@@ -18,7 +18,8 @@ import time
 from uuid import uuid4
 
 from tradingagents.utils.tushare_egress import Permit, TushareEgressStopped, _pairs, _private_fd
-from tradingagents.utils.tushare_manual import CURRENT, BJ, stock_code
+from tradingagents.utils.tushare_manual import CURRENT, BJ
+from deploy.history_sync_plan import _code as stock_code
 
 DIRECTORY = '/app/runtime/tushare-history-batch-v1'
 REGISTRY = '/app/runtime/tushare-history-generations'
@@ -53,8 +54,8 @@ def policy_check(p):
         require(isinstance(p['codes'],list) and 1 <= len(p['codes']) <= 10000
                 and p['codes'] == sorted(set(stock_code(c) for c in p['codes'])))
         lo,hi=(datetime.strptime(p[k],'%Y-%m-%d').date() for k in ('min_date','max_date'))
-        require(0 <= (hi-lo).days <= 366)
-        for k,limit in [('max_requests',20000),('daily_requests',20000),('minute_requests',200)]:
+        require(0 <= (hi-lo).days <= 373)  # 366-day item window plus up to seven days of permit life
+        for k,limit in [('max_requests',100000),('daily_requests',20000),('minute_requests',200)]:
             require(type(p[k]) is int and 2 <= p[k] <= limit)
         require(type(p['expires_at']) in (int,float) and math.isfinite(p['expires_at']))
         return p
@@ -110,9 +111,13 @@ class BatchGate(Permit):
         require(isinstance(plan,dict) and 'plan_sha256' in plan)
         plain={k:v for k,v in plan.items() if k!='plan_sha256'}
         require(plan['plan_sha256']==sha(plain))
-        require(plan['blocked_count']==0 and plan['pool']==policy['codes'] and len(plan['items'])==len(policy['codes']), 'invalid_request')
+        from deploy.history_batch_journal import validate_plan
+        validate_plan(plan)
+        require(plan['pool']==policy['codes'] and len(plan['items'])==len(policy['codes']), 'invalid_request')
         require([i['code'] for i in plan['items']]==policy['codes'])
         for i in plan['items']:
+            if i['status']=='blocked':
+                continue
             require(i['status']=='candidate' and i['request_cost']==2, 'invalid_request')
             require(policy['min_date']<=i['start']<=i['end']<=policy['max_date'], 'invalid_request')
             require(0<=(datetime.strptime(i['end'],'%Y-%m-%d')-datetime.strptime(i['start'],'%Y-%m-%d')).days<366,'invalid_request')
@@ -151,7 +156,7 @@ class BatchGate(Permit):
         with self.locked() as fd:
             p,s=self.read(fd);now=self.check(fd,p,s)
             require(s['plan'] is not None and s['plan']['plan_sha256']==identity,'invalid_request')
-            require(item in s['plan']['items'],'invalid_request')
+            require(item in s['plan']['items'] and item['status']=='candidate','invalid_request')
             if action=='fetch':
                 day=datetime.fromtimestamp(now,BJ).date().isoformat()
                 require(s['used']+2<=p['max_requests'] and s['days'].get(day,0)+2<=p['daily_requests'],'budget_exhausted')
@@ -161,7 +166,7 @@ class BatchGate(Permit):
         with self.locked() as fd:
             p,s=self.read(fd);now=self.check(fd,p,s)
             require(s['active'] is None,'busy')
-            require(s['plan'] is not None and item in s['plan']['items'],'invalid_request')
+            require(s['plan'] is not None and item in s['plan']['items'] and item['status']=='candidate','invalid_request')
             day=datetime.fromtimestamp(now,BJ).date().isoformat()
             require(s['used']+2<=p['max_requests'] and s['days'].get(day,0)+2<=p['daily_requests'],'budget_exhausted')
             identity=uuid4().hex
@@ -170,11 +175,18 @@ class BatchGate(Permit):
         return BatchJob(self,identity,item)
 
 
+class NoDailyData(TushareEgressStopped):
+    """Successful, accounted daily response with zero rows; not an API failure."""
+    def __init__(self):
+        super().__init__('response_invalid')
+
+
 class BatchJob:
     def __init__(self,gate,identity,item):
         self.gate,self.identity,self.item=gate,identity,deepcopy(item)
         self.approved=dict(codes=[item['code']],start=item['start'].replace('-',''),end=item['end'].replace('-',''))
         self.daily_dates=None
+        self.empty_daily=None
 
     @contextmanager
     def context(self):
@@ -186,6 +198,8 @@ class BatchJob:
         with self.gate.locked() as fd:
             p,s=self.gate.read(fd);self.gate.check(fd,p,s)
             require(s['active'] is not None and s['active']['id']==self.identity,'previous_attempt_incomplete')
+            if self.empty_daily is not None:
+                raise NoDailyData()
 
     def fail(self,reason='interrupted'):
         self.gate.stop()  # keep old/manual STOPs untouched
@@ -194,7 +208,8 @@ class BatchJob:
         with self.gate.locked() as fd:
             p,s=self.gate.read(fd);self.gate.check(fd,p,s)
             require(s['active'] is not None and s['active']['id']==self.identity
-                    and s['active']['sent']==['daily','adj_factor'],'previous_attempt_incomplete')
+                    and (s['active']['sent']==['daily','adj_factor'] or
+                         (self.empty_daily is not None and s['active']['sent']==['daily'])),'previous_attempt_incomplete')
             s['active']=None;self.gate.write(fd,s)
 
     def perform(self,api,fields,params,operation):
@@ -231,7 +246,12 @@ class BatchJob:
         try:
             fields,rows=result['fields'],result['items']
             required={'ts_code','trade_date'}|({'open','high','low','close','vol'} if api=='daily' else {'adj_factor'})
-            require(len(fields)==len(set(fields)) and required<=set(fields) and 1<=len(rows)<=366,'response_invalid')
+            require(len(fields)==len(set(fields)) and required<=set(fields) and 0<=len(rows)<=366,'response_invalid')
+            if not rows:
+                require(api=='daily','response_invalid')
+                self.empty_daily=deepcopy(result)
+                self.daily_dates=set()
+                return
             dates=set()
             for values in rows:
                 require(len(values)==len(fields),'response_invalid');r=dict(zip(fields,values))
@@ -335,6 +355,8 @@ async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=D
                 _, _, states = workspace._load(plan['plan_sha256'])
                 for item in plan['items']:
                     saved = states[item['code']]
+                    if saved['phase']=='skipped' and item['status']=='blocked':
+                        continue
                     require(saved['phase'] in ('committed','writing','fetched') and saved['payload'] is not None,
                             'previous_attempt_incomplete')
                     require(await adapter.matches(item, saved['payload']), 'write_outcome_unresolved')

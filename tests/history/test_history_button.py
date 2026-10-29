@@ -234,6 +234,77 @@ class ButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state()['plan']['items'][0]['start'],'2025-10-19')
         self.assertEqual(self.sent,['daily','adj_factor'])
 
+    async def test_new_series_bootstrap_respects_permit_lower_date(self):
+        self.col.rows=[]
+        policy,_=self.gate.status();policy['min_date']='2026-10-01'
+        self.gate=gate_module.provision(Path(self.tmp.name)/'recent',policy)
+        self.workspace=Workspace(self.gate.directory/'runs');self.workspace.provision()
+        self.service.gate=self.gate;self.service.workspace=self.workspace
+        response=await self.click();self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(self.state()['plan']['items'][0]['start'],'2026-10-01')
+        self.assertEqual(self.executions.rows['1']['status'],'success')
+
+    async def test_large_pool_returns_before_inventory_and_keeps_admission_lock(self):
+        from fastapi import HTTPException
+        policy,_=self.gate.status();policy['codes']=['%06d.SH'%n for n in range(600000,600051)]
+        self.gate=gate_module.provision(Path(self.tmp.name)/'large',policy)
+        self.service.gate=self.gate
+        entered=asyncio.Event();release=asyncio.Event()
+        async def prepare(*args):
+            entered.set();await release.wait()
+            raise HTTPException(400,'synthetic inventory refusal')
+        with patch.object(self.service,'_prepare',side_effect=prepare):
+            response=await self.http.post('/api/scheduler/jobs/tushare_historical_sync/trigger',headers={'x-test-admin':'yes'})
+            self.assertEqual(response.status_code,200,response.text)
+            await entered.wait()
+            self.assertEqual(self.executions.rows['1']['status'],'running')
+            second=await self.http.post('/api/scheduler/jobs/tushare_historical_sync/trigger',headers={'x-test-admin':'yes'})
+            self.assertEqual(second.status_code,400)
+            self.assertIn('busy',second.text)
+            release.set()
+            await asyncio.gather(*list(button._TASKS))
+        self.assertEqual(self.executions.rows['1']['status'],'failed')
+        self.assertEqual(self.sent,[])
+
+    async def test_legacy_stock_skipped_healthy_stock_syncs_and_replays(self):
+        from copy import deepcopy
+        legacy=deepcopy(self.col.rows[0]);legacy.update(symbol='300613',_id='legacy')
+        del legacy['history_contract_version']
+        self.col.rows.append(legacy)
+        policy,_=self.gate.status();policy['codes']=['300613.SZ','600000.SH']
+        self.gate=gate_module.provision(Path(self.tmp.name)/'market',policy)
+        self.workspace=Workspace(self.gate.directory/'runs');self.workspace.provision()
+        self.service.gate=self.gate;self.service.workspace=self.workspace
+        response=await self.click();self.assertEqual(response.status_code,200,response.text)
+        record=self.executions.rows['1']
+        self.assertEqual(record['status'],'partial')
+        self.assertEqual(record['success_count'],1)
+        self.assertEqual(record['skipped_items'],[dict(code='300613.SZ',reason='legacy_contract_unproven')])
+        self.assertEqual(self.sent,['daily','adj_factor'])
+        self.assertEqual(next(r for r in self.col.rows if r['symbol']=='300613'),legacy)
+        self.assertEqual((await self.click()).status_code,200)
+        self.assertEqual(len(self.sent),2)
+
+    async def test_confirmed_empty_daily_is_no_write_success_not_global_stop(self):
+        from copy import deepcopy
+        before=deepcopy(self.col.rows)
+        def empty_sdk(**kwargs):
+            job=CURRENT.get()
+            def operation():
+                self.sent.append('daily')
+                return dict(fields=['ts_code','trade_date','open','high','low','close','vol'],items=[])
+            job.perform('daily','',dict(ts_code='600000.SH',start_date=kwargs['start_date'],end_date=kwargs['end_date']),operation)
+            return None
+        self.sdk.pro_bar.side_effect=empty_sdk
+        response=await self.click();self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(self.executions.rows['1']['status'],'success')
+        self.assertEqual(self.col.rows,before)
+        self.assertEqual(self.state()['used'],1)
+        self.assertIsNone(self.state()['active'])
+        self.assertFalse((self.gate.directory/'STOP').exists())
+        self.assertEqual((await self.click()).status_code,200)
+        self.assertEqual(self.sent,['daily'])
+
     async def test_legacy_data_named_before_any_request(self):
         del self.col.rows[0]['history_contract_version']
         response=await self.click();self.assertEqual(response.status_code,400)

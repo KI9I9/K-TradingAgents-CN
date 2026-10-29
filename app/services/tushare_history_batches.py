@@ -23,7 +23,7 @@ BJ=timezone(timedelta(hours=8))
 def message(reason):
     return {
         'not_authorized':'历史同步授权尚未配置，未发送上游请求。',
-        'disabled':'历史同步已停止，需核查停止原因后重新授权。',
+        'disabled':'历史同步运行许可已关闭（不是登录权限）；请联系运维核查停止原因并恢复。',
         'expired':'历史同步授权已到期，未自动续期。',
         'budget_exhausted':'本次或今日请求预算已用完；已完成的数据保留，未自动增加额度。',
         'usage_limit':'上游报告调用限额，已停止后续请求。',
@@ -55,55 +55,21 @@ class HistoryBatchService:
             except BlockingIOError:raise TushareEgressStopped('busy') from None
             self.gate.assert_selected()
             policy,state=self.gate.status()
-            plan=state['plan']
-            now=self.clock().astimezone(BJ)
-            # Pre-18:00 clicks target yesterday; no inferred trading day/finality.
-            end=(now.date() if now.hour>=18 else now.date()-timedelta(days=1)).isoformat()
-            expected='incremental_daily_qfq' if incremental else 'year_daily_qfq'
-            checkpoint=self.workspace.status(plan['plan_sha256']) if plan is not None else None
-            reuse=plan is not None and (not checkpoint['complete'] or (plan['end']==end and plan['mode']==expected))
-            if reuse:
-                if plan['mode']!=expected:
-                    raise HTTPException(400,'已有未完成的历史计划，请使用相同同步模式继续，不能替换其范围。')
-                if checkpoint['complete']:
-                    # Repeated clicks are read-only reconciliation, not new requests.
-                    adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,None,None)
-                    with self.workspace.locked():
-                        _,_,saved=self.workspace._load(plan['plan_sha256'])
-                        for item in plan['items']:
-                            self.gate.authorize(plan['plan_sha256'],item,'reconcile')
-                            if not await adapter.matches(item,saved[item['code']]['payload']):
-                                raise HTTPException(400,'已完成计划的数据发生变化，已停止自动重复取数，请核查。')
-            else:
-                inventory=await Inventory(self.collection).collect(policy['codes'])
-                plan=build_plan(**inventory,end=end,now=now,incremental=incremental,max_window_days=366,
-                    quota=dict(daily_requests=policy['daily_requests'],rolling_minute_requests=policy['minute_requests'],
-                               evidence_ref='explicit-local-policy'))
-                blocked=[i for i in plan['items'] if i['status']=='blocked']
-                if blocked:
-                    preview=', '.join(i['code']+':'+i['reason'] for i in blocked[:8])
-                    raise HTTPException(400,f'历史计划有 {len(blocked)} 只股票未通过检查，未请求上游：{preview}')
-                self.gate._validate_plan(policy,plan)
-                try:self.workspace.create(plan)
-                except FileExistsError:
-                    # Only a complete, structurally verified existing plan is reusable.
-                    self.workspace.status(plan['plan_sha256'])
-                self.gate.bind(plan)
-            checkpoint=self.workspace.status(plan['plan_sha256'])
-            if checkpoint['counts']['fetching']:
-                raise BatchStopped('request_outcome_unknown')
-            identity=plan['plan_sha256']
-            # A budget check before enqueue; writes/reconcile may continue without
-            # spending a new HTTP request when a frozen response already exists.
-            with self.workspace.locked():
-                _,_,states=self.workspace._load(identity)
-                pending=next((i for i in plan['items'] if states[i['code']]['phase']=='pending'),None)
-                has_saved=any(s['phase'] in ('fetched','writing') for s in states.values())
-            if pending is not None and not has_saved:self.gate.authorize(identity,pending,'fetch')
+            if len(policy['codes'])>50:
+                now=self.clock()
+                inserted=await self.executions.insert_one(dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',
+                    status='running',timestamp=now,scheduled_time=now,updated_at=now,is_manual=True,
+                    cancel_requested=False,job_kwargs={'incremental':incremental},total_items=len(policy['codes']),
+                    processed_items=0,progress=0,progress_message='正在核验全市场股票池与历史断点'))
+                task=asyncio.create_task(self._prepare_and_run(fd,inserted.inserted_id,policy,state,incremental))
+                _TASKS.add(task);task.add_done_callback(_TASKS.discard)
+                fd=None
+                return True
+            plan,checkpoint=await self._prepare(policy,state,incremental)
             now=self.clock()
             record=dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',status='running',timestamp=now,
                 scheduled_time=now,updated_at=now,is_manual=True,cancel_requested=False,
-                plan_sha256=identity,job_kwargs={'incremental':incremental},
+                plan_sha256=plan['plan_sha256'],job_kwargs={'incremental':incremental},
                 total_items=len(plan['items']),processed_items=checkpoint['counts']['committed'],
                 progress=int(100*checkpoint['counts']['committed']/len(plan['items'])),
                 progress_message=f"同步授权范围内 {len(plan['items'])} 只股票；结束日期 {plan['end']}")
@@ -120,6 +86,72 @@ class HistoryBatchService:
         finally:
             if fd is not None:os.close(fd)
 
+    async def _prepare(self,policy,state,incremental):
+        plan=state['plan']
+        now=self.clock().astimezone(BJ)
+        # Pre-18:00 clicks target yesterday; no inferred trading day/finality.
+        end=(now.date() if now.hour>=18 else now.date()-timedelta(days=1)).isoformat()
+        expected='incremental_daily_qfq' if incremental else 'year_daily_qfq'
+        checkpoint=self.workspace.status(plan['plan_sha256']) if plan is not None else None
+        reuse=plan is not None and (not checkpoint['complete'] or (plan['end']==end and plan['mode']==expected))
+        if reuse:
+            if plan['mode']!=expected:
+                raise HTTPException(400,'已有未完成的历史计划，请使用相同同步模式继续，不能替换其范围。')
+            if checkpoint['complete']:
+                # Repeated clicks are read-only reconciliation, not new requests.
+                adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,None,None)
+                with self.workspace.locked():
+                    _,_,saved=self.workspace._load(plan['plan_sha256'])
+                    for item in plan['items']:
+                        if item['status']=='blocked':
+                            continue
+                        self.gate.authorize(plan['plan_sha256'],item,'reconcile')
+                        if not await adapter.matches(item,saved[item['code']]['payload']):
+                            raise HTTPException(400,'已完成计划的数据发生变化，已停止自动重复取数，请核查。')
+        else:
+            inventory=await Inventory(self.collection).collect(policy['codes'])
+            plan=build_plan(**inventory,end=end,now=now,incremental=incremental,max_window_days=366,
+                bootstrap_start=max(policy['min_date'],(now.date()-timedelta(days=365)).isoformat()) if incremental else None,
+                quota=dict(daily_requests=policy['daily_requests'],rolling_minute_requests=policy['minute_requests'],
+                           evidence_ref='explicit-local-policy'))
+            blocked=[i for i in plan['items'] if i['status']=='blocked']
+            if blocked and len(blocked)==len(plan['items']):
+                preview=', '.join(i['code']+':'+i['reason'] for i in blocked[:8])
+                raise HTTPException(400,f'历史计划有 {len(blocked)} 只股票未通过检查，未请求上游：{preview}')
+            self.gate._validate_plan(policy,plan)
+            try:self.workspace.create(plan)
+            except FileExistsError:
+                # Only a complete, structurally verified existing plan is reusable.
+                self.workspace.status(plan['plan_sha256'])
+            self.gate.bind(plan)
+        checkpoint=self.workspace.status(plan['plan_sha256'])
+        if checkpoint['counts']['fetching']:
+            raise BatchStopped('request_outcome_unknown')
+        identity=plan['plan_sha256']
+        # A budget check before enqueue; writes/reconcile may continue without
+        # spending a new HTTP request when a frozen response already exists.
+        with self.workspace.locked():
+            _,_,states=self.workspace._load(identity)
+            pending=next((i for i in plan['items'] if states[i['code']]['phase']=='pending'),None)
+            has_saved=any(s['phase'] in ('fetched','writing') for s in states.values())
+        if pending is not None and not has_saved:self.gate.authorize(identity,pending,'fetch')
+        return plan,checkpoint
+
+    async def _prepare_and_run(self,fd,execution_id,policy,state,incremental):
+        try:
+            plan,checkpoint=await self._prepare(policy,state,incremental)
+            current=await self.executions.find_one({'_id':execution_id})
+            if not current or current.get('cancel_requested'):
+                raise BatchStopped('cancelled')
+            await self.executions.update_one({'_id':execution_id},{'$set':{'plan_sha256':plan['plan_sha256']}})
+        except BaseException as error:
+            os.close(fd)
+            detail=error.detail if isinstance(error,HTTPException) else message(error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted')
+            await self.executions.update_one({'_id':execution_id},{'$set':dict(status='failed',finished_at=self.clock(),error_message=detail,progress_message=detail)})
+            if not isinstance(error,Exception):raise
+            return
+        await self._run(fd,execution_id,plan)
+
     async def _run(self,fd,execution_id,plan):
         identity=plan['plan_sha256']
         async def authorize(plan_hash,item,action):
@@ -130,9 +162,11 @@ class HistoryBatchService:
         adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,job_factory,authorize)
         reason=None
         try:
+            async def progress(result):
+                await self._progress(execution_id,result,'running',plan)
             while True:
-                result=await self.workspace.advance_async(identity,adapter,max_items=1)
-                await self._progress(execution_id,result,'success' if result['complete'] else 'running',plan)
+                result=await self.workspace.advance_async(identity,adapter,max_items=10000,on_progress=progress)
+                await self._progress(execution_id,result,('partial' if (result.get('skipped') or any(o['reason']!='no_daily_rows' for o in result.get('outcomes',[]))) else 'success') if result['complete'] else 'running',plan)
                 if result['complete']:break
                 await asyncio.sleep(0)
         except BaseException as error:
@@ -152,10 +186,17 @@ class HistoryBatchService:
 
     async def _progress(self,execution_id,result,status,plan,error=None):
         count,total=result['committed'],result['total']
+        skipped=[dict(code=i['code'],reason=i['reason']) for i in plan['items'] if i['status']=='blocked']
+        finished=count+len(skipped)
+        outcomes=result.get('outcomes',[])
+        skipped+=outcomes
+        count-=len(outcomes)
+        if skipped and not error:
+            error='跳过名单：'+', '.join(i['code']+':'+i['reason'] for i in skipped)
         update=dict(status=status,updated_at=self.clock(),processed_items=count,total_items=total,
-            success_count=count,progress=int(100*count/total),
-            progress_message=error or f"已完成 {count}/{total} 只股票（授权范围，结束日期 {plan['end']}）",
-            error_message=error,result=dict(success=result['complete'],success_count=count,total_processed=total,
+            success_count=count,skipped_count=len(skipped),skipped_items=skipped,progress=int(100*finished/total),
+            progress_message=error or f"已同步 {count}/{total} 只，跳过 {len(skipped)} 只（可查看跳过名单，结束日期 {plan['end']}）",
+            error_message=error,result=dict(success=result['complete'] and all(i['reason']=='no_daily_rows' for i in skipped),complete=result['complete'],skipped_items=skipped,success_count=count,total_processed=finished,
                 plan_sha256=plan['plan_sha256'],end=plan['end']))
         if status!='running':update['finished_at']=self.clock()
         await self.executions.update_one({'_id':execution_id},{'$set':update})

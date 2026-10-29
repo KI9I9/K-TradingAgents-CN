@@ -177,9 +177,13 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_qfq_revision_refused_before_write(self):
         self.sdk.pro_bar.return_value.loc[0,'close']=11.5
-        with self.assertRaisesRegex(BatchStopped,'payload_contract_invalid'): await self.advance()
+        result=await self.advance()
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['outcomes'],[dict(code='600000.SH',reason='history_adjustment_or_price_revision')])
         self.assertEqual(self.col.rows,self.baseline)
-        self.assertTrue(self.job.failed)
+        self.assertTrue(self.job.finished)
+        self.assertFalse(self.job.failed)
+        self.assertEqual((await self.advance())['processed'],0)
 
     async def test_frozen_frame_tamper_refused(self):
         payload=await self.payload(); payload['documents'][0]['volume']*=100

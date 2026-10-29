@@ -19,7 +19,7 @@ import stat
 import uuid
 
 MAX_JSON = 16 * 1024 * 1024
-PHASES = ('pending', 'fetching', 'fetched', 'writing', 'committed')
+PHASES = ('pending', 'fetching', 'fetched', 'writing', 'committed', 'skipped')
 
 
 class BatchStopped(RuntimeError):
@@ -110,16 +110,21 @@ def validate_plan(plan):
         _require(isinstance(pool, list) and pool and pool == sorted(set(pool))
                  and isinstance(items, list) and [i['code'] for i in items] == pool,
                  'invalid_plan_pool')
-        _require(plan['blocked_count'] == 0 and plan['candidate_count'] == len(pool)
-                 and plan['total_requests'] == 2 * len(pool), 'blocked_plan')
+        _require(plan['blocked_count'] == sum(i['status']=='blocked' for i in items)
+                 and plan['candidate_count'] == len(pool)-plan['blocked_count']
+                 and plan['candidate_requests'] == 2 * plan['candidate_count']
+                 and plan['total_requests'] == (None if plan['blocked_count'] else 2*len(pool)), 'blocked_plan')
         _require(isinstance(plan['quota'], dict) and plan['quota'].get('evidence_ref'),
                  'quota_unverified')
         for item in items:
             _require(re.fullmatch(r'\d{6}\.(SH|SZ|BJ)', item['code']) is not None
-                     and item['status'] == 'candidate' and item['reason'] is None
-                     and item['request_cost'] == 2 and _hash(item['observation_sha256'])
+                     and ((item['status']=='candidate' and item['reason'] is None and item['request_cost']==2)
+                          or (item['status']=='blocked' and item['reason'] in
+                              ('legacy_contract_unproven','cursor_after_requested_end','window_exceeds_current_transport')
+                              and item['request_cost'] is None)) and _hash(item['observation_sha256'])
                      and item['end'] == plan['end']
-                     and 0 <= (date.fromisoformat(item['end'])-date.fromisoformat(item['start'])).days < plan.get('max_window_days', 30) <= 366,
+                     and (item['status']=='blocked' or
+                          0 <= (date.fromisoformat(item['end'])-date.fromisoformat(item['start'])).days < plan.get('max_window_days', 30) <= 366),
                      'invalid_plan_item')
         return expected
     except (KeyError, ValueError, TypeError, AttributeError):
@@ -189,13 +194,13 @@ class Workspace:
             _atomic(folder/'plan.json', plan)
             for item in plan['items']:
                 _atomic(folder/(item['code']+'.json'), dict(
-                    schema=1, plan_sha256=identity, code=item['code'], phase='pending',
+                    schema=1, plan_sha256=identity, code=item['code'], phase='skipped' if item['status']=='blocked' else 'pending',
                     fetch_attempts=0, payload=None, payload_sha256=None))
             _atomic(folder/'ready.json', {'plan_sha256': identity})
             _sync_dir(self.path)
         return identity
 
-    def _load(self, identity):
+    def _load(self, identity, *, metadata_only=False):
         _require(self._held and _hash(identity), 'invalid_run_access')
         folder = self.path/identity
         _private(folder, directory=True)
@@ -213,23 +218,26 @@ class Workspace:
                      and state['code'] == code and state['phase'] in PHASES,
                      'item_identity_mismatch')
             _require(type(state['fetch_attempts']) is int
-                     and state['fetch_attempts'] == (0 if state['phase'] == 'pending' else 1),
+                     and state['fetch_attempts'] == (0 if state['phase'] in ('pending','skipped') else 1),
                      'invalid_fetch_attempts')
-            if state['phase'] in ('pending', 'fetching'):
+            _require((state['phase']=='skipped') == (item['status']=='blocked'), 'invalid_skip')
+            if state['phase'] in ('pending', 'fetching', 'skipped'):
                 _require(state['payload'] is None and state['payload_sha256'] is None, 'unexpected_payload')
             else:
                 _require(isinstance(state['payload'], dict) and state['payload']
                          and _hash(state['payload_sha256'])
                          and digest(state['payload']) == state['payload_sha256'], 'payload_corrupt')
+            if metadata_only and state['phase']=='committed':
+                state['payload']={k:v for k,v in state['payload'].items() if k in ('schema','outcome')}
             states[code] = state
         return folder, plan, states
 
     def status(self, identity):
         with self.locked():
-            _, _, states = self._load(identity)
+            _, _, states = self._load(identity,metadata_only=True)
             counts = {phase: sum(s['phase'] == phase for s in states.values()) for phase in PHASES}
             return dict(plan_sha256=identity, counts=counts,
-                        complete=counts['committed'] == len(states))
+                        complete=counts['committed']+counts['skipped'] == len(states))
 
     def advance(self, identity, adapter, *, max_items):
         """Synchronous convenience entry; async applications use advance_async."""
@@ -239,7 +247,7 @@ class Workspace:
             return asyncio.run(self.advance_async(identity, adapter, max_items=max_items))
         raise BatchStopped('use_advance_async')
 
-    async def advance_async(self, identity, adapter, *, max_items):
+    async def advance_async(self, identity, adapter, *, max_items, on_progress=None):
         """Run a bounded slice with explicit authority and side-effect adapters.
 
         Adapter methods may be synchronous or async; all stay on the caller loop.
@@ -256,7 +264,13 @@ class Workspace:
 
         _require(type(max_items) is int and 1 <= max_items <= 10000, 'invalid_slice')
         with self.locked():
-            folder, plan, states = self._load(identity)
+            folder, plan, states = self._load(identity,metadata_only=True)
+            def summary(processed):
+                return dict(processed=processed,committed=sum(s['phase']=='committed' for s in states.values()),
+                    skipped=sum(s['phase']=='skipped' for s in states.values()),total=len(states),
+                    outcomes=[dict(code=c,reason=s['payload']['outcome']) for c,s in states.items()
+                              if s['phase']=='committed' and s['payload'].get('schema') in (2,3)],
+                    complete=all(s['phase'] in ('committed','skipped') for s in states.values()))
             # Refuse all further work when ANY earlier request is uncertain.
             _require(not any(s['phase'] == 'fetching' for s in states.values()), 'request_outcome_unknown')
             # Reconcile uncertain writes before fetching any new symbol.
@@ -264,7 +278,7 @@ class Workspace:
             processed = 0
             for item in ordered:
                 state = states[item['code']]
-                if state['phase'] == 'committed':
+                if state['phase'] in ('committed','skipped'):
                     continue
                 if processed >= max_items:
                     break
@@ -310,6 +324,8 @@ class Workspace:
                              'write_outcome_unresolved')
                 state['phase'] = 'committed'
                 _atomic(path, state)
+                state['payload']={k:v for k,v in state['payload'].items() if k in ('schema','outcome')}
                 processed += 1
-            return dict(processed=processed, committed=sum(s['phase'] == 'committed' for s in states.values()),
-                        total=len(states), complete=all(s['phase'] == 'committed' for s in states.values()))
+                if on_progress is not None:
+                    await call(on_progress, summary(processed))
+            return summary(processed)

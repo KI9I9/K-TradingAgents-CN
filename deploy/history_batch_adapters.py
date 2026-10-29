@@ -160,8 +160,21 @@ class HistoricalAdapter:
             with job.context():
                 job.assert_ready()
                 provider = await self.provider_factory()
-                frame = await provider.get_historical_data(item['code'][:6], item['start'], item['end'], period='daily')
-                job.assert_ready()
+                from tradingagents.utils.tushare_batch import NoDailyData
+                try:
+                    frame = await provider.get_historical_data(item['code'][:6], item['start'], item['end'], period='daily')
+                    job.assert_ready()
+                except NoDailyData:
+                    if getattr(job,'empty_daily',None) is None:
+                        raise
+                    frame=None
+                if getattr(job,'empty_daily',None) is not None and (frame is None or frame.empty):
+                    payload=dict(schema=2,code=item['code'],start=item['start'],end=item['end'],
+                        outcome='no_daily_rows',response=deepcopy(job.empty_daily),baseline=raw_json(baseline))
+                    if not await self.validate(item,payload):
+                        raise BatchStopped('invalid_empty_evidence')
+                    job.finish()
+                    return payload
                 documents = tushare_documents(item['code'][:6], frame, 'CN', 'daily')
                 frozen = freeze_frame(frame)
                 rebuilt = tushare_documents(item['code'][:6], thaw_frame(frozen), 'CN', 'daily')
@@ -169,6 +182,12 @@ class HistoricalAdapter:
                     raise BatchStopped('frame_roundtrip_changed')
                 payload = dict(schema=1, code=item['code'], start=item['start'], end=item['end'],
                     frame=frozen, documents=documents, baseline=raw_json(baseline))
+                try:
+                    validate_existing_series(baseline, documents)
+                except HistoricalContractError as error:
+                    if str(error) not in ('history_adjustment_or_price_revision','history_adjustment_overlap_missing'):
+                        raise
+                    payload.update(schema=3,outcome=str(error))
                 if not await self.validate(item, payload):
                     raise BatchStopped('payload_contract_invalid')
                 # finish verifies daily + adj_factor were accounted for by transport.
@@ -180,8 +199,26 @@ class HistoricalAdapter:
 
     async def validate(self, item, payload):
         try:
-            if (set(payload) != {'schema', 'code', 'start', 'end', 'frame', 'documents', 'baseline'}
-                    or type(payload['schema']) is not int or payload['schema'] != 1
+            if payload.get('schema')==2:
+                if set(payload)!={'schema','code','start','end','outcome','response','baseline'} or payload['outcome']!='no_daily_rows':
+                    return False
+                if any(payload[k]!=item[k] for k in ('code','start','end')):
+                    return False
+                response=payload['response']
+                fields=response['fields']
+                if response['items']!=[] or len(fields)!=len(set(fields)) or not {'ts_code','trade_date','open','high','low','close','vol'}<=set(fields):
+                    return False
+                baseline=json_util.loads(payload['baseline'])
+                validate_existing_contract(baseline,'qfq')
+                if any(r.get('symbol')!=item['code'][:6] or r.get('data_source')!='tushare' or r.get('period')!='daily' or r.get('market')!='CN' for r in baseline):
+                    return False
+                observation=dict(data_source='tushare',market='CN',period='daily',count=len(baseline),
+                    latest=max((r['trade_date'] for r in baseline),default=None),contract_verified=True,content_sha256=raw_hash(baseline))
+                return fingerprint(observation)==item['observation_sha256']
+            rejected=payload.get('schema')==3
+            keys={'schema', 'code', 'start', 'end', 'frame', 'documents', 'baseline'}
+            if (set(payload) != (keys|{'outcome'} if rejected else keys)
+                    or type(payload['schema']) is not int or payload['schema'] not in (1,3)
                     or any(payload[k] != item[k] for k in ('code', 'start', 'end'))):
                 return False
             frame = thaw_frame(payload['frame'])
@@ -206,14 +243,19 @@ class HistoricalAdapter:
                 contract_verified=True, content_sha256=raw_hash(baseline))
             if fingerprint(observation) != item['observation_sha256']:
                 return False
-            validate_existing_series(baseline, documents)
-            return True
+            try:
+                validate_existing_series(baseline, documents)
+            except HistoricalContractError as error:
+                return rejected and str(error)==payload['outcome'] and str(error) in ('history_adjustment_or_price_revision','history_adjustment_overlap_missing')
+            return not rejected
         except (ValueError, KeyError, TypeError, AttributeError, BatchStopped):
             return False
 
     async def write(self, item, payload):
         if not await self.validate(item, payload) or await self.preflight(item) != item['observation_sha256']:
             raise BatchStopped('write_preflight_failed')
+        if payload.get('schema') in (2,3):
+            return  # confirmed no-data result; journal only, no history write
         # The legacy service resolves its DB through the application getter. Verify
         # that it targets the same collection as inventory BEFORE permitting writes.
         target_rows = await self.service.validate_tushare_series(item['code'][:6], 'daily', 'CN', 'qfq')
@@ -230,6 +272,8 @@ class HistoricalAdapter:
         if not await self.validate(item, payload):
             return False
         _, actual = await self.inventory.snapshot(item['code'])
+        if payload.get('schema') in (2,3):
+            return raw_json(actual)==payload['baseline']
         baseline = {r['trade_date']: r for r in json_util.loads(payload['baseline'])}
         incoming = {r['trade_date']: r for r in payload['documents']}
         found = {r['trade_date']: r for r in actual}

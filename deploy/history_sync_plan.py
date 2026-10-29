@@ -41,7 +41,7 @@ def _code(value):
         raise PlanError('invalid_stock')
     code, suffix = match.groups()
     exchange = ('SH' if code.startswith(('600', '601', '603', '605', '688', '689'))
-                else 'SZ' if code.startswith(('000', '001', '002', '003', '300', '301'))
+                else 'SZ' if code.startswith(('000', '001', '002', '003', '300', '301', '302'))
                 else 'BJ' if code.startswith(('430', '83', '87', '88', '920')) else None)
     if exchange is None or suffix not in (None, exchange):
         raise PlanError('invalid_stock')
