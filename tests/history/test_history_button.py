@@ -109,6 +109,80 @@ class ButtonTests(unittest.IsolatedAsyncioTestCase):
     def state(self):
         with self.gate.locked() as fd:return self.gate.read(fd)[1]
 
+    def generation_args(self):
+        with self.gate.locked() as fd: policy,_ = self.gate.read(fd)
+        return policy, dict(registry=Path(self.tmp.name)/'generations', legacy=self.gate.directory)
+
+    async def test_new_generation_uses_original_button_and_preserves_legacy_stop(self):
+        policy, paths = self.generation_args()
+        self.gate.stop()
+        old = {str(p):p.read_bytes() for p in self.gate.directory.rglob('*') if p.is_file()}
+        self.gate = await gate_module.activate_generation(policy, self.col, **paths)
+        self.workspace = Workspace(self.gate.directory/'runs')
+        self.service.gate, self.service.workspace = self.gate, self.workspace
+        response = await self.click()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.executions.rows['1']['status'], 'success')
+        self.assertEqual(self.sent, ['daily', 'adj_factor'])
+        self.assertEqual(self.state()['used'], 2)
+        self.assertEqual(old, {name:Path(name).read_bytes() for name in old})
+
+    async def test_unstopped_predecessor_cannot_get_new_budget(self):
+        policy, paths = self.generation_args()
+        with self.assertRaisesRegex(Exception, 'predecessor_not_stopped'):
+            await gate_module.activate_generation(policy, self.col, **paths)
+        self.assertFalse(paths['registry'].exists())
+
+    async def test_recovered_writing_is_verified_without_rewriting_old_journal(self):
+        await self.click()
+        policy, paths = self.generation_args()
+        plan = self.state()['plan']['plan_sha256']
+        path = self.gate.directory/'runs'/plan/'600000.SH.json'
+        state = json.loads(path.read_text()); state['phase'] = 'writing'
+        path.write_text(json.dumps(state)); self.gate.stop()
+        before = path.read_bytes()
+        new = await gate_module.activate_generation(policy, self.col, **paths)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(new.status()[1]['used'], 0)
+        self.assertEqual(len(self.sent), 2)
+
+    async def test_unresolved_data_blocks_generation_switch(self):
+        await self.click()
+        policy, paths = self.generation_args(); self.gate.stop()
+        self.col.rows[-1]['amount'] += 1
+        with self.assertRaisesRegex(Exception, 'write_outcome_unresolved'):
+            await gate_module.activate_generation(policy, self.col, **paths)
+        self.assertFalse(paths['registry'].exists())
+
+    async def test_stale_selected_request_refused_after_switch(self):
+        policy, paths = self.generation_args(); self.gate.stop()
+        stale = gate_module.selected_gate(**paths)
+        await gate_module.activate_generation(policy, self.col, **paths)
+        self.service.gate = stale
+        response = await self.click()
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('generation_changed', response.text)
+        self.assertEqual(self.sent, [])
+
+    async def test_shared_admission_lock_blocks_generation_switch(self):
+        import os, fcntl
+        policy, paths = self.generation_args(); self.gate.stop()
+        fd = os.open(self.gate.admission_path, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
+            with self.assertRaisesRegex(Exception, 'busy'):
+                await gate_module.activate_generation(policy, self.col, **paths)
+        finally: os.close(fd)
+        self.assertFalse(paths['registry'].exists())
+
+    async def test_incomplete_or_symlink_registry_never_falls_back(self):
+        _, paths = self.generation_args()
+        paths['registry'].symlink_to(Path(self.tmp.name)/'missing')
+        with self.assertRaises(Exception): gate_module.selected_gate(**paths)
+        paths['registry'].unlink(); paths['registry'].mkdir(mode=0o700)
+        with self.assertRaisesRegex(Exception, 'generation_incomplete'):
+            gate_module.selected_gate(**paths)
+
     async def test_original_button_reaches_provider_store_and_visible_success(self):
         response=await self.click()
         self.assertEqual(response.status_code,200,response.text)

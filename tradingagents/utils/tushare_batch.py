@@ -7,6 +7,9 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import fcntl
+import re
+import stat
 import json
 import math
 import os
@@ -18,15 +21,28 @@ from tradingagents.utils.tushare_egress import Permit, TushareEgressStopped, _pa
 from tradingagents.utils.tushare_manual import CURRENT, BJ, stock_code
 
 DIRECTORY = '/app/runtime/tushare-history-batch-v1'
+REGISTRY = '/app/runtime/tushare-history-generations'
 
 
 def sha(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
+GENERATION_REASONS = frozenset(('generation_changed','generation_incomplete',
+    'predecessor_not_stopped','predecessor_changed','write_outcome_unresolved'))
+
+
+class GenerationStopped(TushareEgressStopped):
+    def __init__(self, reason):
+        super().__init__('state_invalid')
+        if reason in GENERATION_REASONS:
+            self.reason = reason
+            RuntimeError.__init__(self, 'history_generation_stopped reason=' + reason)
+
+
 def require(value, reason='state_invalid'):
     if not value:
-        raise TushareEgressStopped(reason)
+        raise GenerationStopped(reason) if reason in GENERATION_REASONS else TushareEgressStopped(reason)
 
 
 def policy_check(p):
@@ -49,6 +65,13 @@ def policy_check(p):
 class BatchGate(Permit):
     def __init__(self,directory=DIRECTORY):
         super().__init__(directory)
+        self.admission_path = self.directory / "admission.lock"
+        self.selection = None
+
+    def assert_selected(self):
+        if self.selection is not None:
+            registry, expected = self.selection
+            require(_selection(registry) == expected, "generation_changed")
 
     def _read_file(self,fd,name):
         raw_fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd)
@@ -235,3 +258,116 @@ def provision(directory,policy):
         gate.write(fd,dict(policy_sha256=sha(policy),phase='ready',reason='none',api_code=None,
             used=0,days={},recent=[],last_time=now,plan=None,active=None))
     return gate
+
+
+def _selection(registry):
+    """Missing registry is legacy mode; malformed existing registry never falls back."""
+    registry = Path(registry)
+    try: info = registry.lstat()
+    except FileNotFoundError: return None
+    require(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+            and info.st_uid == os.geteuid() and registry.resolve() == registry, 'state_invalid')
+    try:
+        fd = os.open(registry/'active.json', os.O_RDONLY|os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise GenerationStopped('generation_incomplete') from None
+    with os.fdopen(fd, 'rb') as f:
+        _private_fd(f.fileno()); raw = f.read(8193)
+    require(len(raw) <= 8192)
+    try:
+        value = json.loads(raw, object_pairs_hook=_pairs)
+        require(set(value) == {'schema','generation','policy_sha256','retirement_sha256'})
+        require(type(value['schema']) is int and value['schema'] == 1)
+        require(all(isinstance(value[k], str) and re.fullmatch('[a-f0-9]{32}' if k == 'generation' else '[a-f0-9]{64}', value[k])
+                    for k in ('generation','policy_sha256','retirement_sha256')))
+    except (ValueError, TypeError, KeyError):
+        raise TushareEgressStopped('state_invalid') from None
+    return value
+
+
+def selected_gate(registry=REGISTRY, legacy=DIRECTORY):
+    """Read-only selection. HTTP never provisions/renews a generation."""
+    registry, legacy = Path(registry), Path(legacy)
+    selection = _selection(registry)
+    gate = BatchGate(registry/selection['generation'] if selection else legacy)
+    gate.admission_path = legacy/'admission.lock'  # shared by ALL generations
+    gate.selection = (registry, selection)
+    if selection:
+        with gate.locked() as fd:
+            policy, _ = gate.read(fd)
+        require(sha(policy) == selection['policy_sha256'], 'state_invalid')
+        receipt = gate.directory/'retirement.json'
+        try: fd = os.open(receipt, os.O_RDONLY|os.O_NOFOLLOW)
+        except OSError: raise TushareEgressStopped('state_io_failed') from None
+        with os.fdopen(fd, 'rb') as f:
+            _private_fd(f.fileno()); raw = f.read(16*1024*1024+1)
+        require(len(raw) <= 16*1024*1024 and hashlib.sha256(raw).hexdigest() == selection['retirement_sha256'])
+    return gate
+
+
+async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=DIRECTORY):
+    """Explicit operator action: STOP predecessor, reconcile it, create a NEW budget.
+
+    Never exposed by the trigger endpoint. No provider/network client is created.
+    No old files or task statuses are changed. A fresh policy needs fresh approval.
+    """
+    from deploy.history_batch_journal import Workspace
+    from deploy.history_batch_adapters import HistoricalAdapter
+    registry, legacy = Path(registry), Path(legacy)
+    policy_check(policy)
+    fd = os.open(legacy/'admission.lock', os.O_RDWR|os.O_NOFOLLOW)
+    created = None
+    try:
+        _private_fd(fd)
+        try: fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise TushareEgressStopped('busy') from None
+        previous = selected_gate(registry, legacy)
+        previous.assert_selected()
+        with previous.locked() as gate_fd:
+            require(previous.stopped(gate_fd), 'predecessor_not_stopped')
+            _, state = previous.read(gate_fd)
+        require(state['active'] is None and state['phase'] == 'ready', 'previous_attempt_incomplete')
+        plan = state['plan']
+        if plan is not None:
+            workspace = Workspace(previous.directory/'runs')
+            adapter = HistoricalAdapter(collection, None, None, None, None)
+            with workspace.locked():
+                _, _, states = workspace._load(plan['plan_sha256'])
+                for item in plan['items']:
+                    saved = states[item['code']]
+                    require(saved['phase'] in ('committed','writing','fetched') and saved['payload'] is not None,
+                            'previous_attempt_incomplete')
+                    require(await adapter.matches(item, saved['payload']), 'write_outcome_unresolved')
+        old_hashes = {str(p.relative_to(previous.directory)):hashlib.sha256(p.read_bytes()).hexdigest()
+                      for p in previous.directory.rglob('*') if p.is_file()}
+        receipt = dict(previous_directory=str(previous.directory), previous_selection=previous.selection[1],
+                       plan_sha256=plan['plan_sha256'] if plan else None,
+                       all_saved_data_matched=True, previous_hashes=old_hashes)
+        # Registry is created only by this explicit action. Interrupted creation
+        # leaves a closed/incomplete registry; never fall back to an old permit.
+        registry.mkdir(mode=0o700, exist_ok=True)
+        identity = uuid4().hex
+        created = BatchGate(registry/identity)
+        gate = provision(created.directory, policy)
+        Workspace(gate.directory/'runs').provision()
+        raw = json.dumps(receipt, sort_keys=True, allow_nan=False).encode()
+        out = os.open(gate.directory/'retirement.json', os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)
+        with os.fdopen(out,'wb') as f: f.write(raw); f.flush(); os.fsync(f.fileno())
+        directory_fd = os.open(gate.directory, os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(directory_fd)
+        finally: os.close(directory_fd)
+        require(old_hashes == {str(p.relative_to(previous.directory)):hashlib.sha256(p.read_bytes()).hexdigest()
+                              for p in previous.directory.rglob('*') if p.is_file()}, 'predecessor_changed')
+        value = dict(schema=1, generation=identity, policy_sha256=sha(policy), retirement_sha256=hashlib.sha256(raw).hexdigest())
+        out = os.open(registry/'active.next', os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)
+        with os.fdopen(out,'w') as f: json.dump(value,f,sort_keys=True); f.flush(); os.fsync(f.fileno())
+        os.replace(registry/'active.next', registry/'active.json')
+        parent = os.open(registry, os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(parent)
+        finally: os.close(parent)
+        return selected_gate(registry, legacy)
+    except BaseException:
+        if created is not None and created.directory.is_dir(): created.stop()
+        raise
+    finally:
+        os.close(fd)

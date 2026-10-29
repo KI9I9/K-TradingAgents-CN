@@ -25,6 +25,10 @@ ARCHIVE_REMOTE = '/home/ubuntu/history-button-9577c7416b17.tgz'
 ARTIFACT_PREFIX = 'history-button'
 
 
+def controller_source():
+    return (REPO / 'deploy' / CONTROLLER).read_text()
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -176,7 +180,7 @@ def main():
     elif args.action in ['check', 'execute']:
         if args.credentials_file is None:
             parser.error('credentials file required')
-        controller = (REPO / 'deploy' / CONTROLLER).read_text()
+        controller = controller_source()
         request = {'code': controller, 'code_sha256': digest(controller.encode()),
                    'payload': payload(args.action == 'check', args.credentials_file)}
         auth = request['payload'].pop('auth')

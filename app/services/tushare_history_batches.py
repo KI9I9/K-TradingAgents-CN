@@ -9,7 +9,7 @@ import fcntl
 import os
 
 from fastapi import HTTPException
-from tradingagents.utils.tushare_batch import BatchGate, DIRECTORY
+from tradingagents.utils.tushare_batch import BatchGate, DIRECTORY, selected_gate
 from tradingagents.utils.tushare_egress import TushareEgressStopped, _private_fd
 from deploy.history_batch_journal import Workspace, BatchStopped
 from deploy.history_batch_adapters import Inventory, HistoricalAdapter
@@ -28,6 +28,8 @@ def message(reason):
         'budget_exhausted':'本次或今日请求预算已用完；已完成的数据保留，未自动增加额度。',
         'usage_limit':'上游报告调用限额，已停止后续请求。',
         'insufficient_points':'上游积分不足，已停止后续请求。',
+        'generation_changed':'授权已切换，请重新提交普通执行。',
+        'generation_incomplete':'授权切换未完成，已停止执行，请运维核查。',
         'busy':'历史同步正在运行，请查看任务进度。',
         'request_outcome_unknown':'上次请求结果不确定，已停止自动重试，请核查执行记录。',
         'write_outcome_unresolved':'上次写入结果未完全匹配，已保留现场，不会重复写入。',
@@ -47,10 +49,11 @@ class HistoryBatchService:
             raise HTTPException(400,'历史同步不支持强制绕过并发或授权检查，请使用普通执行。')
         fd=None
         try:
-            fd=os.open(self.gate.directory/'admission.lock',os.O_RDWR|os.O_NOFOLLOW)
+            fd=os.open(self.gate.admission_path,os.O_RDWR|os.O_NOFOLLOW)
             _private_fd(fd)
             try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:raise TushareEgressStopped('busy') from None
+            self.gate.assert_selected()
             policy,state=self.gate.status()
             plan=state['plan']
             now=self.clock().astimezone(BJ)
@@ -163,8 +166,9 @@ class HistoryBatchService:
 
 
 async def submit_history_batch(*,force=False,incremental=True):
-    gate=BatchGate()
-    try:gate.status()  # refuse BEFORE opening database/provider on unconfigured hosts
+    try:
+        gate=selected_gate()
+        gate.status()  # refuse BEFORE opening database/provider on unconfigured hosts
     except TushareEgressStopped as error:raise HTTPException(400,message(error.reason)) from None
     from app.core.database import get_mongo_db
     from app.services.historical_data_service import HistoricalDataService
