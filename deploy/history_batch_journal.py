@@ -103,7 +103,7 @@ def validate_plan(plan):
         copy = deepcopy(plan)
         expected = copy.pop('plan_sha256')
         _require(_hash(expected) and digest(copy) == expected, 'plan_hash_mismatch')
-        _require(plan['schema'] == 1 and plan['mode'] == 'incremental_daily_qfq'
+        _require(plan['schema'] == 1 and plan['mode'] in ('incremental_daily_qfq', 'year_daily_qfq')
                  and plan['execution_authorized'] is False and plan['full_market_ready'] is False,
                  'unsupported_plan')
         items, pool = plan['items'], plan['pool']
@@ -119,7 +119,7 @@ def validate_plan(plan):
                      and item['status'] == 'candidate' and item['reason'] is None
                      and item['request_cost'] == 2 and _hash(item['observation_sha256'])
                      and item['end'] == plan['end']
-                     and 0 <= (date.fromisoformat(item['end'])-date.fromisoformat(item['start'])).days < 30,
+                     and 0 <= (date.fromisoformat(item['end'])-date.fromisoformat(item['start'])).days < plan.get('max_window_days', 30) <= 366,
                      'invalid_plan_item')
         return expected
     except (KeyError, ValueError, TypeError, AttributeError):

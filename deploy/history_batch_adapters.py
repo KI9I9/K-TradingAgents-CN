@@ -76,7 +76,7 @@ class Inventory:
 
 
 def freeze_frame(frame):
-    if not isinstance(frame, pd.DataFrame) or frame.empty or len(frame) > 30 or not frame.columns.is_unique:
+    if not isinstance(frame, pd.DataFrame) or frame.empty or len(frame) > 366 or not frame.columns.is_unique:
         raise BatchStopped('invalid_frame')
     columns = list(frame.columns)
     if any(not isinstance(c, str) for c in columns):
@@ -175,7 +175,7 @@ class HistoricalAdapter:
                     or meta['price_adjustment'] != 'qfq' or meta['endpoint'] != 'pro_bar'):
                 return False
             documents = tushare_documents(item['code'][:6], frame, 'CN', 'daily')
-            if not 1 <= len(documents) <= 30 or documents != payload['documents']:
+            if not 1 <= len(documents) <= 366 or documents != payload['documents']:
                 return False
             baseline = json_util.loads(payload['baseline'])
             if not isinstance(baseline, list):

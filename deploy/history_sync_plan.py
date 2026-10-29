@@ -2,8 +2,9 @@
 
 Input observations must be produced by a separate read-only inventory. Their hash
 binds a plan to that input; it does not authenticate it or authorize execution.
-Current transport supports <=30 calendar days per stock. Larger windows are
-reported, never silently truncated or split across different qfq anchors.
+Default manual planning remains capped at 30 days. An explicit batch policy
+may select up to 366 days; windows are never silently truncated or split across
+different qfq anchors.
 """
 from datetime import date, datetime, timedelta, timezone
 import hashlib
@@ -65,7 +66,7 @@ def _observation(value):
     return value
 
 
-def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None):
+def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None, max_window_days=30, incremental=True):
     """Freeze a candidate pool and same-source cursors; never grant permission.
 
     quota describes an aggregate shared budget for daily + adj_factor, not a
@@ -74,6 +75,8 @@ def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None):
     """
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise PlanError('aware_clock_required')
+    if type(max_window_days) is not int or not 1 <= max_window_days <= 366 or type(incremental) is not bool:
+        raise PlanError('invalid_window_policy')
     today = now.astimezone(CN)
     end_day = _day(end)
     if end_day > today.date() or (end_day == today.date() and today.hour < 18):
@@ -91,12 +94,12 @@ def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None):
     for code in codes:
         row = observations[code]
         reason = None
-        first = _day(row['latest']) if row['count'] else start
+        first = _day(row['latest']) if row['count'] and incremental else start
         if row['count'] and not row['contract_verified']:
             reason = 'legacy_contract_unproven'
         elif first > end_day:
             reason = 'cursor_after_requested_end'
-        elif (end_day-first).days >= 30:
+        elif (end_day-first).days >= max_window_days:
             reason = 'window_exceeds_current_transport'
         items.append(dict(code=code, start=first.isoformat(), end=end,
                           observation_sha256=fingerprint(row),
@@ -115,7 +118,8 @@ def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None):
         capacity = quota['daily_requests']//2
         budget = dict(**quota, candidate_stocks_per_day=capacity,
                       candidate_budget_days_lower_bound=math.ceil(candidate_count/capacity))
-    plan = dict(schema=1, mode='incremental_daily_qfq', execution_authorized=False,
+    plan = dict(schema=1, mode='incremental_daily_qfq' if incremental else 'year_daily_qfq',
+                max_window_days=max_window_days, execution_authorized=False,
                 end=end, bootstrap_start=start.isoformat(),
                 inventory_sha256=fingerprint(observations), pool=codes, items=items,
                 candidate_count=candidate_count, blocked_count=blocked,

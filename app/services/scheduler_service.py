@@ -362,6 +362,12 @@ class SchedulerService:
             HTTPException: 如果有running记录且force=False，抛出409状态码，提示用户是否强制执行
         """
         from fastapi import HTTPException
+        if job_id == "tushare_historical_sync":
+            from app.services.tushare_history_batches import submit_history_batch
+            options = kwargs or {}
+            if set(options) - {"incremental"}:
+                raise HTTPException(400, "历史批次不接受旧位置恢复参数；请通过普通执行继续冻结计划。")
+            return await submit_history_batch(force=force, incremental=options.get("incremental", True))
         from app.services.tushare_manual_sync import reject_scheduled_job
         reject_scheduled_job(job_id)
         # 🔥 手动触发时，添加标记，允许任务函数跳过并发检查

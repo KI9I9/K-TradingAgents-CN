@@ -23,6 +23,11 @@ REPLACEMENTS = {
         "app/worker/akshare_sync_service.py"),
 }
 BIND_ADDITIONS = (
+    "app/services/tushare_history_batches.py",
+    "tradingagents/utils/tushare_batch.py",
+    "deploy/history_batch_adapters.py",
+    "deploy/history_batch_journal.py",
+    "deploy/history_sync_plan.py",
     "app/services/tushare_manual_sync.py",
     "app/services/scheduler_service.py",
     "app/routers/scheduler.py",
@@ -159,7 +164,7 @@ def build_bundle(repo, destination):
                         mode="replace" if path in REPLACEMENTS else "bind")
             if path in REPLACEMENTS:
                 item["host_source"] = REPLACEMENTS[path]
-            if path not in ("app/services/quote_contract.py", "app/services/historical_contract.py"):
+            if git(repo, "ls-tree", "--name-only", BASELINE, "--", path).strip():
                 item["baseline_sha256"] = sha256(git(repo, "show", f"{BASELINE}:{path}"))
         else:
             item["mode"] = "tool"

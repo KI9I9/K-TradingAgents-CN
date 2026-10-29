@@ -118,6 +118,10 @@ class Ingress(unittest.IsolatedAsyncioTestCase):
 
     async def test_scheduler_force_and_normal_reject_before_side_effects(self):
         fn=extract('app/services/scheduler_service.py','trigger_job')
+        batch=types.ModuleType('app.services.tushare_history_batches')
+        batch.submit_history_batch=AsyncMock(side_effect=HTTPException(400,'unconfigured policy'))
+        self.patcher2=patch.dict(sys.modules,{'app.services.tushare_history_batches':batch})
+        self.patcher2.start();self.addCleanup(self.patcher2.stop)
         for force in (False,True):
             service=Mock();kwargs={}
             with self.assertRaises(HTTPException) as error:await fn(service,'tushare_historical_sync',kwargs,force)
