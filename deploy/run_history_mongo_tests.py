@@ -19,7 +19,7 @@ from pymongo import MongoClient
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image',default='mongo:7.0')
-    parser.add_argument('--test', choices=['test_mongo_history.py', 'test_mongo_history_write.py'], default='test_mongo_history.py')
+    parser.add_argument('--test', choices=['test_mongo_history.py', 'test_mongo_history_write.py', 'test_mongo_history_batch.py'], default='test_mongo_history.py')
     args=parser.parse_args()
     docker=['sudo','-n','docker']
     name='ta-history-test-'+uuid.uuid4().hex[:12]

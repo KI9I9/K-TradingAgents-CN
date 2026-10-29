@@ -7,6 +7,8 @@ not to a plan or this journal. Never reset uncertain requests or writes.
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date
+import asyncio
+import inspect
 import fcntl
 import hashlib
 import json
@@ -230,15 +232,28 @@ class Workspace:
                         complete=counts['committed'] == len(states))
 
     def advance(self, identity, adapter, *, max_items):
+        """Synchronous convenience entry; async applications use advance_async."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.advance_async(identity, adapter, max_items=max_items))
+        raise BatchStopped('use_advance_async')
+
+    async def advance_async(self, identity, adapter, *, max_items):
         """Run a bounded slice with explicit authority and side-effect adapters.
 
-        Adapter methods are synchronous. authorize must return exactly True for
+        Adapter methods may be synchronous or async; all stay on the caller loop.
+        authorize must return exactly True for
         each action (checks only, no budget reservation); fetch MUST independently journal and limit each HTTP request.
         validate must check full historical provenance/units/identity, preflight
         returns the current inventory observation hash, and matches must compare
         persisted business contents to the frozen payload (not merely row count).
         No production adapter is provided by this module.
         """
+        async def call(method, *args):
+            result = method(*args)
+            return await result if inspect.isawaitable(result) else result
+
         _require(type(max_items) is int and 1 <= max_items <= 10000, 'invalid_slice')
         with self.locked():
             folder, plan, states = self._load(identity)
@@ -255,43 +270,43 @@ class Workspace:
                     break
                 path = folder/(item['code']+'.json')
 
-                def allowed(action):
+                async def allowed(action):
                     self._not_stopped()
-                    _require(adapter.authorize(identity, deepcopy(item), action) is True, 'not_authorized')
+                    _require(await call(adapter.authorize, identity, deepcopy(item), action) is True, 'not_authorized')
 
-                def validate():
-                    _require(adapter.validate(deepcopy(item), deepcopy(state['payload'])) is True,
+                async def validate():
+                    _require(await call(adapter.validate, deepcopy(item), deepcopy(state['payload'])) is True,
                              'payload_rejected')
 
                 if state['phase'] == 'writing':
-                    allowed('reconcile')
-                    validate()
-                    _require(adapter.matches(deepcopy(item), deepcopy(state['payload'])) is True,
+                    await allowed('reconcile')
+                    await validate()
+                    _require(await call(adapter.matches, deepcopy(item), deepcopy(state['payload'])) is True,
                              'write_outcome_unresolved')
                 else:
                     if state['phase'] == 'pending':
-                        allowed('fetch')
-                        _require(adapter.preflight(deepcopy(item)) == item['observation_sha256'],
+                        await allowed('fetch')
+                        _require(await call(adapter.preflight, deepcopy(item)) == item['observation_sha256'],
                                  'inventory_changed')
                         state.update(phase='fetching', fetch_attempts=1)
                         _atomic(path, state)  # durable BEFORE external request
-                        allowed('fetch')  # recheck after preflight and durable marker
-                        payload = adapter.fetch(deepcopy(item))
+                        await allowed('fetch')  # recheck after preflight and durable marker
+                        payload = await call(adapter.fetch, deepcopy(item))
                         _require(isinstance(payload, dict) and payload, 'invalid_payload')
                         state['payload'] = deepcopy(payload)
-                        validate()
+                        await validate()
                         state.update(phase='fetched', payload_sha256=digest(state['payload']))
                         _atomic(path, state)  # response + phase in one atomic record
-                    allowed('write')
-                    validate()
-                    _require(adapter.preflight(deepcopy(item)) == item['observation_sha256'],
+                    await allowed('write')
+                    await validate()
+                    _require(await call(adapter.preflight, deepcopy(item)) == item['observation_sha256'],
                              'inventory_changed')
                     state['phase'] = 'writing'
                     _atomic(path, state)  # durable BEFORE any database side effect
-                    allowed('write')  # stop/expiry may change during preflight
-                    adapter.write(deepcopy(item), deepcopy(state['payload']))
-                    allowed('reconcile')
-                    _require(adapter.matches(deepcopy(item), deepcopy(state['payload'])) is True,
+                    await allowed('write')  # stop/expiry may change during preflight
+                    await call(adapter.write, deepcopy(item), deepcopy(state['payload']))
+                    await allowed('reconcile')
+                    _require(await call(adapter.matches, deepcopy(item), deepcopy(state['payload'])) is True,
                              'write_outcome_unresolved')
                 state['phase'] = 'committed'
                 _atomic(path, state)
