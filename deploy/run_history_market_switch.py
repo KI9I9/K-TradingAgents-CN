@@ -16,6 +16,7 @@ for name in ('STAGE','LAUNCH','STATUS'):
 def controller():
     s=prior.controller().replace('history-generations-v1-20261029','history-market-v1-20261029').replace('compose.history-generations.json','compose.history-market.json').replace('deployed_generations_no_new_grant','deployed_market_gate_stopped')
     s=s.replace("from pathlib import Path; print(Path('/app/runtime/tushare-history-generations').exists())", "from tradingagents.utils.tushare_batch import selected_gate; g=selected_gate(); print(not (g.directory/'STOP').is_file())")
+    s=s.replace(").strip() == 'False', 'unexpected_new_grant'", " ).splitlines()[-1] == 'False', 'unexpected_new_grant'")
     return s
 
 
