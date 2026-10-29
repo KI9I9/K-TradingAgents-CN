@@ -215,6 +215,42 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.col.rows), 2)
         self.assertEqual(self.col.rows[0], self.baseline[0])
 
+    async def test_saved_recovery_never_fetches_and_preserves_original_journal(self):
+        from deploy.recover_saved_history import recover
+        payload = await self.payload()
+        before = {str(p): p.read_bytes() for p in Path(self.tmp.name).rglob('*') if p.is_file()}
+        self.adapter.fetch = AsyncMock(side_effect=AssertionError('no fetch'))
+        reserve = AsyncMock()
+        await recover(self.adapter, self.item, payload, reserve)
+        reserve.assert_awaited_once()
+        self.adapter.fetch.assert_not_called()
+        self.assertEqual(len(self.col.rows), 2)
+        self.assertEqual(before, {str(p): p.read_bytes() for p in Path(self.tmp.name).rglob('*') if p.is_file()})
+
+    async def test_saved_recovery_drift_never_reserves_or_writes(self):
+        from deploy.recover_saved_history import recover
+        payload = await self.payload()
+        self.col.rows[0]['updated_at'] = datetime(2000, 1, 1)
+        reserve = AsyncMock()
+        self.adapter.write = AsyncMock()
+        with self.assertRaisesRegex(RuntimeError, 'inventory_changed'):
+            await recover(self.adapter, self.item, payload, reserve)
+        reserve.assert_not_called()
+        self.adapter.write.assert_not_called()
+
+    async def test_saved_recovery_uncertain_write_never_retries(self):
+        from deploy.recover_saved_history import recover
+        payload = await self.payload()
+        original = self.adapter.write
+        async def uncertain(*args):
+            await original(*args)
+            raise RuntimeError('reply_lost')
+        self.adapter.write = AsyncMock(side_effect=uncertain)
+        with self.assertRaisesRegex(RuntimeError, 'reply_lost'):
+            await recover(self.adapter, self.item, payload, AsyncMock())
+        self.adapter.write.assert_awaited_once()
+        self.assertEqual(len(self.col.rows), 2)
+
     async def test_service_database_mismatch_refused_before_write(self):
         payload=await self.payload()
         other=ReadCollection();other.rows=deepcopy(self.baseline)

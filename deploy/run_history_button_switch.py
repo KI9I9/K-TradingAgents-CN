@@ -20,6 +20,11 @@ RELEASE = Path('/home/ubuntu/quote-guard-releases/history-button-v1-20261029')
 ARCHIVE_SHA = '9577c7416b172be84b53a05c0a9adcf73a62e9fdbe54e22ce3338ee19205f6d2'
 
 
+CONTROLLER = 'switch_history_button.py'
+ARCHIVE_REMOTE = '/home/ubuntu/history-button-9577c7416b17.tgz'
+ARTIFACT_PREFIX = 'history-button'
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -166,12 +171,12 @@ def main():
         raw = RELEASE.with_suffix('.tgz').read_bytes()
         if digest(raw) != ARCHIVE_SHA:
             raise SystemExit('local_archive_changed')
-        upload(RELEASE.with_suffix('.tgz'), '/home/ubuntu/history-button-9577c7416b17.tgz')
+        upload(RELEASE.with_suffix('.tgz'), ARCHIVE_REMOTE)
         code, data = STAGE, {'archive_sha256': ARCHIVE_SHA}
     elif args.action in ['check', 'execute']:
         if args.credentials_file is None:
             parser.error('credentials file required')
-        controller = (REPO / 'deploy/switch_history_button.py').read_text()
+        controller = (REPO / 'deploy' / CONTROLLER).read_text()
         request = {'code': controller, 'code_sha256': digest(controller.encode()),
                    'payload': payload(args.action == 'check', args.credentials_file)}
         auth = request['payload'].pop('auth')
@@ -217,7 +222,7 @@ print(json.dumps(out))
         return 1
     report = json.loads(result.stdout)
     if args.action == 'collect':
-        target = EVIDENCE / ('history-button-production-' + report['process']['attempt'] + '.json')
+        target = EVIDENCE / (ARTIFACT_PREFIX + '-production-' + report['process']['attempt'] + '.json')
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as stream:
             json.dump(report, stream, indent=2)
@@ -226,7 +231,7 @@ print(json.dumps(out))
         return 0
     print(json.dumps(report, ensure_ascii=False))
     if args.action in ['check', 'execute']:
-        target = EVIDENCE / ('history-button-switch-' + report['attempt'] + '.json')
+        target = EVIDENCE / (ARTIFACT_PREFIX + '-switch-' + report['attempt'] + '.json')
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w') as stream:
             json.dump(report, stream, indent=2)
