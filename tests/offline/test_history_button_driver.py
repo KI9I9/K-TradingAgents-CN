@@ -24,7 +24,7 @@ class DriverTest(unittest.TestCase):
                     self.assertEqual(json.loads(kwargs['input'])['auth']['password'],'test-secret')
                     if isinstance(outcome,Exception):raise outcome
                     return outcome
-                return subprocess.CompletedProcess(args,0,'True\n','')
+                return subprocess.CompletedProcess(args,0,'import log\nTrue\n','')
             code=runner.DRIVER.replace(runner.ROOT,folder)
             with patch('sys.stdin',io.StringIO(json.dumps({'auth':{'username':'test','password':'test-secret'}}))), patch('subprocess.run',run):
                 exec(compile(code,'<detached-controller>','exec'),{})
@@ -35,11 +35,11 @@ class DriverTest(unittest.TestCase):
             return json.loads((root/'status.json').read_text())
 
     def test_success_stops(self):
-        out=self.exercise(subprocess.CompletedProcess([],0,json.dumps({'status':'passed','new_gate_stopped':True,'used_requests':2}),''))
+        out=self.exercise(subprocess.CompletedProcess([],0,'import log\nBUTTON_ACCEPTANCE_JSON:'+json.dumps({'status':'passed','new_gate_stopped':True,'used_requests':2}),''))
         self.assertEqual(out['stage'],'complete')
 
     def test_rejected_trigger_stops_without_retry(self):
-        out=self.exercise(subprocess.CompletedProcess([],1,json.dumps({'status':'failed','reason':'original_button_rejected'}),''))
+        out=self.exercise(subprocess.CompletedProcess([],1,'import log\nBUTTON_ACCEPTANCE_JSON:'+json.dumps({'status':'failed','reason':'original_button_rejected'}),''))
         self.assertEqual(out['stage'],'failed')
 
     def test_unknown_outcome_stops_without_retry(self):

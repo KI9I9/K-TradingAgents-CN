@@ -212,7 +212,7 @@ def main(request):
             except BaseException: report['new_gate_stopped']=False
         if client is not None:client.close()
         if reserved:save('result.json',report)
-        print(json.dumps(report,default=str))
+        print('BUTTON_ACCEPTANCE_JSON:'+json.dumps(report,default=str))
     return 0 if report['status']=='passed' else 1
 
 

@@ -112,6 +112,21 @@ def thaw_frame(value):
     return frame
 
 
+def same_collection(left, right):
+    """Compare resolved Mongo targets, not ephemeral loop-safe proxy identity.
+
+    Motor and the application's collection proxy expose a PyMongo delegate.
+    Require the very same client as well as PyMongo collection equality; client
+    equality alone may accept distinct clients using the same server address.
+    """
+    if left is right:
+        return True
+    from pymongo.collection import Collection
+    a, b = getattr(left, 'delegate', None), getattr(right, 'delegate', None)
+    return (isinstance(a, Collection) and isinstance(b, Collection)
+            and a.database.client is b.database.client and a == b)
+
+
 class HistoricalAdapter:
     """Connects the durable core to real async provider and historical methods.
 
@@ -202,7 +217,7 @@ class HistoricalAdapter:
         # The legacy service resolves its DB through the application getter. Verify
         # that it targets the same collection as inventory BEFORE permitting writes.
         target_rows = await self.service.validate_tushare_series(item['code'][:6], 'daily', 'CN', 'qfq')
-        if self.service.db.stock_daily_quotes != self.inventory.collection:
+        if not same_collection(self.service.db.stock_daily_quotes, self.inventory.collection):
             raise BatchStopped('service_collection_mismatch')
         if raw_hash(target_rows) != raw_hash(json_util.loads(payload['baseline'])):
             raise BatchStopped('write_inventory_changed')

@@ -29,7 +29,10 @@ try:
     result=subprocess.run(['docker','exec','-i','ta-live-088a60b962bf-backend-1','python3','-B','-c',p['code']],
         input=json.dumps(p['request']),capture_output=True,text=True,timeout=260)
     if result.stderr:(root/'stderr.private').write_text(result.stderr)
-    report=json.loads(result.stdout)
+    (root/'stdout.private').write_text(result.stdout)
+    reports=[line.removeprefix('BUTTON_ACCEPTANCE_JSON:') for line in result.stdout.splitlines() if line.startswith('BUTTON_ACCEPTANCE_JSON:')]
+    if len(reports)!=1:raise RuntimeError('missing_or_duplicate_result')
+    report=json.loads(reports[0])
     save('result.json',report)
     save('status.json',{'stage':'complete' if result.returncode==0 and report.get('status')=='passed' else 'failed',
         'exit_code':result.returncode,'reason':report.get('reason'),'new_gate_stopped':report.get('new_gate_stopped'),
@@ -41,7 +44,7 @@ finally:
     code="from pathlib import Path; from tradingagents.utils.tushare_batch import BatchGate; p=Path('/app/runtime/tushare-history-batch-v1'); BatchGate(p).stop() if p.is_dir() else None; print(p.is_dir() and (p/'STOP').is_file())"
     try:
         r=subprocess.run(['docker','exec','ta-live-088a60b962bf-backend-1','python3','-B','-c',code],capture_output=True,text=True,timeout=15)
-        save('stop-confirmation.json',{'stopped':r.returncode==0 and r.stdout.strip()=='True'})
+        save('stop-confirmation.json',{'stopped':r.returncode==0 and r.stdout.splitlines()[-1:]==['True']})
     except BaseException:save('stop-confirmation.json',{'stopped':False})
 '''
 

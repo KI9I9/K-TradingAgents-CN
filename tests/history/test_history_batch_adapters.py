@@ -188,6 +188,33 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.write(self.item,payload)
         self.assertEqual(self.col.rows,self.baseline)
 
+    async def test_write_through_fresh_actual_loop_safe_collection_proxies(self):
+        import ast
+        from typing import Callable
+        from motor.motor_asyncio import AsyncIOMotorCollection
+        from pymongo import MongoClient
+        tree = ast.parse((ROOT/'app/core/database.py').read_text())
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+                   and n.name == '_LoopSafeMongoCollectionProxy')
+        ns = dict(Callable=Callable, AsyncIOMotorCollection=AsyncIOMotorCollection)
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), '<actual-proxy>', 'exec'), ns)
+        proxy = ns['_LoopSafeMongoCollectionProxy']
+        # No server: real delegate identity, synthetic storage operations.
+        client = MongoClient('mongodb://127.0.0.1:1', connect=False)
+        self.addCleanup(client.close)
+        self.col.delegate = client.synthetic.stock_daily_quotes
+        underlying = self.col
+        class FreshDatabase:
+            @property
+            def stock_daily_quotes(self):
+                return proxy(lambda: underlying)
+        self.db = FreshDatabase()
+        self.adapter.inventory.collection = self.db.stock_daily_quotes
+        self.assertIsNot(self.db.stock_daily_quotes, self.db.stock_daily_quotes)
+        self.assertTrue((await self.advance())['complete'])
+        self.assertEqual(len(self.col.rows), 2)
+        self.assertEqual(self.col.rows[0], self.baseline[0])
+
     async def test_service_database_mismatch_refused_before_write(self):
         payload=await self.payload()
         other=ReadCollection();other.rows=deepcopy(self.baseline)
