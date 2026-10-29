@@ -25,11 +25,11 @@ base.DRIVER=base.DRIVER[:start]+'    if not verified:\n'+''.join('    '+line+'\n
 def package():
     root=Path(__file__).resolve().parents[1]
     manifest=json.loads((base.RELEASE/'manifest.json').read_text())
-    inventory=json.loads((base.EVIDENCE/'history-market-pool-reviewed-20261029.json').read_text())
+    inventory=json.loads((base.EVIDENCE/'history-market-pool-reviewed-20261030.json').read_text())
     hashes=json.loads((base.EVIDENCE/'history-generations-production-20261029T090044Z-9df7b36a.json').read_text())['evidence']['installed-module-hashes.json']
     hashes.update({f['target']:f['sha256'] for f in manifest['files']})
     now=datetime.now(timezone(timedelta(hours=8)))
-    if now.date().isoformat()!='2026-10-29':raise ValueError('review opening date before execution')
+    if now.date().isoformat()!='2026-10-30':raise ValueError('review opening date before execution')
     return dict(source_head=manifest['source_head'],archive_sha256=base.ARCHIVE_SHA,driver=base.DRIVER,
         code=(root/'deploy/history_market_opening.py').read_text(),request=dict(source_hashes=hashes,
             codes=inventory['pool'],history_sha256=inventory['history_sha256'],previous_directory=inventory['gate']['directory'],
