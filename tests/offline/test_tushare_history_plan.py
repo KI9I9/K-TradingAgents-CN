@@ -26,6 +26,11 @@ class HistoryPlanTests(unittest.TestCase):
         values.update(kwargs)
         return p.build_plan(**values)
 
+    def test_302_chinext_code_is_included_with_correct_exchange(self):
+        self.assertEqual(p._code('302132'),'302132.SZ')
+        self.assertEqual(p._code('302132.SZ'),'302132.SZ')
+        with self.assertRaises(p.PlanError):p._code('302132.SH')
+
     def test_cursor_overlap_preserved(self):
         result = self.plan()
         self.assertEqual(result['items'][0]['start'], '2026-10-27')
