@@ -26,8 +26,11 @@ old.pop('config');old['config_hashes']=dict(before=sha(before),after=sha(after))
 print(json.dumps(old))
 '''
 if __name__=='__main__':
-    report=ssh(REMOTE,dict(baseline=json.loads((EVIDENCE/'sync-fix-preflight-initial.json').read_text()),
+    baseline=json.loads((EVIDENCE/'sync-fix-preflight-initial.json').read_text())
+    tree=baseline.pop('generation_tree')
+    report=ssh(REMOTE,dict(baseline=baseline,
         override=json.loads((RELEASE/'compose.sync-fix.json').read_text()),verify=(ROOT/'deploy/verify_compose_merge.py').read_text()))
+    report['generation_tree']=tree
     fd=os.open(EVIDENCE/'sync-fix-preflight.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'w') as f:json.dump(report,f)
     print(json.dumps(dict(config_hashes=report['config_hashes'],verified=True)))
