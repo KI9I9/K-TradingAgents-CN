@@ -14,7 +14,11 @@ for name in ('STAGE','LAUNCH','STATUS'):
 
 
 def controller():
-    return prior.controller().replace('history-market-v1-20261029','history-basic-v1-20261030').replace('compose.history-market.json','compose.history-basic.json').replace('deployed_market_gate_stopped','deployed_basic_gate_stopped')
+    source = prior.controller().replace('history-market-v1-20261029','history-basic-v1-20261030').replace('compose.history-market.json','compose.history-basic.json').replace('deployed_market_gate_stopped','deployed_basic_gate_stopped')
+    marker = "    require(json.loads(in_backend(code)) == PAYLOAD['protected_files'], 'protected_permit_changed')"
+    probe = "import pathlib,hashlib,json; root=pathlib.Path('/app/runtime/tushare-history-generations'); values={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file()}; print(hashlib.sha256(json.dumps(values,sort_keys=True,separators=(',',':')).encode()).hexdigest())"
+    assert marker in source
+    return source.replace(marker, marker + '\n    require(in_backend(' + repr(probe) + ").strip() == PAYLOAD['generation_tree_sha256'], 'generation_tree_changed')")
 
 
 def payload(check_only,credentials):
@@ -22,7 +26,8 @@ def payload(check_only,credentials):
     fresh=json.loads((base.EVIDENCE/'history-basic-preflight.json').read_text())
     deployed=json.loads((base.EVIDENCE/'history-market-production-20261029T161721Z-4948fa8d.json').read_text())
     p.update(expected_chain=fresh['chain'],config_hashes=fresh['config_hashes'],image_id=fresh['image_id'],old_sources=fresh['old_sources'],old_modules=deployed['evidence']['installed-module-hashes.json'])
-    p['protected_files'].update(fresh['batch_protected'])
+    import hashlib
+    p['generation_tree_sha256']=hashlib.sha256(json.dumps(fresh['batch_protected'],sort_keys=True,separators=(',',':')).encode()).hexdigest()
     p['ingress_api_probe']=p['ingress_api_probe'].replace('[disabled]','[usage_limit]')
     return p
 
