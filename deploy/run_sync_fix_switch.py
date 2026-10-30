@@ -20,18 +20,21 @@ base.STAGE = base.STAGE.replace("    tmp.rename(stage)", "    for p in (tmp/'fro
 def controller():
     source = prior.controller().replace('history-basic-v1-20261030','sync-fix-v1-20261030').replace('compose.history-basic.json','compose.sync-fix.json').replace('deployed_basic_gate_stopped','deployed_sync_fix_gate_stopped')
     marker = '    allowed = {}\n'
-    addition = '''    front = next(v for v in normalized['services']['frontend']['volumes'] if v['target']=='/usr/share/nginx/html')
+    addition = """    current_frontend = json.loads(run(PAYLOAD['frontend_chain'] + ['config','--format','json']))
+    normalized['services']['frontend'] = current_frontend['services']['frontend']
+    front = next(v for v in normalized['services']['frontend']['volumes'] if v['target']=='/usr/share/nginx/html')
     require(front['source']==PAYLOAD['old_frontend_source'] and front.get('read_only') is True, 'frontend_source_changed')
     front['source']=str(STAGED/'frontend-dist')
-'''
+"""
     assert marker in source
     source = source.replace(marker,addition+marker)
-    source = source.replace("'--pull', 'never', 'backend'], timeout=150)","'--pull', 'never', 'backend', 'frontend'], timeout=150)")
+    source = source.replace("'--pull', 'never', 'backend'], timeout=150)", "'--pull', 'never', 'backend'], timeout=150)\n    run((chain(True) if new else PAYLOAD['frontend_chain']) + ['up','-d','--no-deps','--force-recreate','--pull','never','frontend'], timeout=150)")
     marker = "    require(len(current['Mounts']) == 39, 'mount_count_mismatch')"
     source = source.replace(marker,marker+'''
     front = inspect('frontend')
-    image = json.loads(run(['docker','image','inspect',cfg['services']['frontend']['image']]))
-    require(not VERIFY.compare_running('frontend',front,image,cfg), 'frontend_runtime_mismatch')
+    front_cfg = cfg if new else json.loads(run(PAYLOAD['frontend_chain'] + ['config','--format','json']))
+    image = json.loads(run(['docker','image','inspect',front_cfg['services']['frontend']['image']]))
+    require(not VERIFY.compare_running('frontend',front,image,front_cfg), 'frontend_runtime_mismatch')
 ''')
     source = source.replace("require(after_frontend['index'] == before_frontend['index'], 'frontend_index_changed')", "require(after_frontend['index']['sha256'] == PAYLOAD['frontend_index_sha256'], 'frontend_index_mismatch')")
     # Static files remain recoverable at their untouched old source.
@@ -43,7 +46,7 @@ def controller():
 def payload(check_only,credentials):
     p = previous_payload(check_only,credentials)
     fresh = json.loads((base.EVIDENCE/'sync-fix-preflight.json').read_text())
-    p.update(expected_chain=fresh['chain'],config_hashes=fresh['config_hashes'],image_id=fresh['image_id'],old_sources=fresh['old_sources'],old_frontend_source=fresh['frontend_source'])
+    p.update(expected_chain=fresh['chain'],config_hashes=fresh['config_hashes'],image_id=fresh['image_id'],old_sources=fresh['old_sources'],old_frontend_source=fresh['frontend_source'],frontend_chain=fresh['frontend_chain'])
     deployed=json.loads((base.EVIDENCE/'history-basic-production-20261030T043707Z-858679c3.json').read_text())
     p['old_modules']=deployed['evidence']['installed-module-hashes.json'] | fresh['modules']
     p['generation_tree_sha256']=hashlib.sha256(json.dumps(fresh['generation_tree'],sort_keys=True,separators=(',',':')).encode()).hexdigest()

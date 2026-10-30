@@ -15,12 +15,28 @@ after=json.loads(run(old['chain']+['-f','-','config','--format','json'],json.dum
 normalized=json.loads(json.dumps(before))
 for service in ('backend','frontend'):
  i=json.loads(run(['docker','inspect','ta-live-088a60b962bf-'+service+'-1']))[0]
- image=json.loads(run(['docker','image','inspect',before['services'][service]['image']]))
- assert not v.compare_running(service,i,image,before),'runtime_changed'
+ current=before
+ if service=='frontend':
+  labels=i['Config']['Labels']
+  fc=['docker','compose','--project-directory',labels['com.docker.compose.project.working_dir'],'--project-name',labels['com.docker.compose.project'],'--profile','cutover-approved']
+  for path in labels['com.docker.compose.project.config_files'].split(','):fc+=['-f',path]
+  old['frontend_chain']=fc
+  current=json.loads(run(fc+['config','--format','json']))
+ image=json.loads(run(['docker','image','inspect',current['services'][service]['image']]))
+ errors=v.compare_running(service,i,image,current)
+ assert not errors, '; '.join(errors)
  for new in r['override']['services'][service]['volumes']:
-  mount=next(m for m in normalized['services'][service]['volumes'] if m['target']==new['target'])
-  assert mount['read_only'] is True
-  mount['source']=new['source']
+  if service=='frontend':
+   actual=json.loads(json.dumps(current['services'][service]))
+   mount=next(m for m in actual['volumes'] if m['target']==new['target'])
+   assert mount['read_only'] is True and mount['source']==old['frontend_source']
+   mount['source']=new['source']
+   assert not v.compare({'services':{'frontend':actual}},{'services':{'frontend':after['services']['frontend']}},{}),'frontend_candidate_changed'
+   normalized['services'][service]=actual
+  else:
+   mount=next(m for m in normalized['services'][service]['volumes'] if m['target']==new['target'])
+   assert mount['read_only'] is True
+   mount['source']=new['source']
 assert not v.compare(normalized,after,{}),'unexpected_config_change'
 old.pop('config');old['config_hashes']=dict(before=sha(before),after=sha(after))
 print(json.dumps(old))
