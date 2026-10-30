@@ -29,7 +29,7 @@ for new in R['override']['services']['backend']['volumes']:
  old_sources[new['target']]=mount['source'];mount['source']=new['source']
 if v.compare(normalized,after,{}):raise RuntimeError('unexpected_config_change')
 probe="import pathlib,hashlib,json; p=pathlib.Path('/app/runtime/tushare-history-generations'); from tradingagents.utils.tushare_batch import selected_gate; assert (selected_gate().directory/'STOP').is_file(); print(json.dumps({str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in p.rglob('*') if f.is_file()}))"
-protected=json.loads(run(['docker','exec','ta-live-088a60b962bf-backend-1','python3','-B','-c',probe].splitlines()[-1])
+protected=json.loads(run(['docker','exec','ta-live-088a60b962bf-backend-1','python3','-B','-c',probe]).splitlines()[-1])
 probe="import pathlib,json,hashlib; p=pathlib.Path('/app/runtime/history-button-saved-recovery-20261029-v1'); r=json.loads((p/'result.json').read_text()); assert r['status']=='passed'; from tradingagents.utils.tushare_batch import selected_gate; g=selected_gate(); assert (g.directory/'STOP').is_file(); print(json.dumps({'series_bson_sha256':hashlib.sha256((p/'series-after.bson').read_bytes()).hexdigest()}))"
 recovery=json.loads(run(['docker','exec','ta-live-088a60b962bf-backend-1','python3','-B','-c',probe]).splitlines()[-1])
 print(json.dumps(dict(recovery=recovery,chain=R['chain'],image_id=R['image'],backend_id=i['Id'],old_sources=old_sources,batch_protected=protected,
