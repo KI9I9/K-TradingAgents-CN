@@ -66,7 +66,7 @@ def _observation(value):
     return value
 
 
-def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None, max_window_days=30, incremental=True):
+def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None, max_window_days=30, incremental=True, price_adjustment='qfq'):
     """Freeze a candidate pool and same-source cursors; never grant permission.
 
     quota describes an aggregate shared budget for daily + adj_factor, not a
@@ -77,6 +77,9 @@ def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None, m
         raise PlanError('aware_clock_required')
     if type(max_window_days) is not int or not 1 <= max_window_days <= 366 or type(incremental) is not bool:
         raise PlanError('invalid_window_policy')
+    if price_adjustment not in ('qfq', 'none'):
+        raise PlanError('invalid_price_adjustment')
+    cost = 1 if price_adjustment == 'none' else 2
     today = now.astimezone(CN)
     end_day = _day(end)
     if end_day > today.date() or (end_day == today.date() and today.hour < 18):
@@ -104,7 +107,7 @@ def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None, m
         items.append(dict(code=code, start=first.isoformat(), end=end,
                           observation_sha256=fingerprint(row),
                           status='blocked' if reason else 'candidate', reason=reason,
-                          request_cost=2 if reason is None else None))
+                          request_cost=cost if reason is None else None))
     candidate_count = sum(item['status'] == 'candidate' for item in items)
     blocked = len(items)-candidate_count
     budget = None
@@ -115,16 +118,16 @@ def build_plan(symbols, series, *, end, now, bootstrap_start=None, quota=None, m
                        for k in ('daily_requests', 'rolling_minute_requests'))
                 or not isinstance(quota['evidence_ref'], str) or not quota['evidence_ref'].strip()):
             raise PlanError('invalid_quota_evidence')
-        capacity = quota['daily_requests']//2
+        capacity = quota['daily_requests']//cost
         budget = dict(**quota, candidate_stocks_per_day=capacity,
                       candidate_budget_days_lower_bound=math.ceil(candidate_count/capacity))
-    plan = dict(schema=1, mode='incremental_daily_qfq' if incremental else 'year_daily_qfq',
+    plan = dict(schema=1, mode=('incremental_daily_' if incremental else 'year_daily_') + price_adjustment,
                 max_window_days=max_window_days, execution_authorized=False,
                 end=end, bootstrap_start=start.isoformat(),
                 inventory_sha256=fingerprint(observations), pool=codes, items=items,
                 candidate_count=candidate_count, blocked_count=blocked,
-                candidate_requests=candidate_count*2,
-                total_requests=None if blocked else candidate_count*2,
+                candidate_requests=candidate_count*cost,
+                total_requests=None if blocked else candidate_count*cost,
                 quota=budget, full_market_ready=False,
                 unresolved=['execution_not_implemented', 'permit_not_granted']
                 + (['series_blockers'] if blocked else [])

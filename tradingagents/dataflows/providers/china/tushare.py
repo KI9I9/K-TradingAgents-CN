@@ -482,7 +482,8 @@ class TushareProvider(BaseStockDataProvider):
         symbol: str,
         start_date: Union[str, date],
         end_date: Union[str, date] = None,
-        period: str = "daily"
+        period: str = "daily",
+        price_adjustment: str = "qfq"
     ) -> Optional[pd.DataFrame]:
         """
         获取历史数据
@@ -495,6 +496,8 @@ class TushareProvider(BaseStockDataProvider):
         """
         if period not in ('daily', 'weekly', 'monthly'):
             raise ValueError('history_period_invalid')
+        if price_adjustment not in ('qfq', 'none') or (price_adjustment == 'none' and period != 'daily'):
+            raise ValueError('history_adjustment_invalid')
         raise_if_egress_blocked()
         if not self.is_available():
             availability_issues = []
@@ -549,7 +552,10 @@ class TushareProvider(BaseStockDataProvider):
 
                 # 实际调用 Tushare API
                 try:
-                    if is_etf:
+                    if price_adjustment == 'none' and not is_etf:
+                        df = await asyncio.to_thread(self.api.daily, ts_code=ts_code,
+                            start_date=start_str, end_date=end_str)
+                    elif is_etf:
                         # ETF/基金走 fund_daily 接口（pro_bar 不支持 ETF）
                         self.logger.info(
                             f"📊 [Tushare API调用] 检测到ETF标的，使用 fund_daily 接口: {ts_code}"
@@ -586,7 +592,7 @@ class TushareProvider(BaseStockDataProvider):
                 # 根据耗时判断是否真正执行了网络请求
                 if api_call_duration < 0.01:  # 小于10毫秒，可能是快速失败
                     self.logger.warning(
-                        f"⚠️ [Tushare API调用] ts.pro_bar() 执行完成（疑似快速失败）\n"
+                        f"⚠️ [Tushare API调用] 历史行情接口执行完成（疑似快速失败）\n"
                         f"   耗时: {api_call_duration:.6f}秒（非常短，可能未执行网络请求）\n"
                         f"   返回类型: {type(df).__name__ if df is not None else 'None'}\n"
                         f"   返回数据: {'空DataFrame' if (df is not None and df.empty) else ('None' if df is None else f'{len(df)}行')}\n"
@@ -594,7 +600,7 @@ class TushareProvider(BaseStockDataProvider):
                     )
                 else:
                     self.logger.info(
-                        f"✅ [Tushare API调用] ts.pro_bar() 执行完成\n"
+                        f"✅ [Tushare API调用] 历史行情接口执行完成\n"
                         f"   耗时: {api_call_duration:.6f}秒\n"
                         f"   返回类型: {type(df).__name__ if df is not None else 'None'}\n"
                         f"   返回数据: {'空DataFrame' if (df is not None and df.empty) else ('None' if df is None else f'{len(df)}行')}"
@@ -605,11 +611,11 @@ class TushareProvider(BaseStockDataProvider):
                 raise_if_egress_blocked()  # SDK may replace a stop with OSError.
                 api_call_duration = time.perf_counter() - api_call_start
                 self.logger.error(
-                    f"❌ [Tushare API调用] ts.pro_bar() 抛出异常\n"
+                    f"❌ [Tushare API调用] 历史行情接口抛出异常\n"
                     f"   耗时: {api_call_duration:.6f}秒\n"
                     f"   异常类型: {type(api_exception).__name__}\n"
                     f"   异常信息: {str(api_exception)}\n"
-                    f"   调用参数: ts_code={ts_code}, start_date={start_str}, end_date={end_str}, freq={freq}, adj=qfq"
+                    f"   调用参数: ts_code={ts_code}, start_date={start_str}, end_date={end_str}, freq={freq}, adj={price_adjustment}"
                 )
                 raise  # 重新抛出异常，让上层处理
 
@@ -633,8 +639,8 @@ class TushareProvider(BaseStockDataProvider):
                 'source': 'tushare', 'symbol': ts_code.split('.')[0], 'period': period,
                 'start_date': start_str, 'end_date': end_str,
                 'volume_unit': 'lot', 'amount_unit': 'thousand_CNY',
-                'endpoint': 'fund_daily' if is_etf else 'pro_bar',
-                'price_adjustment': 'none' if is_etf else 'qfq',
+                'endpoint': 'fund_daily' if is_etf else 'daily' if price_adjustment == 'none' else 'pro_bar',
+                'price_adjustment': 'none' if is_etf else price_adjustment,
             }
 
             self.logger.info(f"✅ 获取{period}历史数据: {symbol} {len(df)}条记录 ({df.attrs['historical_contract']['price_adjustment']})")

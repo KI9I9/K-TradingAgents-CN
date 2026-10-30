@@ -103,7 +103,8 @@ def validate_plan(plan):
         copy = deepcopy(plan)
         expected = copy.pop('plan_sha256')
         _require(_hash(expected) and digest(copy) == expected, 'plan_hash_mismatch')
-        _require(plan['schema'] == 1 and plan['mode'] in ('incremental_daily_qfq', 'year_daily_qfq')
+        cost = 1 if plan['mode'] in ('incremental_daily_none', 'year_daily_none') else 2
+        _require(plan['schema'] == 1 and plan['mode'] in ('incremental_daily_qfq', 'year_daily_qfq', 'incremental_daily_none', 'year_daily_none')
                  and plan['execution_authorized'] is False and plan['full_market_ready'] is False,
                  'unsupported_plan')
         items, pool = plan['items'], plan['pool']
@@ -112,13 +113,13 @@ def validate_plan(plan):
                  'invalid_plan_pool')
         _require(plan['blocked_count'] == sum(i['status']=='blocked' for i in items)
                  and plan['candidate_count'] == len(pool)-plan['blocked_count']
-                 and plan['candidate_requests'] == 2 * plan['candidate_count']
-                 and plan['total_requests'] == (None if plan['blocked_count'] else 2*len(pool)), 'blocked_plan')
+                 and plan['candidate_requests'] == cost * plan['candidate_count']
+                 and plan['total_requests'] == (None if plan['blocked_count'] else cost*len(pool)), 'blocked_plan')
         _require(isinstance(plan['quota'], dict) and plan['quota'].get('evidence_ref'),
                  'quota_unverified')
         for item in items:
             _require(re.fullmatch(r'\d{6}\.(SH|SZ|BJ)', item['code']) is not None
-                     and ((item['status']=='candidate' and item['reason'] is None and item['request_cost']==2)
+                     and ((item['status']=='candidate' and item['reason'] is None and item['request_cost']==cost)
                           or (item['status']=='blocked' and item['reason'] in
                               ('legacy_contract_unproven','cursor_after_requested_end','window_exceeds_current_transport')
                               and item['request_cost'] is None)) and _hash(item['observation_sha256'])

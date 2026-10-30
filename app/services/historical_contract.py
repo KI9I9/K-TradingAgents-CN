@@ -69,9 +69,9 @@ def tushare_documents(symbol, frame, market, period, now=None):
             or meta.get('period') != period or meta.get('volume_unit') != 'lot'
             or meta.get('amount_unit') != 'thousand_CNY'
             or (meta.get('endpoint'), meta.get('price_adjustment')) not in
-               (('pro_bar', 'qfq'), ('fund_daily', 'none'))):
+               (('pro_bar', 'qfq'), ('fund_daily', 'none'), ('daily', 'none'))):
         raise HistoricalContractError('history_provenance_unproven')
-    if meta['endpoint'] == 'fund_daily' and period != 'daily':
+    if meta['endpoint'] in ('fund_daily', 'daily') and period != 'daily':
         raise HistoricalContractError('history_fund_period_unsupported')
     start, end = trade_date(meta.get('start_date')), trade_date(meta.get('end_date'))
     if start > end:

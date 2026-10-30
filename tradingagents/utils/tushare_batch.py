@@ -50,7 +50,9 @@ def policy_check(p):
     try:
         require(set(p) == {'schema','codes','min_date','max_date','expires_at','max_requests',
                           'daily_requests','minute_requests','write_enabled'})
-        require(type(p['schema']) is int and p['schema'] == 1 and p['write_enabled'] is True)
+        require(type(p['schema']) is int and p['schema'] in (1, 2) and p['write_enabled'] is True)
+        if p['schema'] == 2:
+            require(p['minute_requests'] <= 40 and p['daily_requests'] <= 7500)
         require(isinstance(p['codes'],list) and 1 <= len(p['codes']) <= 10000
                 and p['codes'] == sorted(set(stock_code(c) for c in p['codes'])))
         lo,hi=(datetime.strptime(p[k],'%Y-%m-%d').date() for k in ('min_date','max_date'))
@@ -115,10 +117,11 @@ class BatchGate(Permit):
         validate_plan(plan)
         require(plan['pool']==policy['codes'] and len(plan['items'])==len(policy['codes']), 'invalid_request')
         require([i['code'] for i in plan['items']]==policy['codes'])
+        require(plan['mode'].endswith('_none' if policy['schema']==2 else '_qfq'), 'invalid_request')
         for i in plan['items']:
             if i['status']=='blocked':
                 continue
-            require(i['status']=='candidate' and i['request_cost']==2, 'invalid_request')
+            require(i['status']=='candidate' and i['request_cost']==(1 if policy['schema']==2 else 2), 'invalid_request')
             require(policy['min_date']<=i['start']<=i['end']<=policy['max_date'], 'invalid_request')
             require(0<=(datetime.strptime(i['end'],'%Y-%m-%d')-datetime.strptime(i['start'],'%Y-%m-%d')).days<366,'invalid_request')
 
@@ -131,7 +134,8 @@ class BatchGate(Permit):
         os.replace('state.next','state.json',src_dir_fd=fd,dst_dir_fd=fd);os.fsync(fd)
 
     def check(self,fd,p,s):
-        if self.stopped(fd): raise TushareEgressStopped('disabled')
+        if self.stopped(fd):
+            raise TushareEgressStopped(s['reason'] if s['phase']=='blocked' else 'disabled', s['api_code'])
         if s['phase']!='ready':
             raise TushareEgressStopped('previous_attempt_incomplete' if s['phase']=='in_flight' else s['reason'],s['api_code'])
         now=time.time()
@@ -159,7 +163,7 @@ class BatchGate(Permit):
             require(item in s['plan']['items'] and item['status']=='candidate','invalid_request')
             if action=='fetch':
                 day=datetime.fromtimestamp(now,BJ).date().isoformat()
-                require(s['used']+2<=p['max_requests'] and s['days'].get(day,0)+2<=p['daily_requests'],'budget_exhausted')
+                require(s['used']+item['request_cost']<=p['max_requests'] and s['days'].get(day,0)+item['request_cost']<=p['daily_requests'],'budget_exhausted')
             return True
 
     def begin(self,item):
@@ -168,7 +172,7 @@ class BatchGate(Permit):
             require(s['active'] is None,'busy')
             require(s['plan'] is not None and item in s['plan']['items'] and item['status']=='candidate','invalid_request')
             day=datetime.fromtimestamp(now,BJ).date().isoformat()
-            require(s['used']+2<=p['max_requests'] and s['days'].get(day,0)+2<=p['daily_requests'],'budget_exhausted')
+            require(s['used']+item['request_cost']<=p['max_requests'] and s['days'].get(day,0)+item['request_cost']<=p['daily_requests'],'budget_exhausted')
             identity=uuid4().hex
             s.update(active=dict(id=identity,code=item['code'],start=item['start'],end=item['end'],sent=[]),last_time=now)
             self.write(fd,s)
@@ -209,7 +213,7 @@ class BatchJob:
             p,s=self.gate.read(fd);self.gate.check(fd,p,s)
             require(s['active'] is not None and s['active']['id']==self.identity
                     and (s['active']['sent']==['daily','adj_factor'] or
-                         (self.empty_daily is not None and s['active']['sent']==['daily'])),'previous_attempt_incomplete')
+                         ((self.empty_daily is not None or p['schema']==2) and s['active']['sent']==['daily'])),'previous_attempt_incomplete')
             s['active']=None;self.gate.write(fd,s)
 
     def perform(self,api,fields,params,operation):
@@ -222,6 +226,7 @@ class BatchJob:
         while True:
             with self.gate.locked() as fd:
                 p,s=self.gate.read(fd);now=self.gate.check(fd,p,s)
+                require(p['schema'] != 2 or api == 'daily', 'invalid_request')
                 a=s['active'];require(a is not None and a['id']==self.identity,'previous_attempt_incomplete')
                 require(a['sent']==([] if api=='daily' else ['daily']),'invalid_request')
                 day=datetime.fromtimestamp(now,BJ).date().isoformat()
@@ -325,7 +330,7 @@ def selected_gate(registry=REGISTRY, legacy=DIRECTORY):
     return gate
 
 
-async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=DIRECTORY):
+async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=DIRECTORY, retire_rejected=False):
     """Explicit operator action: STOP predecessor, reconcile it, create a NEW budget.
 
     Never exposed by the trigger endpoint. No provider/network client is created.
@@ -345,17 +350,35 @@ async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=D
         previous.assert_selected()
         with previous.locked() as gate_fd:
             require(previous.stopped(gate_fd), 'predecessor_not_stopped')
-            _, state = previous.read(gate_fd)
-        require(state['active'] is None and state['phase'] == 'ready', 'previous_attempt_incomplete')
+            previous_policy, state = previous.read(gate_fd)
+        rejected = (retire_rejected is True and policy['schema'] == 2
+                    and state['phase'] == 'blocked'
+                    and state['reason'] in ('usage_limit', 'insufficient_points')
+                    and type(state['api_code']) is int and state['api_code'] != 0
+                    and state['active'] is not None)
+        require(rejected or (state['active'] is None and state['phase'] == 'ready'), 'previous_attempt_incomplete')
         plan = state['plan']
         if plan is not None:
             workspace = Workspace(previous.directory/'runs')
-            adapter = HistoricalAdapter(collection, None, None, None, None)
+            adapter = HistoricalAdapter(collection, None, None, None, None,
+                price_adjustment='none' if previous_policy['schema']==2 else 'qfq')
             with workspace.locked():
                 _, _, states = workspace._load(plan['plan_sha256'])
                 for item in plan['items']:
                     saved = states[item['code']]
                     if saved['phase']=='skipped' and item['status']=='blocked':
+                        continue
+                    if rejected and saved['phase'] in ('pending','fetching'):
+                        active = state['active']
+                        require((saved['phase']=='fetching') == (item['code']==active['code']),
+                                'previous_attempt_incomplete')
+                        if saved['phase']=='fetching':
+                            require(all(active[k]==item[k] for k in ('code','start','end'))
+                                    and active['sent'], 'previous_attempt_incomplete')
+                        # No saved payload has reached the write stage. Exact inventory
+                        # fingerprint proves these symbols still match their pre-fetch state.
+                        require(await adapter.preflight(item)==item['observation_sha256'],
+                                'write_outcome_unresolved')
                         continue
                     require(saved['phase'] in ('committed','writing','fetched') and saved['payload'] is not None,
                             'previous_attempt_incomplete')
@@ -364,13 +387,25 @@ async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=D
                       for p in previous.directory.rglob('*') if p.is_file()}
         receipt = dict(previous_directory=str(previous.directory), previous_selection=previous.selection[1],
                        plan_sha256=plan['plan_sha256'] if plan else None,
-                       all_saved_data_matched=True, previous_hashes=old_hashes)
+                       all_saved_data_matched=True, previous_hashes=old_hashes,
+                       retired_rejection=dict(reason=state['reason'],api_code=state['api_code'],
+                           active=state['active']) if rejected else None)
         # Registry is created only by this explicit action. Interrupted creation
         # leaves a closed/incomplete registry; never fall back to an old permit.
         registry.mkdir(mode=0o700, exist_ok=True)
         identity = uuid4().hex
         created = BatchGate(registry/identity)
         gate = provision(created.directory, policy)
+        if policy['schema'] == 2:
+            # Account budgets must not reset when changing price basis/generation.
+            require(state['used'] < policy['max_requests']
+                    and all(n <= policy['daily_requests'] for n in state['days'].values())
+                    and len(state['recent']) <= policy['minute_requests'], 'budget_exhausted')
+            with gate.locked() as new_fd:
+                _, new_state = gate.read(new_fd)
+                for key in ('used','days','recent','last_time'):
+                    new_state[key] = deepcopy(state[key])
+                gate.write(new_fd,new_state)
         Workspace(gate.directory/'runs').provision()
         raw = json.dumps(receipt, sort_keys=True, allow_nan=False).encode()
         out = os.open(gate.directory/'retirement.json', os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)

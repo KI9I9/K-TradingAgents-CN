@@ -32,7 +32,10 @@ def raw_hash(rows):
 
 
 class Inventory:
-    def __init__(self, collection):
+    def __init__(self, collection, price_adjustment='qfq'):
+        if price_adjustment not in ('qfq', 'none'):
+            raise BatchStopped('invalid_price_adjustment')
+        self.price_adjustment = price_adjustment
         self.collection = collection
 
     async def snapshot(self, code):
@@ -54,7 +57,7 @@ class Inventory:
             raise BatchStopped('history_duplicate_dates')
         verified = all(r.get('market') == 'CN' for r in rows)
         try:
-            validate_existing_contract(rows, 'qfq')
+            validate_existing_contract(rows, self.price_adjustment)
         except HistoricalContractError:
             verified = False
         observation = dict(data_source='tushare', market='CN', period='daily', count=len(rows),
@@ -136,8 +139,9 @@ class HistoricalAdapter:
     this class never provisions, resets, renews or removes STOP from that gate.
     provider_factory is async and runs ONLY inside job.context(), after checks.
     """
-    def __init__(self, collection, historical_service, provider_factory, job_factory, authorize):
-        self.inventory = Inventory(collection)
+    def __init__(self, collection, historical_service, provider_factory, job_factory, authorize, price_adjustment='qfq'):
+        self.price_adjustment = price_adjustment
+        self.inventory = Inventory(collection, price_adjustment)
         self.service = historical_service
         self.provider_factory = provider_factory
         self.job_factory = job_factory
@@ -162,7 +166,8 @@ class HistoricalAdapter:
                 provider = await self.provider_factory()
                 from tradingagents.utils.tushare_batch import NoDailyData
                 try:
-                    frame = await provider.get_historical_data(item['code'][:6], item['start'], item['end'], period='daily')
+                    frame = await provider.get_historical_data(item['code'][:6], item['start'], item['end'], period='daily',
+                        **({'price_adjustment': 'none'} if self.price_adjustment == 'none' else {}))
                     job.assert_ready()
                 except NoDailyData:
                     if getattr(job,'empty_daily',None) is None:
@@ -209,7 +214,7 @@ class HistoricalAdapter:
                 if response['items']!=[] or len(fields)!=len(set(fields)) or not {'ts_code','trade_date','open','high','low','close','vol'}<=set(fields):
                     return False
                 baseline=json_util.loads(payload['baseline'])
-                validate_existing_contract(baseline,'qfq')
+                validate_existing_contract(baseline,self.price_adjustment)
                 if any(r.get('symbol')!=item['code'][:6] or r.get('data_source')!='tushare' or r.get('period')!='daily' or r.get('market')!='CN' for r in baseline):
                     return False
                 observation=dict(data_source='tushare',market='CN',period='daily',count=len(baseline),
@@ -224,7 +229,7 @@ class HistoricalAdapter:
             frame = thaw_frame(payload['frame'])
             meta = frame.attrs['historical_contract']
             if (trade_date(meta['start_date']) != item['start'] or trade_date(meta['end_date']) != item['end']
-                    or meta['price_adjustment'] != 'qfq' or meta['endpoint'] != 'pro_bar'):
+                    or meta['price_adjustment'] != self.price_adjustment or meta['endpoint'] != ('daily' if self.price_adjustment == 'none' else 'pro_bar')):
                 return False
             documents = tushare_documents(item['code'][:6], frame, 'CN', 'daily')
             if not 1 <= len(documents) <= 366 or documents != payload['documents']:
@@ -258,8 +263,8 @@ class HistoricalAdapter:
             return  # confirmed no-data result; journal only, no history write
         # The legacy service resolves its DB through the application getter. Verify
         # that it targets the same collection as inventory BEFORE permitting writes.
-        target_rows = await self.service.validate_tushare_series(item['code'][:6], 'daily', 'CN', 'qfq')
-        if not same_collection(self.service.db.stock_daily_quotes, self.inventory.collection):
+        target_rows = await self.service.validate_tushare_series(item['code'][:6], 'daily', 'CN', self.price_adjustment)
+        if not same_collection(self.service.tushare_collection(), self.inventory.collection):
             raise BatchStopped('service_collection_mismatch')
         if raw_hash(target_rows) != raw_hash(json_util.loads(payload['baseline'])):
             raise BatchStopped('write_inventory_changed')

@@ -1175,3 +1175,25 @@ async def get_tushare_manual_policy(current_user: dict = Depends(get_current_use
         return ok(data=DailyGate().status())
     except TushareEgressStopped as error:
         raise HTTPException(status_code=409, detail=error.reason) from None
+
+
+@router.get("/history-unadjusted/{symbol}")
+async def get_unadjusted_history(
+    symbol: str,
+    limit: int = Query(120, ge=1, le=2000),
+    current_user: dict = Depends(get_current_user),
+):
+    """Read only: explicitly raw Tushare bars, with no fallback or upstream fetch."""
+    from deploy.history_sync_plan import _code, PlanError
+    from app.services.historical_data_service import HistoricalDataService
+    try:
+        code = _code(symbol)
+    except PlanError:
+        raise HTTPException(400, "无效的 A 股代码") from None
+    rows = await HistoricalDataService().get_historical_data(code[:6],
+        data_source="tushare", period="daily", limit=limit, price_adjustment="none")
+    items = [{k: v for k, v in r.items() if k not in ("_id", "created_at", "updated_at")}
+             for r in reversed(rows)]
+    return ok(data=dict(symbol=code, price_adjustment="none", period="daily",
+        data_source="tushare", source_endpoint="daily", volume_unit="lot", amount_unit="CNY",
+        items=items))

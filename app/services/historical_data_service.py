@@ -18,11 +18,15 @@ logger = logging.getLogger(__name__)
 class HistoricalDataService:
     """统一历史数据管理服务"""
     
-    def __init__(self):
+    def __init__(self, *, unadjusted_stock=False):
         """初始化服务"""
+        self.unadjusted_stock = unadjusted_stock
         self.db = None
         self.collection = None
         
+    def tushare_collection(self):
+        return self.db.stock_daily_quotes_unadjusted if self.unadjusted_stock else self.db.stock_daily_quotes
+
     async def initialize(self):
         """初始化数据库连接"""
         try:
@@ -209,8 +213,11 @@ class HistoricalDataService:
             return 0
         # Complete validation precedes writes, so one malformed row cannot leave a valid prefix.
         documents = tushare_documents(symbol, data, market, period)
+        raw_stock = data.attrs['historical_contract']['endpoint'] == 'daily'
+        if raw_stock != self.unadjusted_stock:
+            raise HistoricalContractError('history_storage_basis_mismatch')
         existing = await self.validate_tushare_series(symbol, period, market, documents[0]['price_adjustment'])
-        collection = self.db.stock_daily_quotes
+        collection = self.tushare_collection()
         series = {'symbol': symbol, 'data_source': 'tushare', 'period': period}
         validate_existing_series(existing, documents)
         old_by_day = {row['trade_date']: row for row in existing}
@@ -244,7 +251,9 @@ class HistoricalDataService:
         from app.services.historical_contract import HistoricalContractError, validate_existing_contract
         from app.core.database import get_mongo_db
         self.db = get_mongo_db()
-        collection = self.db.stock_daily_quotes
+        if self.unadjusted_stock and (adjustment != 'none' or period != 'daily'):
+            raise HistoricalContractError('history_storage_basis_mismatch')
+        collection = self.tushare_collection()
         indexes = await collection.index_information()
         unique_key = [('symbol', 1), ('trade_date', 1), ('data_source', 1), ('period', 1)]
         if not any(index.get('unique') is True and index.get('key') == unique_key
@@ -488,7 +497,8 @@ class HistoricalDataService:
         end_date: str = None,
         data_source: str = None,
         period: str = None,
-        limit: int = None
+        limit: int = None,
+        price_adjustment: str = None
     ) -> List[Dict[str, Any]]:
         """
         查询历史数据
@@ -504,16 +514,20 @@ class HistoricalDataService:
         Returns:
             历史数据列表
         """
-        # 🔥 关键修复：检查 self.db 而不是 self.collection
+        if price_adjustment not in (None, 'qfq', 'none'):
+            raise ValueError('history_adjustment_invalid')
+        if price_adjustment == 'none' and (data_source != 'tushare' or period != 'daily'):
+            raise ValueError('raw_stock_requires_tushare_daily')
         if self.db is None:
-            await self.initialize()
-        
-        # 🔥 从 self.db 重新获取 collection，确保使用正确的连接
-        collection = self.db.stock_daily_quotes
+            from app.core.database import get_mongo_db
+            self.db = get_mongo_db()
+        collection = self.db.stock_daily_quotes_unadjusted if price_adjustment == 'none' else self.db.stock_daily_quotes
         
         try:
             # 构建查询条件
             query = {"symbol": symbol}
+            if price_adjustment is not None:
+                query['price_adjustment'] = price_adjustment
             
             if start_date or end_date:
                 date_filter = {}
@@ -542,6 +556,8 @@ class HistoricalDataService:
             
         except Exception as e:
             logger.error(f"❌ 查询历史数据失败 {symbol}: {e}")
+            if price_adjustment is not None:
+                raise
             return []
     
     async def get_latest_date(self, symbol: str, data_source: str, period: str = None,

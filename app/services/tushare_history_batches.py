@@ -91,7 +91,9 @@ class HistoryBatchService:
         now=self.clock().astimezone(BJ)
         # Pre-18:00 clicks target yesterday; no inferred trading day/finality.
         end=(now.date() if now.hour>=18 else now.date()-timedelta(days=1)).isoformat()
-        expected='incremental_daily_qfq' if incremental else 'year_daily_qfq'
+        adjustment = 'none' if policy['schema'] == 2 else 'qfq'
+        self.price_adjustment = adjustment
+        expected=('incremental_daily_' if incremental else 'year_daily_') + adjustment
         checkpoint=self.workspace.status(plan['plan_sha256']) if plan is not None else None
         reuse=plan is not None and (not checkpoint['complete'] or (plan['end']==end and plan['mode']==expected))
         if reuse:
@@ -99,7 +101,7 @@ class HistoryBatchService:
                 raise HTTPException(400,'已有未完成的历史计划，请使用相同同步模式继续，不能替换其范围。')
             if checkpoint['complete']:
                 # Repeated clicks are read-only reconciliation, not new requests.
-                adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,None,None)
+                adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,None,None,price_adjustment=adjustment)
                 with self.workspace.locked():
                     _,_,saved=self.workspace._load(plan['plan_sha256'])
                     for item in plan['items']:
@@ -109,8 +111,8 @@ class HistoryBatchService:
                         if not await adapter.matches(item,saved[item['code']]['payload']):
                             raise HTTPException(400,'已完成计划的数据发生变化，已停止自动重复取数，请核查。')
         else:
-            inventory=await Inventory(self.collection).collect(policy['codes'])
-            plan=build_plan(**inventory,end=end,now=now,incremental=incremental,max_window_days=366,
+            inventory=await Inventory(self.collection,adjustment).collect(policy['codes'])
+            plan=build_plan(**inventory,end=end,now=now,incremental=incremental,max_window_days=366,price_adjustment=adjustment,
                 bootstrap_start=max(policy['min_date'],(now.date()-timedelta(days=365)).isoformat()) if incremental else None,
                 quota=dict(daily_requests=policy['daily_requests'],rolling_minute_requests=policy['minute_requests'],
                            evidence_ref='explicit-local-policy'))
@@ -159,7 +161,8 @@ class HistoryBatchService:
             if not current or current.get('cancel_requested'):raise BatchStopped('cancelled')
             return self.gate.authorize(plan_hash,item,action)
         async def job_factory(item):return self.gate.begin(item)
-        adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,job_factory,authorize)
+        adapter=HistoricalAdapter(self.collection,self.historical_service,self.provider_factory,job_factory,authorize,
+            price_adjustment='none' if plan['mode'].endswith('_none') else 'qfq')
         reason=None
         try:
             async def progress(result):
@@ -195,7 +198,8 @@ class HistoryBatchService:
             error='跳过名单：'+', '.join(i['code']+':'+i['reason'] for i in skipped)
         update=dict(status=status,updated_at=self.clock(),processed_items=count,total_items=total,
             success_count=count,skipped_count=len(skipped),skipped_items=skipped,progress=int(100*finished/total),
-            progress_message=error or f"已同步 {count}/{total} 只，跳过 {len(skipped)} 只（可查看跳过名单，结束日期 {plan['end']}）",
+            price_adjustment='none' if plan['mode'].endswith('_none') else 'qfq',
+            progress_message=error or ('非复权日线：' if plan['mode'].endswith('_none') else '前复权日线：') + f"已同步 {count}/{total} 只，跳过 {len(skipped)} 只（可查看跳过名单，结束日期 {plan['end']}）",
             error_message=error,result=dict(success=result['complete'] and all(i['reason']=='no_daily_rows' for i in skipped),complete=result['complete'],skipped_items=skipped,success_count=count,total_processed=finished,
                 plan_sha256=plan['plan_sha256'],end=plan['end']))
         if status!='running':update['finished_at']=self.clock()
@@ -209,7 +213,7 @@ class HistoryBatchService:
 async def submit_history_batch(*,force=False,incremental=True):
     try:
         gate=selected_gate()
-        gate.status()  # refuse BEFORE opening database/provider on unconfigured hosts
+        policy,_ = gate.status()  # refuse BEFORE opening database/provider on unconfigured hosts
     except TushareEgressStopped as error:raise HTTPException(400,message(error.reason)) from None
     from app.core.database import get_mongo_db
     from app.services.historical_data_service import HistoricalDataService
@@ -219,6 +223,8 @@ async def submit_history_batch(*,force=False,incremental=True):
         provider=TushareProvider()
         if not await provider.connect():raise TushareEgressStopped('not_authorized')
         return provider
-    service=HistoryBatchService(gate,Workspace(gate.directory/'runs'),db.stock_daily_quotes,
-        db.scheduler_executions,HistoricalDataService(),provider_factory)
+    raw = policy['schema'] == 2
+    collection = db.stock_daily_quotes_unadjusted if raw else db.stock_daily_quotes
+    service=HistoryBatchService(gate,Workspace(gate.directory/'runs'),collection,
+        db.scheduler_executions,HistoricalDataService(unadjusted_stock=raw),provider_factory)
     return await service.submit(force=force,incremental=incremental)

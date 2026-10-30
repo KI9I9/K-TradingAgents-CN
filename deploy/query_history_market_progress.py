@@ -18,7 +18,7 @@ db=c[env['MONGODB_DATABASE']]
 row=db.scheduler_executions.find_one({'job_id':'tushare_historical_sync'},sort=[('timestamp',-1)]) or {}
 job={k:row.get(k) for k in ('_id','status','timestamp','updated_at','progress','processed_items','total_items','success_count','skipped_count','error_message','progress_message','plan_sha256')}
 q={'data_source':'tushare'}
-print('MARKET_PROGRESS:'+json.dumps(dict(generation=str(folder),stopped=(folder/'STOP').exists(),phase=state['phase'],reason=state['reason'],api_code=state.get('api_code'),used=state['used'],days=state['days'],active=state['active'],pool_count=len(policy['codes']),expires_at=policy['expires_at'],job=job,history_count=db.stock_daily_quotes.count_documents(q),series_count=len(db.stock_daily_quotes.distinct('symbol',q))),default=str))
+print('MARKET_PROGRESS:'+json.dumps(dict(generation=str(folder),stopped=(folder/'STOP').exists(),phase=state['phase'],reason=state['reason'],api_code=state.get('api_code'),used=state['used'],days=state['days'],active=state['active'],pool_count=len(policy['codes']),expires_at=policy['expires_at'],job=job,history_count=db.stock_daily_quotes.count_documents(q),series_count=len(db.stock_daily_quotes.distinct('symbol',q)),raw_history_count=db.stock_daily_quotes_unadjusted.count_documents(q),raw_series_count=len(db.stock_daily_quotes_unadjusted.distinct('symbol',q)),policy_schema=policy['schema']),default=str))
 c.close()
 '''
 
