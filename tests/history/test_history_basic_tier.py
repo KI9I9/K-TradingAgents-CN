@@ -80,6 +80,42 @@ class BasicTierTests(ButtonTests):
         self.assertEqual(self.state()['used'],4)
         self.assertEqual(self.executions.rows['2']['status'],'success')
 
+    async def test_recovery_skips_completed_stock_and_preserves_empty_outcome(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        policy,_ = self.gate.status()
+        policy['codes'] = ['600000.SH','600001.SH']
+        self.gate = gate_module.provision(Path(self.tmp.name)/'pair',policy)
+        self.workspace = Workspace(self.gate.directory/'runs');self.workspace.provision()
+        self.service = button.HistoryBatchService(self.gate,self.workspace,self.col,self.executions,
+            self.history,self.factory,clock=lambda:self.clock)
+        failed = True
+        calls = []
+        def daily(**kwargs):
+            job=CURRENT.get()
+            def operation():
+                calls.append(kwargs['ts_code'])
+                if kwargs['ts_code']=='600001.SH' and failed:
+                    raise TushareEgressStopped('timeout')
+                return dict(fields=list(self.raw.columns),items=[])
+            result=job.perform('daily','',kwargs,operation)
+            import pandas as pd
+            return pd.DataFrame(result['items'],columns=result['fields'])
+        self.provider.api.daily.side_effect=daily
+        with patch.object(gate_module.time,'sleep'):
+            await self.service.submit();await asyncio.gather(*list(button._TASKS))
+        state=self.state()
+        self.assertEqual(calls,['600000.SH']+['600001.SH']*3)
+        self.assertEqual(self.executions.rows['1']['success_count'],0)
+        self.assertEqual(self.executions.rows['1']['skipped_count'],1)
+        await gate_module.recover_raw_timeout(self.gate,self.col,
+            expected_plan=state['plan']['plan_sha256'],expected_used=4)
+        failed=False
+        await self.service.submit();await asyncio.gather(*list(button._TASKS))
+        self.assertEqual(calls,['600000.SH']+['600001.SH']*4)
+        self.assertEqual(self.state()['used'],5)
+        self.assertEqual(self.executions.rows['2']['skipped_count'],2)
+        self.assertEqual(self.executions.rows['2']['success_count'],0)
+
     async def test_recovery_rejects_inventory_drift(self):
         from tradingagents.utils.tushare_egress import TushareEgressStopped
         self.send_failure = TushareEgressStopped('timeout')
