@@ -13,6 +13,7 @@ from test_history_batch_adapters import ReadCollection, raw_json
 from test_tushare_history import frame, history
 from deploy.history_batch_journal import Workspace
 from app.services.historical_contract import HistoricalContractError
+from deploy import history_tls_recovery as tls_recovery
 
 
 class BasicTierTests(ButtonTests):
@@ -134,6 +135,98 @@ class BasicTierTests(ButtonTests):
         self.send_failure = TushareEgressStopped('usage_limit',40203)
         await self.service.submit(); await asyncio.gather(*list(button._TASKS))
         self.assertEqual(self.state()['used'],1)
+        self.assertTrue((self.gate.directory/'STOP').exists())
+
+    async def stop_for_tls(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        self.send_failure=TushareEgressStopped('tls_failed')
+        await self.service.submit();await asyncio.gather(*list(button._TASKS))
+        state=self.state()
+        self.assertEqual(state['used'],1)  # No automatic TLS retry.
+        self.assertTrue((self.gate.directory/'STOP').exists())
+        return dict(expected_plan=state['plan']['plan_sha256'],expected_used=1)
+
+    async def test_tls_operator_recovery_preserves_budget_and_resumes(self):
+        args=await self.stop_for_tls()
+        before=self.state();rows=raw_json(self.col.rows)
+        probes=[dict(version='TLSv1.2',elapsed=.1)]*3
+        with patch.object(tls_recovery,'verify_fixed_tls',return_value=probes) as verify:
+            receipt=await tls_recovery.recover_raw_tls(self.gate,self.col,**args)
+        verify.assert_called_once()
+        self.assertEqual(receipt['previous_reason'],'tls_failed')
+        for key in ('used','days','recent','last_time','plan'):
+            self.assertEqual(self.state()[key],before[key])
+        self.assertEqual(raw_json(self.col.rows),rows)
+        self.assertFalse((self.gate.directory/'STOP').exists())
+        saved=json.loads((Path(receipt['receipt'])/'before.json').read_text())
+        self.assertEqual(saved['state'],before)
+        self.assertEqual(saved['tls_probes'],probes)
+        self.send_failure=None
+        await self.service.submit();await asyncio.gather(*list(button._TASKS))
+        self.assertEqual(self.state()['used'],2)
+        self.assertEqual(self.executions.rows['2']['status'],'success')
+
+    async def test_tls_recovery_cert_error_keeps_every_ledger_byte(self):
+        import ssl
+        args=await self.stop_for_tls()
+        before={str(p):p.read_bytes() for p in self.gate.directory.rglob('*') if p.is_file()}
+        with patch.object(tls_recovery,'verify_fixed_tls',side_effect=ssl.SSLCertVerificationError('synthetic')):
+            # BatchGate.locked maps OS/SSL errors to its fail-closed IO reason.
+            with self.assertRaisesRegex(RuntimeError,'state_io_failed'):
+                await tls_recovery.recover_raw_tls(self.gate,self.col,**args)
+        self.assertEqual(before,{str(p):p.read_bytes() for p in self.gate.directory.rglob('*') if p.is_file()})
+
+    async def test_tls_recovery_requires_exact_counter_before_probe(self):
+        args=await self.stop_for_tls();args['expected_used']=0
+        with patch.object(tls_recovery,'verify_fixed_tls') as verify:
+            with self.assertRaisesRegex(RuntimeError,'previous_attempt_incomplete'):
+                await tls_recovery.recover_raw_tls(self.gate,self.col,**args)
+        verify.assert_not_called()
+        self.assertTrue((self.gate.directory/'STOP').exists())
+
+    async def test_tls_recovery_rejects_inventory_drift_before_probe(self):
+        args=await self.stop_for_tls()
+        self.col.rows=deepcopy(self.legacy_col.rows)
+        with patch.object(tls_recovery,'verify_fixed_tls') as verify:
+            with self.assertRaisesRegex(RuntimeError,'write_outcome_unresolved'):
+                await tls_recovery.recover_raw_tls(self.gate,self.col,**args)
+        verify.assert_not_called()
+        self.assertTrue((self.gate.directory/'STOP').exists())
+
+    async def test_tls_recovery_preserves_completed_stock_bytes(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        policy,_=self.gate.status();policy['codes']=['600000.SH','600001.SH']
+        self.gate=gate_module.provision(Path(self.tmp.name)/'tls-pair',policy)
+        self.workspace=Workspace(self.gate.directory/'runs');self.workspace.provision()
+        self.service=button.HistoryBatchService(self.gate,self.workspace,self.col,self.executions,
+            self.history,self.factory,clock=lambda:self.clock)
+        original=self.provider.api.daily.side_effect
+        def daily(**params):
+            self.send_failure=TushareEgressStopped('tls_failed') if params['ts_code']=='600001.SH' else None
+            return original(**params)
+        self.provider.api.daily.side_effect=daily
+        await self.service.submit();await asyncio.gather(*list(button._TASKS))
+        state=self.state();self.assertEqual(state['used'],2)
+        with self.workspace.locked():
+            folder,plan,states=self.workspace._load(state['plan']['plan_sha256'])
+        self.assertEqual(states['600000.SH']['phase'],'committed')
+        committed=(folder/'600000.SH.json').read_bytes();rows=raw_json(self.col.rows)
+        with patch.object(tls_recovery,'verify_fixed_tls',return_value=[]):
+            await tls_recovery.recover_raw_tls(self.gate,self.col,
+                expected_plan=state['plan']['plan_sha256'],expected_used=2)
+        self.assertEqual((folder/'600000.SH.json').read_bytes(),committed)
+        self.assertEqual(raw_json(self.col.rows),rows)
+
+    async def test_tls_probe_cannot_extend_expired_permit(self):
+        from datetime import timedelta
+        args=await self.stop_for_tls();before=self.state()
+        def expire():
+            self.clock+=timedelta(days=3)
+            return []
+        with patch.object(tls_recovery,'verify_fixed_tls',side_effect=expire):
+            with self.assertRaisesRegex(RuntimeError,'expired'):
+                await tls_recovery.recover_raw_tls(self.gate,self.col,**args)
+        self.assertEqual(self.state(),before)
         self.assertTrue((self.gate.directory/'STOP').exists())
 
     async def test_basic_end_to_end_and_replay(self):

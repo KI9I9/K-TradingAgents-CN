@@ -34,11 +34,17 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):raise RuntimeError('redirect_refused')
 
 
-def main(r):
+def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
+         run_directory=None):
+    global RUN
+    if run_directory is not None:
+        RUN=Path(run_directory)
     os.umask(0o077)
     gate=None;client=None;reserved=False
     report=dict(status='failed',trigger_sent=False,new_gate_stopped=True)
     try:
+        require(expected_reason in ('timeout','tls_failed')
+                and (expected_reason=='timeout' or recoverer is not None),'invalid_recovery_reason')
         require(not RUN.exists(),'already_reserved')
         require(shutil.disk_usage('/app/runtime').free>1024**3,'backup_space')
         for p,h in r['source_hashes'].items():require(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h,'source_changed')
@@ -59,7 +65,7 @@ def main(r):
         require(str(gate.directory)==r['generation'],'generation_changed')
         with gate.locked() as fd:
             _,s=gate.read(fd)
-            require(gate.stopped(fd) and s['phase']=='blocked' and s['reason']=='timeout'
+            require(gate.stopped(fd) and s['phase']=='blocked' and s['reason']==expected_reason
                     and s['used']==r['used'] and s['plan']['plan_sha256']==r['plan'],'state_changed')
         opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),NoRedirect())
         def http(path,body,token=None):
@@ -71,7 +77,7 @@ def main(r):
         token=login['data']['access_token']
         RUN.mkdir(mode=0o700);reserved=True
         hashes={};before={}
-        for name,expected in [('stock_daily_quotes',2112),('stock_daily_quotes_unadjusted',13136)]:
+        for name,expected in [('stock_daily_quotes',2112),('stock_daily_quotes_unadjusted',raw_count)]:
             rows=list(db[name].find({'data_source':'tushare'}).max_time_ms(15000))
             require(len(rows)==expected,'inventory_changed')
             raw=b''.join(BSON.encode(row) for row in sorted(rows,key=lambda x:str(x['_id'])))
@@ -85,7 +91,7 @@ def main(r):
         async def recover():
             from motor.motor_asyncio import AsyncIOMotorClient
             motor=AsyncIOMotorClient(**options)
-            try:return await recover_raw_timeout(gate,motor[env['MONGODB_DATABASE']].stock_daily_quotes_unadjusted,
+            try:return await (recoverer or recover_raw_timeout)(gate,motor[env['MONGODB_DATABASE']].stock_daily_quotes_unadjusted,
                 expected_plan=r['plan'],expected_used=r['used'])
             finally:motor.close()
         receipt=asyncio.run(recover());save('recovery.json',receipt)
