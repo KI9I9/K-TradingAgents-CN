@@ -30,4 +30,14 @@ def package():
 
 
 base.package=package
-if __name__=='__main__':base.main()
+if __name__=='__main__':
+    import sys, os
+    if sys.argv[1:] == ['--action', 'collect']:
+        from run_history_sample import ssh, EVIDENCE
+        result=ssh(base.STATUS)
+        target=EVIDENCE/'history-basic-opening-result-20261030.json'
+        fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as f:json.dump(result,f,indent=2)
+        print(json.dumps(result,ensure_ascii=False))
+    else:
+        base.main()
