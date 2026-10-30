@@ -45,6 +45,61 @@ class BasicTierTests(ButtonTests):
         self.provider.api.daily.side_effect=daily
         self.sdk.pro_bar.side_effect=AssertionError('Basic account must never request pro_bar')
 
+    async def test_timeout_retry_charges_every_attempt(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        p,s = self.gate.status()
+        plan,_ = await self.service._prepare(p,s,True)
+        job = self.gate.begin(plan['items'][0])
+        params = dict(ts_code='600000.SH',start_date=job.approved['start'],end_date=job.approved['end'])
+        response = dict(fields=list(self.raw.columns),items=self.raw.values.tolist())
+        operation = Mock(side_effect=[TushareEgressStopped('timeout'), response])
+        with patch.object(gate_module.time, 'sleep'):
+            self.assertEqual(job.perform('daily','',params,operation), response)
+        self.assertEqual(self.state()['used'],2)
+        self.assertEqual(len(list(self.gate.directory.glob('retry-*.json'))),1)
+        self.assertFalse(self.col.rows)
+        job.finish()
+
+    async def test_timeout_exhaustion_and_explicit_same_plan_recovery(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        self.send_failure = TushareEgressStopped('timeout')
+        with patch.object(gate_module.time, 'sleep'):
+            await self.service.submit(); await asyncio.gather(*list(button._TASKS))
+        state = self.state()
+        self.assertEqual(state['used'],3)
+        self.assertTrue((self.gate.directory/'STOP').exists())
+        before = raw_json(self.col.rows)
+        receipt = await gate_module.recover_raw_timeout(self.gate,self.col,
+            expected_plan=state['plan']['plan_sha256'],expected_used=3)
+        self.assertEqual(receipt['used'],3)
+        self.assertEqual(raw_json(self.col.rows),before)
+        self.assertEqual(self.state()['plan'],state['plan'])
+        self.assertFalse((self.gate.directory/'STOP').exists())
+        self.send_failure = None
+        await self.service.submit(); await asyncio.gather(*list(button._TASKS))
+        self.assertEqual(self.state()['used'],4)
+        self.assertEqual(self.executions.rows['2']['status'],'success')
+
+    async def test_recovery_rejects_inventory_drift(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        self.send_failure = TushareEgressStopped('timeout')
+        with patch.object(gate_module.time, 'sleep'):
+            await self.service.submit(); await asyncio.gather(*list(button._TASKS))
+        state = self.state()
+        self.col.rows = deepcopy(self.legacy_col.rows)
+        with self.assertRaisesRegex(RuntimeError,'write_outcome_unresolved'):
+            await gate_module.recover_raw_timeout(self.gate,self.col,
+                expected_plan=state['plan']['plan_sha256'],expected_used=3)
+        self.assertTrue((self.gate.directory/'STOP').exists())
+        self.assertEqual(self.state(),state)
+
+    async def test_permission_error_not_retried(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        self.send_failure = TushareEgressStopped('usage_limit',40203)
+        await self.service.submit(); await asyncio.gather(*list(button._TASKS))
+        self.assertEqual(self.state()['used'],1)
+        self.assertTrue((self.gate.directory/'STOP').exists())
+
     async def test_basic_end_to_end_and_replay(self):
         self.assertTrue(await self.service.submit())
         await asyncio.gather(*list(button._TASKS))

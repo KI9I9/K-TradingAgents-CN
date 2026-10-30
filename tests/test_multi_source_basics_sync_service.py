@@ -53,7 +53,9 @@ def test_run_full_sync_uses_system_industry_mapping_for_batch_docs():
          patch("app.services.official_industry_service.fetch_industry_mapping", new=AsyncMock(return_value={"300750": "电气设备"})):
         result = asyncio.run(service.run_full_sync(preferred_sources=["akshare"]))
 
-    assert result["status"] == "success"
+    assert result["status"] == "success_with_errors"
+    assert result["degraded"] is True
+    assert "未获取最新每日财务指标" in result["message"]
     assert "industry_mapping:system_industry_mapping" in result["data_sources_used"]
     assert len(captured_operations) == 1
 

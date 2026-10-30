@@ -74,7 +74,7 @@
                 size="small"
                 type="info"
               >
-                {{ source }}
+                {{ sourceLabel(source) }}
               </el-tag>
             </div>
           </div>
@@ -84,7 +84,7 @@
             <div class="time-label">任务结束时间:</div>
             <div class="time-value">{{ formatTime(syncStatus.finished_at) }}</div>
           </div>
-          <p v-if="syncStatus.status === 'failed'" class="inventory-note">
+          <p v-if="(syncStatus.status === 'failed' || syncStatus.degraded)" class="inventory-note">
             {{ syncStatus.message || '本次任务失败；处理数量不代表数据库已有数量。' }}
           </p>
         </div>
@@ -188,10 +188,10 @@
         </div>
 
         <!-- 错误信息 -->
-        <div v-if="syncStatus?.message && syncStatus.status === 'failed'" class="error-section">
+        <div v-if="syncStatus?.message && (syncStatus.status === 'failed' || syncStatus.degraded)" class="error-section">
           <el-alert
             :title="syncStatus.message"
-            type="error"
+            :type="syncStatus.degraded ? 'warning' : 'error'"
             :closable="false"
             show-icon
           />
@@ -442,7 +442,11 @@ const showSyncCompletionNotification = (status: string) => {
   let message = ''
   let type: 'success' | 'warning' | 'error' = 'success'
 
-  if (status === 'success') {
+  if (stats.degraded) {
+    title = '基本信息更新不完整'
+    message = stats.message || '沿用本地已有资料，未完成外部更新'
+    type = 'warning'
+  } else if (status === 'success') {
     title = '🎉 同步完成！'
     message = `处理了 ${total} 条记录，新增 ${inserted} 条，更新 ${updated} 条`
     type = 'success'
@@ -471,13 +475,25 @@ const showSyncCompletionNotification = (status: string) => {
   if (stats.data_sources_used && stats.data_sources_used.length > 0) {
     setTimeout(() => {
       ElMessage({
-        message: `📡 使用的数据源: ${stats.data_sources_used.join(', ')}`,
+        message: `📡 使用的数据源: ${stats.data_sources_used.map(sourceLabel).join('、')}`,
         type: 'info',
         duration: 6000,
         showClose: true
       })
     }, 1000)
   }
+}
+
+const sourceLabel = (source: string): string => {
+  const labels: Record<string, string> = {
+    'stock_list:__local_universe__': '本地已有股票资料（未从外部更新）',
+    'industry_mapping:system_industry_mapping': '系统行业映射'
+  }
+  if (labels[source]) return labels[source]
+  const [kind, name] = source.split(':')
+  const kinds: Record<string, string> = { stock_list: '股票列表', daily_data: '每日指标' }
+  const names: Record<string, string> = { tushare: 'Tushare', akshare: 'AKShare', baostock: 'BaoStock' }
+  return kinds[kind] && names[name] ? `${kinds[kind]}（${names[name]}）` : '其他数据来源'
 }
 
 // 获取状态类型
@@ -496,6 +512,7 @@ const getStatusType = (status?: string): 'success' | 'warning' | 'info' | 'dange
 
 // 获取状态文本
 const getStatusText = (status?: string) => {
+  if (syncStatus.value?.degraded && status === 'success_with_errors') return '更新不完整'
   const textMap: Record<string, string> = {
     idle: '空闲',
     queued: '后台启动中',

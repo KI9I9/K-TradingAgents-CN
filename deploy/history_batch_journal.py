@@ -238,6 +238,8 @@ class Workspace:
             _, _, states = self._load(identity,metadata_only=True)
             counts = {phase: sum(s['phase'] == phase for s in states.values()) for phase in PHASES}
             return dict(plan_sha256=identity, counts=counts,
+                        outcomes=[dict(code=c, reason=s['payload']['outcome']) for c,s in states.items()
+                                  if s['phase']=='committed' and s['payload'].get('schema') in (2,3)],
                         complete=counts['committed']+counts['skipped'] == len(states))
 
     def advance(self, identity, adapter, *, max_items):

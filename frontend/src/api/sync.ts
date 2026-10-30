@@ -26,6 +26,7 @@ export interface SyncStatus {
   data_sources_used: string[]
   source_stats?: Record<string, Record<string, number>>
   message?: string
+  degraded?: boolean
   existing_records?: number | null
   last_success?: Pick<SyncStatus, 'status' | 'started_at' | 'finished_at' | 'total' | 'inserted' | 'updated' | 'errors' | 'data_sources_used'> | null
 }

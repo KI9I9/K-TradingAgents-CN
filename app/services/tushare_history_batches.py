@@ -26,6 +26,7 @@ def message(reason):
         'disabled':'历史同步运行许可已关闭（不是登录权限）；请联系运维核查停止原因并恢复。',
         'expired':'历史同步授权已到期，未自动续期。',
         'budget_exhausted':'本次或今日请求预算已用完；已完成的数据保留，未自动增加额度。',
+        'timeout':'上游请求连续超时，已保留完成数据及断点；需核验后从未完成股票继续。',
         'usage_limit':'上游报告调用限额，已停止后续请求。',
         'insufficient_points':'上游积分不足，已停止后续请求。',
         'generation_changed':'授权已切换，请重新提交普通执行。',
@@ -176,7 +177,8 @@ class HistoryBatchService:
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted'
             try:
                 checkpoint=self.workspace.status(identity)
-                result=dict(committed=checkpoint['counts']['committed'],total=len(plan['items']),complete=False)
+                result=dict(committed=checkpoint['counts']['committed'],total=len(plan['items']),complete=False,
+                            outcomes=checkpoint['outcomes'])
                 status='cancelled' if reason=='cancelled' else 'partial' if result['committed'] else 'failed'
                 await self._progress(execution_id,result,status,plan,message(reason))
             except Exception:
@@ -194,8 +196,6 @@ class HistoryBatchService:
         outcomes=result.get('outcomes',[])
         skipped+=outcomes
         count-=len(outcomes)
-        if skipped and not error:
-            error='跳过名单：'+', '.join(i['code']+':'+i['reason'] for i in skipped)
         update=dict(status=status,updated_at=self.clock(),processed_items=count,total_items=total,
             success_count=count,skipped_count=len(skipped),skipped_items=skipped,progress=int(100*finished/total),
             price_adjustment='none' if plan['mode'].endswith('_none') else 'qfq',

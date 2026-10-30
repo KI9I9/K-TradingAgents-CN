@@ -60,6 +60,7 @@ class SyncStats:
     data_sources_used: List[str] = field(default_factory=list)
     source_stats: Dict[str, Dict[str, int]] = field(default_factory=dict)
     message: Optional[str] = None
+    degraded: bool = False
 
 
 class MultiSourceBasicsSyncService:
@@ -168,15 +169,34 @@ class MultiSourceBasicsSyncService:
         return await self._with_inventory(db, {"job": JOB_KEY, "status": "never_run"})
 
     @staticmethod
+    def _normalize_status(stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose old fallback records honestly without rewriting their audit history."""
+        result = dict(stats)
+        if result.get("status") not in {"success", "success_with_errors"}:
+            return result
+        sources = result.get("data_sources_used") or []
+        notices = []
+        if "stock_list:__local_universe__" in sources:
+            notices.append("外部股票列表获取失败，本次沿用本地已有股票资料；不代表已更新上市名单或公司信息")
+        if sources and not any(s.startswith("daily_data:") for s in sources):
+            notices.append("未获取最新每日财务指标，已有指标保留")
+        if notices:
+            result.update(status="success_with_errors", degraded=True, message="；".join(notices) + "。")
+        return result
+
+    @staticmethod
     def _successful_summary(stats: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if stats.get("status") not in {"success", "success_with_errors"}:
+        stats = MultiSourceBasicsSyncService._normalize_status(stats)
+        if stats.get("degraded") or stats.get("status") not in {"success", "success_with_errors"}:
             return None
         fields = ("status", "started_at", "finished_at", "total", "inserted",
                   "updated", "errors", "data_sources_used")
         return {key: stats[key] for key in fields if key in stats}
 
     async def _with_inventory(self, db: AsyncIOMotorDatabase, status: Dict[str, Any]) -> Dict[str, Any]:
-        result = dict(status)
+        result = self._normalize_status(status)
+        if result.get("last_success") and not self._successful_summary(result["last_success"]):
+            result["last_success"] = None
         # One stock may have separate records for several data sources.
         try:
             result["existing_records"] = await db[COLLECTION_NAME].count_documents({}, maxTimeMS=3000)
@@ -198,7 +218,7 @@ class MultiSourceBasicsSyncService:
             "job": JOB_KEY
         }
 
-        values = dict(stats)
+        values = self._normalize_status(stats)
         values.pop("existing_records", None)
         summary = self._successful_summary(stats)
         if summary:
@@ -604,6 +624,10 @@ class MultiSourceBasicsSyncService:
             stats.errors = errors
             stats.status = "success" if errors == 0 else "success_with_errors"
             stats.finished_at = datetime.now().isoformat()
+            normalized = self._normalize_status(stats.__dict__)
+            stats.status = normalized["status"]
+            stats.degraded = normalized.get("degraded", False)
+            stats.message = normalized.get("message")
 
             try:
                 await self._persist_status(db, stats.__dict__.copy())

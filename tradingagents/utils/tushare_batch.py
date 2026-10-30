@@ -217,6 +217,36 @@ class BatchJob:
             s['active']=None;self.gate.write(fd,s)
 
     def perform(self,api,fields,params,operation):
+        # Only raw daily reads can be retried. Every attempt retains its quota debit;
+        # no payload is returned to the writer until the full response is validated.
+        for attempt in range(3):
+            try:
+                return self._perform_once(api, fields, params, operation)
+            except TushareEgressStopped as error:
+                if error.reason != 'timeout' or api != 'daily' or attempt == 2:
+                    raise
+                with self.gate.locked() as fd:
+                    p,s = self.gate.read(fd)
+                    if (p['schema'] != 2 or self.gate.stopped(fd)
+                            or s['phase'] != 'blocked' or s['reason'] != 'timeout'
+                            or s['active'] is None or s['active']['id'] != self.identity
+                            or s['active']['sent'] != ['daily']):
+                        raise
+                    evidence = dict(plan_sha256=s['plan']['plan_sha256'], active=s['active'],
+                                    used=s['used'], days=s['days'], last_time=s['last_time'],
+                                    reason=s['reason'], api_code=s['api_code'])
+                    name = 'retry-' + self.identity + '-' + str(attempt + 1) + '.json'
+                    out = os.open(name, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600, dir_fd=fd)
+                    with os.fdopen(out, 'w') as stream:
+                        json.dump(evidence, stream, sort_keys=True)
+                        stream.flush(); os.fsync(stream.fileno())
+                    os.fsync(fd)
+                    s['active']['sent'] = []
+                    s.update(phase='ready', reason='none', api_code=None)
+                    self.gate.write(fd,s)
+                time.sleep(2 ** (attempt + 1))
+
+    def _perform_once(self,api,fields,params,operation):
         require(api in ('daily','adj_factor') and fields==''
                 and not set(params)-{'ts_code','start_date','end_date','offset','limit','ts_type_name'}
                 and params.get('ts_code')==self.item['code']
@@ -426,5 +456,71 @@ async def activate_generation(policy, collection, *, registry=REGISTRY, legacy=D
     except BaseException:
         if created is not None and created.directory.is_dir(): created.stop()
         raise
+    finally:
+        os.close(fd)
+
+
+async def recover_raw_timeout(gate, collection, *, expected_plan, expected_used):
+    """Explicit operator recovery of a stopped read timeout; never an HTTP reset.
+
+    Caller must back up the database and journal first. No data writes or provider
+    calls occur here. A crash leaves STOP in place and an immutable recovery record.
+    """
+    from deploy.history_batch_journal import Workspace, _atomic, _sync_dir
+    from deploy.history_batch_adapters import HistoricalAdapter
+    fd = os.open(gate.admission_path, os.O_RDWR|os.O_NOFOLLOW)
+    try:
+        _private_fd(fd)
+        try: fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise TushareEgressStopped('busy') from None
+        gate.assert_selected()
+        workspace = Workspace(gate.directory/'runs')
+        with workspace.locked(), gate.locked() as gate_fd:
+            p,s = gate.read(gate_fd)
+            require(gate.stopped(gate_fd) and p['schema'] == 2
+                    and s['phase'] == 'blocked' and s['reason'] == 'timeout'
+                    and s['api_code'] is None and s['used'] == expected_used
+                    and s['plan'] is not None and s['plan']['plan_sha256'] == expected_plan
+                    and s['active'] is not None and s['active']['sent'] == ['daily'],
+                    'previous_attempt_incomplete')
+            now = time.time()
+            require(s['last_time'] <= now < p['expires_at'], 'expired')
+            day = datetime.fromtimestamp(now, BJ).date().isoformat()
+            require(s['used'] < p['max_requests'] and s['days'].get(day,0) < p['daily_requests'], 'budget_exhausted')
+            workspace._not_stopped()
+            folder,plan,states = workspace._load(expected_plan)
+            require(plan == s['plan'], 'state_invalid')
+            active = s['active']
+            require([c for c,v in states.items() if v['phase']=='fetching'] == [active['code']],
+                    'previous_attempt_incomplete')
+            adapter = HistoricalAdapter(collection,None,None,None,None,price_adjustment='none')
+            for item in plan['items']:
+                saved = states[item['code']]
+                if saved['phase'] == 'skipped':
+                    continue
+                if saved['phase'] == 'committed':
+                    require(await adapter.matches(item,saved['payload']), 'write_outcome_unresolved')
+                else:
+                    require(saved['phase'] in ('pending','fetching'), 'write_outcome_unresolved')
+                    if saved['phase'] == 'fetching':
+                        require(all(active[k] == item[k] for k in ('code','start','end')), 'state_invalid')
+                    require(await adapter.preflight(item) == item['observation_sha256'], 'write_outcome_unresolved')
+            # O_EXCL directory and STOP-last make interrupted recovery fail closed.
+            receipt = gate.directory/('timeout-recovery-' + active['id'])
+            receipt.mkdir(mode=0o700)
+            _sync_dir(gate.directory)
+            _atomic(receipt/'before.json',dict(state=s,item=states[active['code']],
+                    stopped=True,verified_all_items=True,verified_at=now))
+            saved = deepcopy(states[active['code']])
+            saved.update(phase='pending',fetch_attempts=0)
+            _atomic(folder/(active['code']+'.json'),saved)
+            s.update(active=None,phase='ready',reason='none',api_code=None)
+            gate.write(gate_fd,s)
+            _atomic(receipt/'ready.json',dict(plan_sha256=expected_plan,used=s['used'],
+                    days=s['days'],resume_code=active['code']))
+            gate.assert_selected()
+            os.unlink('STOP',dir_fd=gate_fd)
+            os.fsync(gate_fd)
+            return dict(plan_sha256=expected_plan,used=s['used'],resume_code=active['code'],receipt=str(receipt))
     finally:
         os.close(fd)
