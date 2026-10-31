@@ -4,6 +4,7 @@ This is a bounded acceptance candidate, not an unlimited production grant.
 Only an explicitly provisioned permit can authorize a request; failures latch.
 """
 from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import http.client
 import json
@@ -11,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import select
 import socket
 import ssl
 import stat
@@ -242,16 +244,23 @@ class UnixTLSConnection(http.client.HTTPSConnection):
         self._socket_lock = threading.Lock()
         self._active = None
         self._watchdog = None
+        self._watchdog_id = 0
+        self._closed = False
+        self._created_at = time.monotonic()
+        self._completed_requests = 0
+        self._reading_headers = False
 
     def _adopt(self, sock):
         with self._socket_lock:
-            if self._expired.is_set():
+            if self._expired.is_set() or self._closed:
                 sock.close()
                 raise TimeoutError()
             self._active = sock
 
-    def _expire(self):
+    def _expire(self, watchdog_id=None):
         with self._socket_lock:
+            if watchdog_id is not None and watchdog_id != self._watchdog_id:
+                return
             self._expired.set()
             if self._active is not None:
                 try:
@@ -260,13 +269,38 @@ class UnixTLSConnection(http.client.HTTPSConnection):
                     pass
                 self._active.close()
 
+    def begin_request(self):
+        """A fresh total deadline for an explicitly authorized HTTP attempt."""
+        with self._socket_lock:
+            if self._closed:
+                raise TushareEgressStopped('network_failed')
+            if self._expired.is_set():
+                raise TimeoutError()
+            self._watchdog_id += 1
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+            self._watchdog = threading.Timer(
+                self._duration, self._expire, args=(self._watchdog_id,))
+            self._watchdog.daemon = True
+            self._watchdog.start()
+            if self._active is not None:
+                self._active.settimeout(self._duration)
+
+    def finish_request(self):
+        with self._socket_lock:
+            if self._expired.is_set():
+                raise TimeoutError()
+            self._watchdog_id += 1  # A cancelled callback cannot expire the next request.
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+                self._watchdog = None
+            self._completed_requests += 1
+
     def connect(self):
         if self._attempted or self._tunnel_host:
             raise TushareEgressStopped('network_failed')
         self._attempted = True
-        self._watchdog = threading.Timer(self._duration, self._expire)
-        self._watchdog.daemon = True
-        self._watchdog.start()
+        self.begin_request()
         raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._adopt(raw)
         raw.settimeout(min(5, self._duration))
@@ -277,14 +311,125 @@ class UnixTLSConnection(http.client.HTTPSConnection):
         secure.settimeout(self._duration)
         secure.do_handshake()
 
+    def getresponse(self):
+        self._reading_headers = True
+        try:
+            return super().getresponse()
+        finally:
+            self._reading_headers = False
+
     def close(self):
-        if self._watchdog is not None:
-            self._watchdog.cancel()
+        if self._reading_headers:
+            # HTTPConnection detaches a Connection: close socket as soon as
+            # headers arrive. The response still owns its file descriptor;
+            # retain the watchdog/active handle until its body has been read.
+            super().close()
+            return
+        self.abort()
+
+    def abort(self):
         with self._socket_lock:
+            self._closed = True
+            self._watchdog_id += 1
+            if self._watchdog is not None:
+                self._watchdog.cancel()
+                self._watchdog = None
             if self._active is not None:
+                try:
+                    self._active.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 self._active.close()
                 self._active = None
             super().close()
+
+
+_HISTORY_SESSION = ContextVar('tushare_history_connection_session', default=None)
+
+
+class _HistoryConnectionSession:
+    """One worker's connection, never its authorization or retry policy.
+
+    Context propagation shares this object with asyncio.to_thread. The request
+    slot rejects concurrency; close can interrupt a cancelled worker without
+    waiting for that slot. Credentials only identify the in-memory cache key.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._slot = threading.Lock()
+        self._cached = self._active = self._key = None
+        self._last_used = 0
+        self._closed = False
+
+    @contextmanager
+    def request_slot(self):
+        if not self._slot.acquire(blocking=False):
+            raise TushareEgressStopped('busy')
+        try:
+            yield
+        finally:
+            self._slot.release()
+
+    def checkout(self, key):
+        with self._lock:
+            if self._closed:
+                raise TushareEgressStopped('disabled')
+            conn, self._cached = self._cached, None
+            same_key = self._key == key
+            self._key = key
+            idle = time.monotonic() - self._last_used
+        if conn is not None:
+            try:
+                reusable = (same_key and idle < 5
+                    and time.monotonic() - conn._created_at < 120
+                    and conn._completed_requests < 64 and conn.sock is not None
+                    and not conn.sock.pending()
+                    and not select.select([conn.sock], [], [], 0)[0])
+                if reusable:
+                    return conn
+            except (OSError, ValueError):
+                pass
+            conn.close()
+        return None
+
+    def activate(self, conn):
+        with self._lock:
+            if self._closed:
+                raise TushareEgressStopped('disabled')
+            self._active = conn
+
+    def retain(self, conn):
+        with self._lock:
+            if self._closed:
+                return False
+            self._cached, self._active = conn, None
+            self._last_used = time.monotonic()
+            return True
+
+    def deactivate(self, conn):
+        with self._lock:
+            if self._active is conn:
+                self._active = None
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            connections = {c for c in (self._cached, self._active) if c is not None}
+            self._cached = self._active = self._key = None
+        for conn in connections:
+            conn.abort()
+
+
+@contextmanager
+def history_transport_session():
+    """Opt in only for one history worker; every query still enters its gate."""
+    session = _HistoryConnectionSession()
+    token = _HISTORY_SESSION.set(session)
+    try:
+        yield session
+    finally:
+        _HISTORY_SESSION.reset(token)
+        session.close()
 
 
 class MainlandTransport:
@@ -319,12 +464,31 @@ class MainlandTransport:
         return self._permit.perform(api_name, lambda: self._send(api_name, body))
 
     def _send(self, api_name, body):
+        session = _HISTORY_SESSION.get()
+        if session is not None:
+            with session.request_slot():
+                return self._send_request(api_name, body, session)
+        return self._send_request(api_name, body)
+
+    def _send_request(self, api_name, body, session=None):
         conn = None
+        owned = None
         try:
-            conn = UnixTLSConnection(self._timeout)
-            conn.connect()
+            if session is not None:
+                conn = session.checkout((self._token, self._timeout))
+            reused = conn is not None
+            if conn is None:
+                conn = UnixTLSConnection(self._timeout)
+            owned = conn
+            if session is not None:
+                session.activate(conn)
+            if reused:
+                conn.begin_request()
+            else:
+                conn.connect()
             conn.request('POST', '/dataapi/'+api_name, body=body, headers={
-                'Content-Type':'application/json', 'Accept':'*/*', 'Connection':'close'})
+                'Content-Type':'application/json', 'Accept':'*/*',
+                'Connection':'keep-alive' if session is not None else 'close'})
             response = conn.getresponse()
             if 300 <= response.status < 400:
                 raise TushareEgressStopped('redirect_blocked')
@@ -351,6 +515,12 @@ class MainlandTransport:
                     or not isinstance(table.get('items'), list)
                     or not all(isinstance(row, list) and len(row) == len(table['fields']) for row in table['items'])):
                 raise TushareEgressStopped('response_invalid')
+            if (session is not None and response.version == 11
+                    and not response.will_close and response.isclosed()
+                    and conn.sock is not None):
+                conn.finish_request()
+                if session.retain(conn):
+                    conn = None  # The worker scope now owns the idle connection.
             return table
         except TushareEgressStopped:
             raise
@@ -364,5 +534,7 @@ class MainlandTransport:
         except Exception:
             raise TushareEgressStopped('response_invalid') from None
         finally:
+            if session is not None:
+                session.deactivate(owned)
             if conn is not None:
                 conn.close()

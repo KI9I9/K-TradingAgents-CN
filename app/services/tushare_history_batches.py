@@ -10,7 +10,7 @@ import os
 
 from fastapi import HTTPException
 from tradingagents.utils.tushare_batch import BatchGate, DIRECTORY, selected_gate
-from tradingagents.utils.tushare_egress import TushareEgressStopped, _private_fd
+from tradingagents.utils.tushare_egress import TushareEgressStopped, _private_fd, history_transport_session
 from deploy.history_batch_journal import Workspace, BatchStopped
 from deploy.history_batch_adapters import Inventory, HistoricalAdapter
 from deploy.history_sync_plan import build_plan, PlanError
@@ -168,11 +168,12 @@ class HistoryBatchService:
         try:
             async def progress(result):
                 await self._progress(execution_id,result,'running',plan)
-            while True:
-                result=await self.workspace.advance_async(identity,adapter,max_items=10000,on_progress=progress)
-                await self._progress(execution_id,result,('partial' if (result.get('skipped') or any(o['reason']!='no_daily_rows' for o in result.get('outcomes',[]))) else 'success') if result['complete'] else 'running',plan)
-                if result['complete']:break
-                await asyncio.sleep(0)
+            with history_transport_session():
+                while True:
+                    result=await self.workspace.advance_async(identity,adapter,max_items=10000,on_progress=progress)
+                    await self._progress(execution_id,result,('partial' if (result.get('skipped') or any(o['reason']!='no_daily_rows' for o in result.get('outcomes',[]))) else 'success') if result['complete'] else 'running',plan)
+                    if result['complete']:break
+                    await asyncio.sleep(0)
         except BaseException as error:
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted'
             try:

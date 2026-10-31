@@ -46,6 +46,36 @@ class BasicTierTests(ButtonTests):
         self.provider.api.daily.side_effect=daily
         self.sdk.pro_bar.side_effect=AssertionError('Basic account must never request pro_bar')
 
+    async def test_history_worker_owns_and_closes_transport_session(self):
+        from tradingagents.utils import tushare_egress as transport
+        sessions = []
+        async def factory():
+            session = transport._HISTORY_SESSION.get()
+            self.assertIsNotNone(session)
+            sessions.append(session)
+            return self.provider
+        self.factory.side_effect = factory
+        await self.service.submit()
+        await asyncio.gather(*list(button._TASKS))
+        self.assertTrue(sessions)
+        self.assertTrue(all(s._closed for s in sessions))
+        self.assertIsNone(transport._HISTORY_SESSION.get())
+
+    async def test_failed_history_worker_also_closes_transport_session(self):
+        from tradingagents.utils import tushare_egress as transport
+        sessions = []
+        async def factory():
+            sessions.append(transport._HISTORY_SESSION.get())
+            return self.provider
+        self.factory.side_effect = factory
+        self.send_failure = transport.TushareEgressStopped('timeout')
+        with patch.object(gate_module.time, 'sleep'):
+            await self.service.submit()
+            await asyncio.gather(*list(button._TASKS))
+        self.assertTrue(sessions)
+        self.assertTrue(all(s is not None and s._closed for s in sessions))
+        self.assertTrue((self.gate.directory/'STOP').exists())
+
     async def test_timeout_retry_charges_every_attempt(self):
         from tradingagents.utils.tushare_egress import TushareEgressStopped
         p,s = self.gate.status()
