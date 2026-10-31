@@ -16,7 +16,7 @@ REMOTE=r'''
 import pathlib,json,sys,types,hashlib
 from bson import BSON,decode_all
 from pymongo import MongoClient
-r=json.load(sys.stdin);root=pathlib.Path('/app/runtime/history-http-reuse-recovery-20261101-v1')
+r=json.load(sys.stdin);root=pathlib.Path('/app/runtime/history-http-reuse-recovery-20261101-v2')
 manifest=json.loads((root/'backup-manifest.json').read_text())
 assert manifest['used']==2298 and manifest['plan']=='44ae01f972073cd2d6ec5167e8d35e15793365392480572c541cac7efaa7e1c4','backup_identity_changed'
 rt=types.ModuleType('runtime');exec(r['runtime'],rt.__dict__)

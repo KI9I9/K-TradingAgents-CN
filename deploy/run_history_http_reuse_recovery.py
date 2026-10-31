@@ -14,11 +14,11 @@ import subprocess
 import time
 
 import run_history_tls_recovery as previous
-from prepare_history_http_reuse import REPO, RELEASE, ROOT as SWITCH, EVIDENCE
+from prepare_history_http_reuse import REPO, RELEASE, ROOT as SWITCH, EVIDENCE, PREFLIGHT
 from query_quote_guard_jobs import read_auth
 
-ROOT = '/home/ubuntu/k-tradingagents-history-http-reuse-recovery-20261101-v1'
-BACKUP = '/app/runtime/history-http-reuse-recovery-20261101-v1'
+ROOT = '/home/ubuntu/k-tradingagents-history-http-reuse-recovery-20261101-v2'
+BACKUP = '/app/runtime/history-http-reuse-recovery-20261101-v2'
 LAUNCH = previous.LAUNCH.replace(previous.ROOT, ROOT).replace(
     '/home/ubuntu/k-tradingagents-sync-fix-v1-20261030', SWITCH).replace(
     'deployed_sync_fix_gate_stopped', 'deployed_http_reuse_gate_stopped')
@@ -28,7 +28,7 @@ STATUS = previous.STATUS.replace(previous.ROOT, ROOT)
 
 def package():
     manifest = json.loads((RELEASE / 'manifest.json').read_text())
-    fresh = json.loads((EVIDENCE / 'history-http-reuse-preflight.json').read_text())
+    fresh = json.loads(PREFLIGHT.read_text())
     hashes = fresh['modules'] | {f['target']: f['sha256'] for f in manifest['files']}
     core = (REPO / 'deploy/history_timeout_recovery.py').read_text()
     tls = (REPO / 'deploy/history_tls_recovery.py').read_text()

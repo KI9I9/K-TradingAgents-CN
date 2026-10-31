@@ -15,8 +15,9 @@ import time
 
 REPO = Path(__file__).resolve().parents[1]
 EVIDENCE = Path('/home/ubuntu/quote-guard-releases/production-20261028')
-RELEASE = Path('/home/ubuntu/quote-guard-releases/history-http-reuse-v1-20261101')
-ROOT = '/home/ubuntu/k-tradingagents-history-http-reuse-v1-20261101'
+RELEASE = Path('/home/ubuntu/quote-guard-releases/history-http-reuse-v2-20261101')
+ROOT = '/home/ubuntu/k-tradingagents-history-http-reuse-v2-20261101'
+PREFLIGHT = EVIDENCE / 'history-http-reuse-v2-preflight.json'
 FILES = ('tradingagents/utils/tushare_egress.py', 'app/services/tushare_history_batches.py')
 
 
@@ -58,7 +59,9 @@ def save(name,value,mode=0o600):
  p=root/name;p.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
  raw=value if isinstance(value,bytes) else json.dumps(value,indent=2).encode()
  fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
- with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ with os.fdopen(fd,'wb') as f:
+  f.write(raw);f.flush();os.fchmod(f.fileno(),mode);os.fsync(f.fileno())
+ assert (p.stat().st_mode & 0o777)==mode,'saved_mode_mismatch'
  assert p.read_bytes()==raw,'backup_readback_failed'
 def run(argv,data=None):return subprocess.check_output(argv,input=data,text=True,timeout=50)
 def sha(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -112,6 +115,16 @@ try:
  save('staged/manifest.json',r['manifest'],0o644)
  members={str(p.relative_to(stage)):hashlib.sha256(p.read_bytes()).hexdigest() for p in stage.rglob('*') if p.is_file()}
  save('staged/SHA256SUMS',''.join(h+'  '+p+'\n' for p,h in sorted(members.items())).encode(),0o644)
+ # A root-readable hash is insufficient: the application runs as appuser.
+ # Verify the actual staged bind in a disposable, disconnected process with
+ # the configured identity; never mount secrets, runtime or database volumes.
+ access_code="import pathlib,hashlib,json,os; expected="+repr({p:e['sha256'] for p,e in r['files'].items()})+"; assert {p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in expected}==expected; [compile(pathlib.Path(p).read_bytes(),p,'exec') for p in expected]; print(json.dumps({'readable':True,'uid':os.geteuid(),'gid':os.getegid()}))"
+ access=['docker','run','--rm','--network','none','--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','128m','--cpus','1','--pids-limit','32','--log-driver','none','--user',i['Config']['User'],'--entrypoint','python3']
+ for target in r['files']:
+  access+=['--mount','type=bind,source='+str(stage/target.removeprefix('/app/'))+',target='+target+',readonly']
+ access+=[i['Image'],'-B','-c',"import signal; signal.signal(signal.SIGALRM,lambda *_: __import__('os')._exit(124)); signal.alarm(10); "+access_code]
+ readable=json.loads(run(access));assert readable['readable'] is True,'candidate_not_readable'
+ save('candidate-access.json',readable)
  result.update(ok=True,stage='prepared_no_switch',chain=chain,image_id=i['Image'],backend_id=i['Id'],old_sources=old_sources,
      config_hashes=dict(before=sha(before),after=sha(after)),modules=b['modules'],generation_tree_sha256=b['generation_tree_sha256'],state=b['state'],db=db,
      checksums_sha256=hashlib.sha256((stage/'SHA256SUMS').read_bytes()).hexdigest(),package_sha256=sha(r))
@@ -153,6 +166,7 @@ def package():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--action', choices=['freeze', 'prepare', 'status'], required=True)
+    parser.add_argument('--control-socket', type=Path)
     args = parser.parse_args()
     os.umask(0o077)
     if args.action == 'freeze':
@@ -178,7 +192,7 @@ def main():
                               source_head=request['manifest']['source_head'], mounts='39->40')))
         return
     data = (RELEASE / 'package.json').read_text() if args.action == 'prepare' else None
-    cmd = ['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config', '-S', 'none', '-C',
+    cmd = ['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config', '-S', str(args.control_socket) if args.control_socket else 'none', '-C',
            '-o', 'BatchMode=yes', '-o', 'IPQoS=none', '-o', 'ConnectTimeout=25', 'osaka-migration',
            'sudo -n python3 -B -c ' + shlex.quote(REMOTE if data else STATUS)]
     prefix = EVIDENCE / ('history-http-prepare-' + args.action + '-' + str(time.time_ns()))
@@ -193,7 +207,7 @@ def main():
     prefix.with_suffix('.json').write_text(json.dumps(result, indent=2))
     report = result.get('result') if args.action == 'status' else result
     if report and report.get('ok'):
-        target = EVIDENCE / 'history-http-reuse-preflight.json'
+        target = PREFLIGHT
         if target.exists():
             assert json.loads(target.read_text()) == report, 'preflight_evidence_changed'
         else:

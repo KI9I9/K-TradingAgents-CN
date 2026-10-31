@@ -1,5 +1,6 @@
 """Exercise the generated controller's switch/failure/rollback branches offline."""
 import json
+import hashlib
 import tempfile
 from pathlib import Path
 import unittest
@@ -82,6 +83,26 @@ class SwitchTests(unittest.TestCase):
             ns['check_running'](new)
             with self.assertRaisesRegex(RuntimeError, 'mount_count_mismatch'):
                 ns['check_running'](not new)
+
+    def test_unreadable_stage_refused_before_any_backend_operation(self):
+        ns = {'__name__': 'offline_preflight'}
+        exec(compile(controller(), '<frozen-controller>', 'exec'), ns)
+        stage = Path(self.directory.name) / 'staged'
+        stage.mkdir()
+        module = stage / 'worker.py'
+        module.write_bytes(b'pass\n')
+        checksums = stage / 'SHA256SUMS'
+        checksums.write_text(hashlib.sha256(module.read_bytes()).hexdigest() + '  worker.py\n')
+        ns.update(STAGED=stage, PAYLOAD={'checksums_sha256': hashlib.sha256(checksums.read_bytes()).hexdigest()})
+        def first_external_operation():
+            raise RuntimeError('reached_backend_inspect')
+        ns['inspect'] = first_external_operation
+        module.chmod(0o600)
+        with self.assertRaisesRegex(RuntimeError, 'staged_file_mode_changed'):
+            ns['preflight']()
+        module.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, 'reached_backend_inspect'):
+            ns['preflight']()
 
 
 if __name__ == '__main__':

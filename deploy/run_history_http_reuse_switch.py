@@ -14,7 +14,7 @@ import subprocess
 import time
 
 import run_history_basic_switch as prior
-from prepare_history_http_reuse import RELEASE, ROOT, EVIDENCE, REPO, db_probe
+from prepare_history_http_reuse import RELEASE, ROOT, EVIDENCE, REPO, PREFLIGHT, db_probe
 from query_quote_guard_jobs import read_auth
 
 base = prior.base
@@ -47,6 +47,9 @@ def controller():
     require(set(allowed['backend']) == {'/app/tradingagents/utils/tushare_egress.py'}, 'unexpected_new_bind')
 ''' + code[end:]
     code = code.replace("'backend_mounts': 39,", "'backend_mounts': 40,")
+    marker = "        require(not (STAGED / name).is_symlink() and digest((STAGED / name).read_bytes()) == sha, 'staged_file_changed')"
+    assert code.count(marker) == 1
+    code = code.replace(marker, marker + "\n        require(((STAGED / name).stat().st_mode & 0o777) == 0o644, 'staged_file_mode_changed')")
     # Keep the transport/worker pair installed together before importing services.
     marker = "        smoke()\n"
     assert code.count(marker) == 1
@@ -58,7 +61,7 @@ def controller():
 
 def payload(check_only, credentials):
     p = previous_payload(check_only, credentials)
-    fresh = json.loads((EVIDENCE / 'history-http-reuse-preflight.json').read_text())
+    fresh = json.loads(PREFLIGHT.read_text())
     assert fresh['ok'] and fresh['stage'] == 'prepared_no_switch'
     assert p['checksums_sha256'] == fresh['checksums_sha256'], 'stage_differs_from_frozen_package'
     p.update(expected_chain=fresh['chain'], config_hashes=fresh['config_hashes'], image_id=fresh['image_id'],
