@@ -13,7 +13,6 @@ import shlex
 import subprocess
 import time
 
-import query_history_market_progress as progress
 from tushare_port_trial_support import RULE, SOURCE, remote_cleanup
 
 REPO = Path(__file__).resolve().parents[1]
@@ -35,6 +34,19 @@ for value in (
     'ClientAliveInterval=30', 'ClientAliveCountMax=3',
 ):
     OPTIONS += ['-o', value]
+
+INVENTORY = r'''
+import json,sys,types,pathlib
+from pymongo import MongoClient
+rt=types.ModuleType('runtime');exec(json.load(sys.stdin),rt.__dict__)
+e,_=rt.reconstruct('/app/deploy/migration_production_entrypoint.py','d75d2ac13363b5b46284684d39c05c22c79886903174a0e09552175537ecf82b','/run/secrets')
+registry=pathlib.Path('/app/runtime/tushare-history-generations')
+active=json.loads((registry/'active.json').read_text());d=registry/active['generation'];s=json.loads((d/'state.json').read_text())
+c=MongoClient(host=e['MONGODB_HOST'],port=int(e['MONGODB_PORT']),username=e['MONGODB_USERNAME'],password=e['MONGODB_PASSWORD'],authSource=e.get('MONGODB_AUTH_SOURCE','admin'),retryWrites=False,retryReads=False,serverSelectionTimeoutMS=5000,socketTimeoutMS=10000)
+b=c[e['MONGODB_DATABASE']];q={'data_source':'tushare'}
+print('MARKET_PROGRESS:'+json.dumps(dict(generation=str(d),stopped=(d/'STOP').exists(),phase=s['phase'],reason=s['reason'],used=s['used'],active=s['active'],permit_plan=s['plan']['plan_sha256'],raw_history_count=b.stock_daily_quotes_unadjusted.count_documents(q),history_count=b.stock_daily_quotes.count_documents(q),running_jobs=b.scheduler_executions.count_documents({'job_id':{'$regex':'^tushare_'},'status':{'$in':['running','cancelling']}}))))
+c.close()
+'''
 
 REMOTE = r'''
 import json,sys,subprocess,pathlib,hashlib,os,time,stat
@@ -92,8 +104,11 @@ run(base+['-t'])
 effective=run(base+['-T','-C','user=ta-tushare-in,host=localhost,addr=127.0.0.1'])
 assert hashlib.sha256(effective.encode()).hexdigest()==r['expected'],'effective_config_changed'
 # Read-only inventory. No login or scheduler API call occurs.
+previous=json.loads(pathlib.Path('/home/ubuntu/k-tradingagents-history-timeout-recovery-20261031-v3/package.json').read_text())
+runtime=previous['request']['runtime_tool']
+assert hashlib.sha256(runtime.encode()).hexdigest()==r['runtime_sha256'],'runtime_tool_changed'
 p=subprocess.run(['docker','exec','-i','ta-live-088a60b962bf-backend-1','python3','-B','-c',r['inventory_code']],
-    input=json.dumps({'runtime':r['runtime']}),capture_output=True,text=True,timeout=30)
+    input=json.dumps(runtime),capture_output=True,text=True,timeout=30)
 assert p.returncode==0,'inventory_query_failed'
 rows=[x.split(':',1)[1] for x in p.stdout.splitlines() if x.startswith('MARKET_PROGRESS:')]
 assert len(rows)==1,'inventory_output'
@@ -191,8 +206,6 @@ def main():
         raise SystemExit('v1_consumed: status/stop only')
     if args.action == 'start' and subprocess.check_output(['git','status','--porcelain'],cwd=REPO):
         raise SystemExit('commit_operator_before_start')
-    inventory = progress.REMOTE.replace("q={'data_source':'tushare'}", "q={'data_source':'tushare'}\nrunning_jobs=db.scheduler_executions.count_documents({'job_id':{'$regex':'^tushare_'},'status':{'$in':['running','cancelling']}})")
-    inventory = inventory.replace('dict(generation=', 'dict(running_jobs=running_jobs,permit_plan=s["plan"]["plan_sha256"],generation=')
     root=ROOT.replace('-v1','-'+args.run);unit=UNIT.replace('-v1','-'+args.run)
     cleanup_unit='ta-tushare-ssh443-firewall-cleanup-20261031-'+args.run
     request = dict(action=args.action,root=root,unit=unit,options=OPTIONS,expected=EXPECTED,
@@ -202,7 +215,7 @@ def main():
                    operator_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
                    operator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     if args.action=='start':
-        request.update(inventory_code=inventory,runtime=(REPO/'deploy/quote_guard_runtime.py').read_text())
+        request.update(inventory_code=INVENTORY,runtime_sha256=hashlib.sha256((REPO/'deploy/quote_guard_runtime.py').read_bytes()).hexdigest())
     elif args.action=='status':
         request.pop('cleanup_code')
     command = ['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
