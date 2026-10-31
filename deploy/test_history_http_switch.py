@@ -1,0 +1,88 @@
+"""Exercise the generated controller's switch/failure/rollback branches offline."""
+import json
+import tempfile
+from pathlib import Path
+import unittest
+
+from run_history_http_reuse_switch import controller
+
+
+class SwitchTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.ns = {'__name__': 'offline_controller'}
+        exec(compile(controller(), '<frozen-controller>', 'exec'), self.ns)
+        self.events, self.actions = [], []
+        self.ns.update(PAYLOAD={'check_only': False}, MANIFEST={'source_head': 'synthetic'}, STATE={},
+                       ATTEMPT=Path(self.directory.name))
+        self.ns['event'] = self.events.append
+        self.ns['save'] = lambda *_: None
+        for name in ('preflight', 'seal_check', 'module_hashes', 'protected_check', 'audit', 'smoke', 'ingress_probe', 'check_running'):
+            self.ns[name] = lambda *_, **kw: None
+        self.ns['stop_backend'] = lambda: self.actions.append('stop')
+        self.ns['up'] = lambda new: self.actions.append(('up', new))
+        self.ns['healthy'] = lambda: None
+        self.ns['in_backend'] = lambda _: 'IMPORT_OK\n'
+        self.ns['db_probe'] = lambda _: {'hashes': {'synthetic': 'unchanged'}, 'preferences': []}
+        self.ns['api_probe'] = lambda *_, **kw: {'index': 'same'}
+        (Path(self.directory.name) / 'frontend-before.json').write_text(json.dumps({'index': 'same'}))
+        self.ns['config'] = lambda _: {'synthetic': 'original'}
+        self.ns['PAYLOAD']['config_hashes'] = {'before': self.ns['digest'](self.ns['canonical']({'synthetic': 'original'}))}
+
+    def test_success_installs_once_and_does_not_run_recovery(self):
+        self.assertEqual(self.ns['main'](), 0)
+        self.assertEqual(self.actions, ['stop', ('up', True)])
+        self.assertEqual(self.events[-1], 'complete')
+
+    def test_preflight_only_never_stops_application(self):
+        self.ns['PAYLOAD']['check_only'] = True
+        self.assertEqual(self.ns['main'](), 0)
+        self.assertEqual(self.actions, [])
+
+    def test_import_failure_restores_original_compose_chain(self):
+        self.ns['in_backend'] = lambda _: 'IMPORT_FAILED'
+        self.assertEqual(self.ns['main'](), 1)
+        self.assertEqual(self.actions, ['stop', ('up', True), 'stop', ('up', False)])
+        self.assertEqual(self.events[-1], 'rolled_back_history_release')
+
+    def test_changed_data_fails_acceptance_and_rolls_back_application(self):
+        self.ns['db_probe'] = lambda name: {'hashes': {'synthetic': 'changed' if name == 'db-after.json' else 'unchanged'}, 'preferences': []}
+        self.assertEqual(self.ns['main'](), 1)
+        self.assertEqual(self.ns['STATE']['failure_code'], 'guarded_business_content_changed')
+        self.assertEqual(self.actions[-1], ('up', False))
+
+    def test_failed_rollback_requests_backend_stop(self):
+        def fail():
+            raise RuntimeError('synthetic_health_failure')
+        self.ns['healthy'] = fail
+        self.assertEqual(self.ns['main'](), 1)
+        self.assertEqual(self.events[-1], 'rollback_failed_stop_requested')
+        self.assertEqual(self.actions[-1], 'stop')
+
+    def test_no_downtime_if_backup_fails(self):
+        def fail():
+            raise RuntimeError('synthetic_backup_failure')
+        self.ns['preflight'] = fail
+        self.assertEqual(self.ns['main'](), 1)
+        self.assertEqual(self.actions, [])
+
+    def test_running_mount_count_depends_on_release(self):
+        # Run the real check_running function, bypassing only external Docker IO.
+        ns = {'__name__': 'offline_running'}
+        exec(compile(controller(), '<frozen-controller>', 'exec'), ns)
+        cfg = {'services': {'backend': {'image': 'synthetic-image'}}}
+        h = ns['digest'](ns['canonical'](cfg))
+        ns.update(PAYLOAD={'config_hashes': {'before': h, 'after': h}, 'image_id': 'synthetic-id'})
+        ns['config'] = lambda _: cfg
+        ns['run'] = lambda _: '[{}]'
+        ns['VERIFY'] = type('Verifier', (), {'compare_running': staticmethod(lambda *_: [])})
+        for new, count in ((False, 39), (True, 40)):
+            ns['inspect'] = lambda count=count: {'Image': 'synthetic-id', 'Mounts': [None] * count}
+            ns['check_running'](new)
+            with self.assertRaisesRegex(RuntimeError, 'mount_count_mismatch'):
+                ns['check_running'](not new)
+
+
+if __name__ == '__main__':
+    unittest.main()
