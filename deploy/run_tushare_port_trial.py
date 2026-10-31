@@ -153,6 +153,34 @@ except BaseException as e:
 print(json.dumps(status()))
 '''
 
+# Recovery/status must not resend the inventory tool or the full startup body
+# over a congested management connection.
+SMALL_REMOTE = r'''
+import json,sys,subprocess,pathlib
+r=json.load(sys.stdin);root=pathlib.Path(r['root']);unit=r['unit']
+if r['action']=='stop':
+    if r['firewall']:
+        p=subprocess.run(['python3','-B','-c',r['cleanup_code']],capture_output=True,text=True,timeout=65)
+        assert p.returncode==0,'cleanup_process_failed'
+        result=json.loads(p.stdout.splitlines()[-1])
+        if result['closed']:subprocess.run(['systemctl','stop',r['cleanup_unit']+'.timer'],capture_output=True,timeout=10)
+    else:subprocess.run(['systemctl','stop',unit],capture_output=True,timeout=15)
+out={'reserved':root.exists()}
+for key,cmd in [('unit',['systemctl','show',unit,'-p','ActiveState','-p','MainPID','-p','RuntimeMaxUSec','-p','KillMode']),('listener',['ss','-H','-ltnp','sport','=',':443'])]:
+    p=subprocess.run(cmd,capture_output=True,text=True,timeout=5)
+    out[key]=dict(x.split('=',1) for x in p.stdout.splitlines() if '=' in x) if key=='unit' else p.stdout
+for name in ('manifest.json','result.json'):
+    if (root/name).exists():out[name]=json.loads((root/name).read_text())
+if r['firewall']:
+    p=subprocess.run(['iptables','-w','10','-C','INPUT']+r['rule'],capture_output=True,timeout=15)
+    out['temporary_rule_absent']=p.returncode==1
+    p=subprocess.run(['systemctl','show',r['cleanup_unit']+'.timer','-p','ActiveState','-p','SubState'],capture_output=True,text=True,timeout=5)
+    out['cleanup_timer']=dict(x.split('=',1) for x in p.stdout.splitlines() if '=' in x)
+    receipts=sorted(root.glob('cleanup-*.json'))
+    if receipts:out['cleanup_result']=json.loads(receipts[-1].read_text())
+print(json.dumps(out))
+'''
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -175,20 +203,27 @@ def main():
                    operator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     if args.action=='start':
         request.update(inventory_code=inventory,runtime=(REPO/'deploy/quote_guard_runtime.py').read_text())
+    elif args.action=='status':
+        request.pop('cleanup_code')
     command = ['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
                '-S','none','-C','-o','BatchMode=yes','-o','IPQoS=none',
-               '-o','ConnectTimeout=12','-o','ConnectionAttempts=1',
-               'osaka-migration','sudo -n python3 -B -c '+shlex.quote(REMOTE)+' "$SSH_CONNECTION"']
+               '-o','ConnectTimeout=30','-o','ConnectionAttempts=1',
+               'osaka-migration','sudo -n python3 -B -c '+shlex.quote(REMOTE if args.action=='start' else SMALL_REMOTE)+' "$SSH_CONNECTION"']
     try:
-        p = subprocess.run(command,input=json.dumps(request),capture_output=True,text=True,timeout=90)
+        p = subprocess.run(command,input=json.dumps(request),capture_output=True,text=True,timeout=110)
     except subprocess.TimeoutExpired:
         raise SystemExit('management_timeout: inspect status; never repeat start') from None
     if p.returncode:
+        target=EVIDENCE/('ssh443-trial-'+args.run+'-'+args.action+'-error-'+str(time.time_ns())+'.private')
+        fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as f:f.write(p.stderr)
         # Operator assertions have fixed, non-secret reason identifiers. Avoid
         # exposing arbitrary SSH/Python stderr or silently hiding failed checks.
         reason=re.search(r'AssertionError: ([a-z_]+)\s*$',p.stderr)
         if reason:
             raise SystemExit('preflight_failed:'+reason[1]+'; inspect status before any retry')
+        kind=re.search(r'(?:^|\n)(RuntimeError|KeyError|TypeError|IndexError|SyntaxError):',p.stderr)
+        if kind:raise SystemExit('operator_failed:'+kind[1]+'; inspect status')
         raise SystemExit('management_failed: inspect status; never repeat start')
     result = json.loads(p.stdout)
     target=EVIDENCE/('ssh443-trial-'+args.run+'-'+args.action+'-'+str(time.time_ns())+'.json')
