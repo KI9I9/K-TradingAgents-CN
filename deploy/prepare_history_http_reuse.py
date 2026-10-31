@@ -157,7 +157,9 @@ def main():
     os.umask(0o077)
     if args.action == 'freeze':
         assert not subprocess.check_output(['git', 'status', '--porcelain'], cwd=REPO), 'commit_before_freeze'
-        request = package()
+        # Use the same sorted-key representation the remote JSON loader sees.
+        # Otherwise equivalent manifest objects produce different byte hashes.
+        request = json.loads(json.dumps(package(), sort_keys=True))
         RELEASE.mkdir(mode=0o700)
         (RELEASE / 'package.json').write_text(json.dumps(request, sort_keys=True))
         (RELEASE / 'manifest.json').write_text(json.dumps(request['manifest'], indent=2))
