@@ -146,6 +146,16 @@ class BasicTierTests(ButtonTests):
         self.assertTrue((self.gate.directory/'STOP').exists())
         return dict(expected_plan=state['plan']['plan_sha256'],expected_used=1)
 
+    def test_tls_probe_uses_existing_transport_deadline_and_closes(self):
+        from unittest.mock import call
+        with patch('tradingagents.utils.tushare_egress.UnixTLSConnection') as connection:
+            connection.return_value.sock.version.return_value='TLSv1.2'
+            observations=tls_recovery.verify_fixed_tls()
+            self.assertEqual(connection.call_args_list,[call(30)]*3)
+            self.assertEqual(len(observations),3)
+            self.assertEqual(connection.return_value.connect.call_count,3)
+            self.assertEqual(connection.return_value.close.call_count,3)
+
     async def test_tls_operator_recovery_preserves_budget_and_resumes(self):
         args=await self.stop_for_tls()
         before=self.state();rows=raw_json(self.col.rows)
@@ -171,8 +181,7 @@ class BasicTierTests(ButtonTests):
         args=await self.stop_for_tls()
         before={str(p):p.read_bytes() for p in self.gate.directory.rglob('*') if p.is_file()}
         with patch.object(tls_recovery,'verify_fixed_tls',side_effect=ssl.SSLCertVerificationError('synthetic')):
-            # BatchGate.locked maps OS/SSL errors to its fail-closed IO reason.
-            with self.assertRaisesRegex(RuntimeError,'state_io_failed'):
+            with self.assertRaisesRegex(RuntimeError,'tls_probe_failed:SSLCertVerificationError'):
                 await tls_recovery.recover_raw_tls(self.gate,self.col,**args)
         self.assertEqual(before,{str(p):p.read_bytes() for p in self.gate.directory.rglob('*') if p.is_file()})
 

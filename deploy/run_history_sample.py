@@ -94,11 +94,11 @@ print(json.dumps(out))
 '''
 
 
-def ssh(code, data=None):
+def ssh(code, data=None, *, timeout=60):
     try:
         result = subprocess.run(SSH + ['sudo -n python3 -B -c ' + shlex.quote(code)],
                                 input=json.dumps(data) if data is not None else None,
-                                text=True, capture_output=True, timeout=60)
+                                text=True, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise SystemExit('SSH_TIMEOUT: inspect status; never retry an uncertain sample launch') from None
     if result.returncode:

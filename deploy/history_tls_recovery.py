@@ -20,7 +20,10 @@ def verify_fixed_tls():
     from tradingagents.utils.tushare_egress import UnixTLSConnection
     observations=[]
     for _ in range(3):
-        conn=UnixTLSConnection(10)
+        # Match MainlandTransport's existing request deadline. On this route a
+        # verified handshake can take >10s; do not weaken certificate checks or
+        # increase the application's 30s total request budget.
+        conn=UnixTLSConnection(30)
         start=time.monotonic()
         try:
             conn.connect()
@@ -81,7 +84,12 @@ async def recover_raw_tls(gate, collection, *, expected_plan, expected_used):
                     require(await adapter.preflight(item)==item['observation_sha256'],
                             'write_outcome_unresolved')
             # This isolated operator process holds all locks through the probes.
-            probes=verify_fixed_tls()
+            try:
+                probes=verify_fixed_tls()
+            except OSError as error:
+                # Gate.locked normalizes OSError (including SSL errors) to
+                # state_io_failed. Preserve the probe stage and safe class name.
+                raise RuntimeError('tls_probe_failed:'+type(error).__name__) from None
             now=check_budget()
             gate.assert_selected()
             receipt=gate.directory/('tls-recovery-'+active['id'])

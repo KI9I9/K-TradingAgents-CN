@@ -41,7 +41,7 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
         RUN=Path(run_directory)
     os.umask(0o077)
     gate=None;client=None;reserved=False
-    report=dict(status='failed',trigger_sent=False,new_gate_stopped=True)
+    report=dict(status='failed',stage='preflight',trigger_sent=False,new_gate_stopped=True)
     try:
         require(expected_reason in ('timeout','tls_failed')
                 and (expected_reason=='timeout' or recoverer is not None),'invalid_recovery_reason')
@@ -76,6 +76,7 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
         login=http('/api/auth/login',r['auth']);require(login.get('success') is True,'auth_failed')
         token=login['data']['access_token']
         RUN.mkdir(mode=0o700);reserved=True
+        report['stage']='backup'
         hashes={};before={}
         for name,expected in [('stock_daily_quotes',2112),('stock_daily_quotes_unadjusted',raw_count)]:
             rows=list(db[name].find({'data_source':'tushare'}).max_time_ms(15000))
@@ -94,17 +95,20 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
             try:return await (recoverer or recover_raw_timeout)(gate,motor[env['MONGODB_DATABASE']].stock_daily_quotes_unadjusted,
                 expected_plan=r['plan'],expected_used=r['used'])
             finally:motor.close()
+        report['stage']='reconcile'
         receipt=asyncio.run(recover());save('recovery.json',receipt)
+        report['stage']='verify_data'
         # No writes should have occurred during recovery; preserve exact BSON proof.
         for name,rows in before.items():
             current=list(db[name].find({'data_source':'tushare'}).max_time_ms(15000))
             raw=b''.join(BSON.encode(row) for row in sorted(current,key=lambda x:str(x['_id'])))
             require(hashlib.sha256(raw).hexdigest()==hashes[name+'.bson'],'data_changed_during_recovery')
         save('trigger-reserved.json',dict(at=time.time(),plan=r['plan']))
+        report['stage']='submit'
         report['trigger_sent']=True
         response=http('/api/scheduler/jobs/tushare_historical_sync/trigger',{},token)
         save('trigger-response.json',response);require(response.get('success') is True,'button_rejected')
-        report.update(status='passed',new_gate_stopped=False,used_requests=r['used'],
+        report.update(status='passed',stage='submitted',new_gate_stopped=False,used_requests=r['used'],
             resume_code=receipt['resume_code'],plan=r['plan'],backup_directory=str(RUN),execution_status='submitted')
     except BaseException as error:
         report.update(error_type=type(error).__name__,reason=str(error) if isinstance(error,RuntimeError) else 'details_withheld')

@@ -51,8 +51,8 @@ assert hashlib.sha256(raw).hexdigest()==r['sha256'],'upload_changed'
 assert not pathlib.Path('/home/ubuntu/k-tradingagents-history-tls-recovery-20261030-v1').exists(),'already_reserved'
 # Check the real transport before reserving the sole recovery attempt. The
 # reconciliation itself repeats these probes after the full database backup.
-probe="from tradingagents.utils.tushare_egress import UnixTLSConnection\nfor _ in range(3):\n c=UnixTLSConnection(10)\n try:c.connect()\n finally:c.close()\nprint('TLS_READY')"
-proc=subprocess.run(['docker','exec','ta-live-088a60b962bf-backend-1','python3','-B','-c',probe],capture_output=True,text=True,timeout=35)
+probe="from tradingagents.utils.tushare_egress import UnixTLSConnection\nfor _ in range(3):\n c=UnixTLSConnection(30)\n try:c.connect()\n finally:c.close()\nprint('TLS_READY')"
+proc=subprocess.run(['docker','exec','ta-live-088a60b962bf-backend-1','python3','-B','-c',probe],capture_output=True,text=True,timeout=95)
 assert proc.returncode==0 and proc.stdout.splitlines()[-1:]==['TLS_READY'],'transport_not_ready'
 p=pathlib.Path('/home/ubuntu/history-button-acceptance-upload-'+r['sha256']+'.json')
 if p.exists():assert p.read_bytes()==raw,'existing_upload_changed'
@@ -66,21 +66,36 @@ exec(r['launch'])
 
 
 def configure_transport():
-    transport.SSH[1:1]=['-o','IPQoS=none','-o','ControlMaster=auto',
-        '-o','ControlPath=/home/ubuntu/quote-guard-releases/.ssh-market/tls-recovery-control',
-        '-o','ControlPersist=600','-o','ServerAliveInterval=5','-o','ServerAliveCountMax=1']
+    # Only the management channel carries compressible operator source. The
+    # fixed upstream TLS route, certificate rules and service expiry are intact.
+    transport.SSH=[x.replace('ConnectTimeout=10','ConnectTimeout=20') for x in transport.SSH]
+    transport.SSH[1:1]=['-C','-o','IPQoS=none','-o','ControlMaster=auto',
+        '-o','ControlPath=/home/ubuntu/quote-guard-releases/.ssh-market/tls-compressed-control',
+        '-o','ControlPersist=600','-o','ServerAliveInterval=15','-o','ServerAliveCountMax=4']
 
 
 def main():
+    global ROOT,BACKUP,LAUNCH,STATUS,DRIVER,UPLOAD_AND_LAUNCH
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--action',choices=['freeze','execute','status','collect'],required=True)
+    parser.add_argument('--run',choices=['v1','v2'],default='v1')
     parser.add_argument('--credentials-file',type=Path)
     args=parser.parse_args()
+    if args.run=='v1' and args.action in ('freeze','execute'):
+        raise SystemExit('v1_already_consumed: inspect status; never reuse its reservation')
+    if args.run=='v2':
+        old=ROOT
+        ROOT=ROOT.replace('20261030-v1','20261030-v2')
+        BACKUP=BACKUP.replace('20261030-v1','20261030-v2')
+        LAUNCH=LAUNCH.replace(old,ROOT)
+        STATUS=STATUS.replace(old,ROOT)
+        DRIVER=DRIVER.replace(old,ROOT)
+        UPLOAD_AND_LAUNCH=UPLOAD_AND_LAUNCH.replace(old,ROOT)
     configure_transport()
     if args.action in ('status','collect'):
         result=transport.ssh(STATUS)
         if args.action=='collect':
-            target=transport.EVIDENCE/'history-tls-recovery-result-20261030-v1.json'
+            target=transport.EVIDENCE/('history-tls-recovery-result-20261030-'+args.run+'.json')
             fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
             with os.fdopen(fd,'w') as f:json.dump(result,f,indent=2)
         print(json.dumps(result,ensure_ascii=False));return
@@ -99,7 +114,7 @@ def main():
         print(json.dumps(dict(artifact=str(artifact),sha256=sha,upstream_requests=0)));return
     if args.credentials_file is None:parser.error('credentials_file_required')
     result=transport.ssh(UPLOAD_AND_LAUNCH,dict(package=raw.decode(),sha256=sha,
-        launch=LAUNCH,auth=read_auth(args.credentials_file,True)))
+        launch=LAUNCH,auth=read_auth(args.credentials_file,True)),timeout=150)
     print(json.dumps(result))
 
 
