@@ -49,6 +49,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--action', choices=['freeze', 'execute', 'status', 'collect'], required=True)
     parser.add_argument('--credentials-file', type=Path)
+    parser.add_argument('--control-socket', type=Path, help='Existing private SSH master, if available')
     args = parser.parse_args()
     os.umask(0o077)
     artifact = RELEASE / 'recovery.json'
@@ -73,7 +74,7 @@ def main():
     else:
         code = STATUS
     ast.parse(code)
-    cmd = ['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config', '-S', 'none', '-C',
+    cmd = ['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config', '-S', str(args.control_socket) if args.control_socket else 'none', '-C',
            '-o', 'BatchMode=yes', '-o', 'IPQoS=none', '-o', 'ConnectTimeout=25', 'osaka-migration',
            'sudo -n python3 -B -c ' + shlex.quote(code)]
     prefix = EVIDENCE / ('history-http-recovery-' + args.action + '-' + str(time.time_ns()))

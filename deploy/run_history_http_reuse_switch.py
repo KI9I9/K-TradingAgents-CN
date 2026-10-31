@@ -23,6 +23,9 @@ old_root = '/home/ubuntu/k-tradingagents-history-basic-v1-20261030'
 base.RELEASE = RELEASE
 for name in ('LAUNCH', 'STATUS'):
     setattr(base, name, getattr(base, name).replace(old_root, ROOT))
+base.STATUS = base.STATUS.replace(
+    "process=json.loads((root/'latest-attempt.json').read_text())",
+    "if not (root/'latest-attempt.json').exists():\n    print(json.dumps({'reserved':root.exists(),'attempt_started':False})); raise SystemExit(0)\nprocess=json.loads((root/'latest-attempt.json').read_text())")
 
 
 def controller():
@@ -69,6 +72,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--action', choices=['freeze-controller', 'check', 'execute', 'status', 'collect'], required=True)
     parser.add_argument('--credentials-file', type=Path)
+    parser.add_argument('--control-socket', type=Path, help='Existing private SSH master, if available')
     args = parser.parse_args()
     os.umask(0o077)
     artifact = RELEASE / 'controller.json'
@@ -112,7 +116,7 @@ names=['process.json','state.json','completion.json','backup/complete.json','ins
 out['evidence']={n:json.loads((directory/n).read_text()) for n in names if (directory/n).exists()}
 print(json.dumps(out))
 ''')
-    cmd = ['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config', '-S', 'none', '-C',
+    cmd = ['ssh', '-F', '/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config', '-S', str(args.control_socket) if args.control_socket else 'none', '-C',
            '-o', 'BatchMode=yes', '-o', 'IPQoS=none', '-o', 'ConnectTimeout=25', 'osaka-migration',
            'sudo -n python3 -B -c ' + shlex.quote(code)]
     prefix = EVIDENCE / ('history-http-switch-' + args.action + '-' + str(time.time_ns()))
