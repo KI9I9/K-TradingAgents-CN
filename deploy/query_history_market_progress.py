@@ -1,5 +1,7 @@
 """Read-only current history permit, task progress and Tushare series counts."""
+import argparse
 import json
+import os
 from pathlib import Path
 from run_history_sample import ssh
 ROOT=Path(__file__).resolve().parents[1]
@@ -32,4 +34,19 @@ print(lines[0])
 """
     return ssh(wrapper,dict(code=REMOTE,request=dict(runtime=(ROOT/'deploy/quote_guard_runtime.py').read_text())))
 
-if __name__=='__main__':print(json.dumps(query(),ensure_ascii=False))
+if __name__=='__main__':
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--control-socket',type=Path)
+    parser.add_argument('--output',type=Path)
+    args=parser.parse_args()
+    if args.output and args.output.exists():parser.error('output_already_exists')
+    if args.control_socket:
+        import run_history_sample as transport
+        transport.SSH=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config',
+            '-S',str(args.control_socket),'-C','-o','BatchMode=yes','-o','IPQoS=none',
+            '-o','ConnectTimeout=25','osaka-migration']
+    result=query()
+    if args.output:
+        fd=os.open(args.output,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'w') as stream:json.dump(result,stream,ensure_ascii=False,indent=2)
+    print(json.dumps(result,ensure_ascii=False))
