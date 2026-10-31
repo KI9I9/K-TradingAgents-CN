@@ -35,6 +35,16 @@ def verify_fixed_tls():
 
 
 async def recover_raw_tls(gate, collection, *, expected_plan, expected_used):
+    return await _recover_raw_transport(gate,collection,expected_plan=expected_plan,
+                                       expected_used=expected_used,expected_reason='tls_failed')
+
+
+async def recover_raw_timeout_verified(gate, collection, *, expected_plan, expected_used):
+    return await _recover_raw_transport(gate,collection,expected_plan=expected_plan,
+                                       expected_used=expected_used,expected_reason='timeout')
+
+
+async def _recover_raw_transport(gate, collection, *, expected_plan, expected_used, expected_reason):
     """Reconcile exactly one blocked daily attempt, then remove STOP last.
 
     Full database/journal backups are a caller precondition. As with the timeout
@@ -42,6 +52,7 @@ async def recover_raw_tls(gate, collection, *, expected_plan, expected_used):
     A successful TLS handshake today does not classify the old SSL exception;
     this is an explicit operator recovery, never an automatic TLS retry.
     """
+    require(expected_reason in ('tls_failed','timeout'),'invalid_recovery_reason')
     fd=os.open(gate.admission_path,os.O_RDWR|os.O_NOFOLLOW)
     try:
         _private_fd(fd)
@@ -52,7 +63,7 @@ async def recover_raw_tls(gate, collection, *, expected_plan, expected_used):
         with workspace.locked(),gate.locked() as gate_fd:
             p,s=gate.read(gate_fd)
             require(gate.stopped(gate_fd) and p['schema']==2
-                    and s['phase']=='blocked' and s['reason']=='tls_failed'
+                    and s['phase']=='blocked' and s['reason']==expected_reason
                     and s['api_code'] is None and s['used']==expected_used
                     and s['plan'] is not None and s['plan']['plan_sha256']==expected_plan
                     and s['active'] is not None and s['active']['sent']==['daily'],
@@ -92,7 +103,8 @@ async def recover_raw_tls(gate, collection, *, expected_plan, expected_used):
                 raise RuntimeError('tls_probe_failed:'+type(error).__name__) from None
             now=check_budget()
             gate.assert_selected()
-            receipt=gate.directory/('tls-recovery-'+active['id'])
+            prefix='tls-recovery-' if expected_reason=='tls_failed' else 'timeout-recovery-'
+            receipt=gate.directory/(prefix+active['id'])
             receipt.mkdir(mode=0o700)
             _sync_dir(gate.directory)
             _atomic(receipt/'before.json',dict(state=s,item=states[active['code']],stopped=True,
@@ -102,11 +114,11 @@ async def recover_raw_tls(gate, collection, *, expected_plan, expected_used):
             s.update(active=None,phase='ready',reason='none',api_code=None)
             gate.write(gate_fd,s)
             _atomic(receipt/'ready.json',dict(plan_sha256=expected_plan,used=s['used'],
-                    days=s['days'],resume_code=active['code'],previous_reason='tls_failed'))
+                    days=s['days'],resume_code=active['code'],previous_reason=expected_reason))
             gate.assert_selected()
             os.unlink('STOP',dir_fd=gate_fd)
             os.fsync(gate_fd)
             return dict(plan_sha256=expected_plan,used=s['used'],resume_code=active['code'],
-                        receipt=str(receipt),previous_reason='tls_failed',tls_probes=probes)
+                        receipt=str(receipt),previous_reason=expected_reason,tls_probes=probes)
     finally:
         os.close(fd)

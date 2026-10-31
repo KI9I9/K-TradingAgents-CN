@@ -21,6 +21,10 @@ BACKUP='/app/runtime/history-tls-recovery-20261030-v1'
 LAUNCH=base.LAUNCH.replace(base.ROOT,ROOT)
 STATUS=base.STATUS.replace(base.ROOT,ROOT)
 DRIVER=base.DRIVER.replace(base.ROOT,ROOT)
+EXPECTED_REASON='tls_failed'
+EXPECTED_USED=2173
+EXPECTED_RAW=36642
+RECOVERER='recover_raw_tls'
 
 
 def package():
@@ -32,15 +36,15 @@ def package():
           "core={'__name__':'operator_backup'}\nexec("+repr(core)+",core)\n"
           "tls={'__name__':'operator_tls'}\nexec("+repr(tls)+",tls)\n"
           "raise SystemExit(core['main'](json.load(sys.stdin),"
-          "recoverer=tls['recover_raw_tls'],expected_reason='tls_failed',"
-          "raw_count=36642,run_directory="+repr(BACKUP)+"))\n")
+          "recoverer=tls["+repr(RECOVERER)+"],expected_reason="+repr(EXPECTED_REASON)+","
+          "raw_count="+str(EXPECTED_RAW)+",run_directory="+repr(BACKUP)+"))\n")
     return dict(source_head=manifest['source_head'],archive_sha256=base.ARCHIVE_SHA,
                 operator_head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip(),
                 driver=DRIVER,code=code,request=dict(
                     source_hashes={f['target']:f['sha256'] for f in manifest['files']},
                     runtime_tool=(REPO/'deploy/quote_guard_runtime.py').read_text(),
                     generation='/app/runtime/tushare-history-generations/2097c3ae1c61487e87cb7b393340f3fa',
-                    used=2173,plan='44ae01f972073cd2d6ec5167e8d35e15793365392480572c541cac7efaa7e1c4'))
+                    used=EXPECTED_USED,plan='44ae01f972073cd2d6ec5167e8d35e15793365392480572c541cac7efaa7e1c4'))
 
 
 UPLOAD_AND_LAUNCH=r'''
@@ -76,17 +80,24 @@ def configure_transport():
 
 def main():
     global ROOT,BACKUP,LAUNCH,STATUS,DRIVER,UPLOAD_AND_LAUNCH
+    global EXPECTED_REASON,EXPECTED_USED,EXPECTED_RAW,RECOVERER
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--action',choices=['freeze','execute','status','collect'],required=True)
-    parser.add_argument('--run',choices=['v1','v2'],default='v1')
+    parser.add_argument('--run',choices=['v1','v2','timeout-v3'],default='v1')
     parser.add_argument('--credentials-file',type=Path)
     args=parser.parse_args()
     if args.run=='v1' and args.action in ('freeze','execute'):
         raise SystemExit('v1_already_consumed: inspect status; never reuse its reservation')
-    if args.run=='v2':
+    if args.run in ('v2','timeout-v3'):
         old=ROOT
-        ROOT=ROOT.replace('20261030-v1','20261030-v2')
-        BACKUP=BACKUP.replace('20261030-v1','20261030-v2')
+        if args.run=='v2':
+            ROOT=ROOT.replace('20261030-v1','20261030-v2')
+            BACKUP=BACKUP.replace('20261030-v1','20261030-v2')
+        else:
+            ROOT=ROOT.replace('tls-recovery-20261030-v1','timeout-recovery-20261031-v3')
+            BACKUP=BACKUP.replace('tls-recovery-20261030-v1','timeout-recovery-20261031-v3')
+            EXPECTED_REASON='timeout'; EXPECTED_USED=2273; EXPECTED_RAW=38267
+            RECOVERER='recover_raw_timeout_verified'
         LAUNCH=LAUNCH.replace(old,ROOT)
         STATUS=STATUS.replace(old,ROOT)
         DRIVER=DRIVER.replace(old,ROOT)
@@ -95,7 +106,9 @@ def main():
     if args.action in ('status','collect'):
         result=transport.ssh(STATUS)
         if args.action=='collect':
-            target=transport.EVIDENCE/('history-tls-recovery-result-20261030-'+args.run+'.json')
+            name=('history-timeout-recovery-result-20261031-v3.json' if args.run=='timeout-v3'
+                  else 'history-tls-recovery-result-20261030-'+args.run+'.json')
+            target=transport.EVIDENCE/name
             fd=os.open(target,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
             with os.fdopen(fd,'w') as f:json.dump(result,f,indent=2)
         print(json.dumps(result,ensure_ascii=False));return

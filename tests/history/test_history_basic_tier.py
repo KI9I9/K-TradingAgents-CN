@@ -176,6 +176,30 @@ class BasicTierTests(ButtonTests):
         self.assertEqual(self.state()['used'],2)
         self.assertEqual(self.executions.rows['2']['status'],'success')
 
+    async def test_verified_timeout_recovery_keeps_charged_attempts_and_checks_tls(self):
+        from tradingagents.utils.tushare_egress import TushareEgressStopped
+        self.send_failure=TushareEgressStopped('timeout')
+        with patch.object(gate_module.time,'sleep'):
+            await self.service.submit(); await asyncio.gather(*list(button._TASKS))
+        before=self.state();rows=raw_json(self.col.rows)
+        self.assertEqual(before['used'],3)
+        args=dict(expected_plan=before['plan']['plan_sha256'],expected_used=3)
+        with patch.object(tls_recovery,'verify_fixed_tls',side_effect=TimeoutError()):
+            with self.assertRaisesRegex(RuntimeError,'tls_probe_failed:TimeoutError'):
+                await tls_recovery.recover_raw_timeout_verified(self.gate,self.col,**args)
+        self.assertEqual(self.state(),before)
+        self.assertTrue((self.gate.directory/'STOP').exists())
+        with patch.object(tls_recovery,'verify_fixed_tls',return_value=[{'version':'TLSv1.2'}]*3):
+            receipt=await tls_recovery.recover_raw_timeout_verified(self.gate,self.col,**args)
+        self.assertEqual(receipt['previous_reason'],'timeout')
+        self.assertEqual(self.state()['used'],3)
+        self.assertEqual(self.state()['days'],before['days'])
+        self.assertEqual(raw_json(self.col.rows),rows)
+        self.send_failure=None
+        await self.service.submit(); await asyncio.gather(*list(button._TASKS))
+        self.assertEqual(self.state()['used'],4)
+        self.assertEqual(self.executions.rows['2']['status'],'success')
+
     async def test_tls_recovery_cert_error_keeps_every_ledger_byte(self):
         import ssl
         args=await self.stop_for_tls()

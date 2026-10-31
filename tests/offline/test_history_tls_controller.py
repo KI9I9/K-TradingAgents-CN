@@ -44,6 +44,18 @@ class ControllerTests(unittest.TestCase):
             state['main']()
         state['transport'].ssh.assert_called_once_with('/unique/history-tls-recovery-20261030-v1')
 
+    def test_timeout_v3_freezes_exact_current_checkpoint_and_separate_paths(self):
+        state=self.controller()
+        with patch.object(sys,'argv',['operator','--action','status','--run','timeout-v3']):
+            state['main']()
+        for name in ('ROOT','BACKUP','LAUNCH','STATUS','DRIVER','UPLOAD_AND_LAUNCH'):
+            self.assertEqual(state[name],'/unique/history-timeout-recovery-20261031-v3')
+        self.assertEqual(state['EXPECTED_REASON'],'timeout')
+        self.assertEqual(state['EXPECTED_USED'],2273)
+        self.assertEqual(state['EXPECTED_RAW'],38267)
+        self.assertEqual(state['RECOVERER'],'recover_raw_timeout_verified')
+        state['transport'].ssh.assert_called_once_with(state['STATUS'])
+
 
 if __name__=='__main__':
     unittest.main()
