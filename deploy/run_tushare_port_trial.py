@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -138,6 +139,11 @@ def main():
     except subprocess.TimeoutExpired:
         raise SystemExit('management_timeout: inspect status; never repeat start') from None
     if p.returncode:
+        # Operator assertions have fixed, non-secret reason identifiers. Avoid
+        # exposing arbitrary SSH/Python stderr or silently hiding failed checks.
+        reason=re.search(r'AssertionError: ([a-z_]+)\s*$',p.stderr)
+        if reason:
+            raise SystemExit('preflight_failed:'+reason[1]+'; inspect status before any retry')
         raise SystemExit('management_failed: inspect status; never repeat start')
     result = json.loads(p.stdout)
     target=EVIDENCE/('ssh443-trial-'+args.action+'-'+str(time.time_ns())+'.json')
