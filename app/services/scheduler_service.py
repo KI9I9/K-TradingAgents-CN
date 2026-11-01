@@ -308,6 +308,11 @@ class SchedulerService:
         from app.core.config import settings
 
         try:
+            if job_id == 'tushare_historical_sync':
+                from app.services.tushare_history_schedule import load_schedule, CRON
+                load_schedule()
+                if cron_expression != CRON:
+                    raise ValueError('历史定时同步仅允许已批准的工作日 18:30（北京时间）')
             job = self.scheduler.get_job(job_id)
             if not job:
                 logger.error(f"❌ 任务 {job_id} 不存在")
@@ -324,9 +329,12 @@ class SchedulerService:
 
             # 记录旧的触发器信息
             old_trigger_str = str(job.trigger)
+            history_paused = job_id == 'tushare_historical_sync' and job.next_run_time is None
 
             # 修改任务的触发器
             self.scheduler.reschedule_job(job_id, trigger=new_trigger)
+            if history_paused:
+                self.scheduler.pause_job(job_id)
 
             logger.info(f"🔄 任务 {job_id} CRON已更新: {old_trigger_str} -> {cron_expression}")
 
@@ -1485,6 +1493,11 @@ class SchedulerService:
 
     def _on_job_executed(self, event: JobExecutionEvent):
         """任务执行成功回调"""
+        if (event.job_id == 'tushare_historical_sync' and isinstance(event.retval, dict)
+                and event.retval.get('_execution_recorded') is True):
+            # The awaited batch already persisted its success/skip/failure.
+            # A second generic success would hide the actual batch outcome.
+            return
         # 计算执行时间（处理时区问题）
         execution_time = None
         if event.scheduled_run_time:

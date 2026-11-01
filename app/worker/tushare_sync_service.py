@@ -2643,94 +2643,11 @@ async def run_tushare_realtime_quotes_hourly(**kwargs):
 
 
 async def run_tushare_historical_sync(incremental: bool = True, **kwargs):
-    """APScheduler任务：同步历史数据"""
-    raise_if_egress_blocked()
-    job_id = "tushare_historical_sync"
-    
-    # 🔥 从kwargs中提取恢复位置信息、手动触发标记和强制执行标记
-    resume_from_index = kwargs.get("_resume_from_index")
-    resume_execution_id = kwargs.get("_resume_execution_id")  # 恢复执行时的执行记录ID
-    trigger_execution_id = kwargs.get("_trigger_execution_id")  # 手动触发时预创建的执行记录ID
-    manual_trigger = kwargs.get("_manual_trigger", False)  # 手动触发标记
-    force_execute = kwargs.get("_force_execute", False)  # 强制执行标记
-    
-    # 🔥 只有恢复执行或强制执行才允许绕过并发检查
-    # 普通手动触发仍然要检查是否已有同类未完成任务，避免用户重复点击起多个实例
-    if resume_from_index is not None or resume_execution_id is not None or force_execute:
-        if resume_from_index is not None or resume_execution_id is not None:
-            logger.info(f"🔄 [APScheduler] 恢复执行，从第 {resume_from_index} 个位置继续 (execution_id={resume_execution_id})")
-        if force_execute:
-            logger.info(f"🔧 [APScheduler] 强制执行，跳过并发检查")
-        # 恢复执行或强制执行时，不检查并发，直接允许执行
-    else:
-        # 🔥 检查是否已有实例在运行（普通手动触发也要检查）
-        is_running, instance_id = await _check_task_running(
-            job_id,
-            exclude_execution_id=trigger_execution_id
-        )
-        if is_running:
-            logger.warning(f"⚠️ 任务 {job_id} 已有实例在运行（_id={instance_id}），跳过本次执行")
-            return {
-                "skipped": True,
-                "reason": "已有实例在运行",
-                "running_instance_id": instance_id
-            }
-    
-    # 🔥 清理内部标记（这些不应该传递给sync_historical_data）
-    clean_kwargs = {k: v for k, v in kwargs.items() if not k.startswith("_") or k == "_resume_from_index"}
-    
-    logger.info(f"🚀 [APScheduler] 开始执行 Tushare 历史数据同步任务 (incremental={incremental}, kwargs={clean_kwargs})")
-    try:
-        # 🔥 使用统一的线程池同步服务
-        from app.worker.unified_thread_pool_sync_service import get_unified_thread_pool_sync_service
-        
-        unified_service = await get_unified_thread_pool_sync_service()
-        
-        # 🔥 为历史同步创建独立服务实例，避免复用全局单例带来的跨事件循环连接污染
-        service = await create_tushare_sync_service()
-        logger.info(f"✅ [APScheduler] Tushare 独立同步服务已初始化（历史同步专用）")
-        
-        # 🔥 在线程池中执行同步方法
-        sync_result = await unified_service.execute_sync_method(
-            sync_method=service.sync_historical_data,
-            method_kwargs={
-                "incremental": incremental,
-                "period": clean_kwargs.get("period", "daily"),
-                "start_date": clean_kwargs.get("start_date"),
-                "end_date": clean_kwargs.get("end_date"),
-                "symbols": clean_kwargs.get("symbols"),
-                "job_id": "tushare_historical_sync",
-                **{k: v for k, v in clean_kwargs.items() if k not in ["period", "start_date", "end_date", "symbols"]}
-            },
-            job_id=job_id,
-            rate_limit_per_minute=kwargs.get("rate_limit_per_minute", 200),  # Tushare速率限制
-            resume_from_index=resume_from_index
-        )
-        
-        if sync_result.success:
-            result = sync_result.result
-            if not isinstance(result, dict) or result.get('success') is not True:
-                raise RuntimeError('tushare_history_sync_incomplete')
-            logger.info(f"✅ [APScheduler] Tushare历史数据同步完成: {result}")
-            return result
-        else:
-            # 🔥 检查是否是任务取消
-            if "取消" in (sync_result.error or '') or "cancelled" in (sync_result.error or '').lower():
-                logger.info(f"ℹ️ [APScheduler] Tushare历史数据同步任务已被用户取消")
-                return {"cancelled": True, "message": sync_result.error}
-            else:
-                logger.error(f"❌ [APScheduler] Tushare历史数据同步失败: {sync_result.error}")
-                raise RuntimeError(sync_result.error)
-                
-    except Exception as e:
-        # 检查是否是任务取消异常（用户主动取消，不应该记录为错误）
-        from app.services.scheduler_service import TaskCancelledException
-        if isinstance(e, TaskCancelledException):
-            logger.info(f"ℹ️ [APScheduler] Tushare历史数据同步任务已被用户取消")
-            return {"cancelled": True, "message": "任务已被用户取消"}
-        # 其他异常才记录为错误
-        logger.error(f"❌ [APScheduler] Tushare历史数据同步失败: {e}", exc_info=True)
-        raise
+    """APScheduler uses the same finite daily-only batch as the manual button."""
+    if incremental is not True or kwargs:
+        raise ValueError('定时历史同步不接受全量、强制执行或旧位置恢复参数')
+    from app.services.tushare_history_batches import submit_history_batch
+    return await submit_history_batch(incremental=True, scheduled=True)
 
 
 async def run_tushare_financial_sync(**kwargs):

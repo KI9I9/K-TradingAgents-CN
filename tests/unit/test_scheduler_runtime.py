@@ -19,6 +19,9 @@ class Cursor:
 class Collection:
     def __init__(self): self.docs = {}
     def find(self, query): return Cursor(list(self.docs.values()))
+    async def count_documents(self, query):
+        return sum(doc.get('enabled') == query.get('enabled') and doc.get('_id') in query['_id']['$in']
+                   for doc in self.docs.values())
     async def update_one(self, query, update, upsert=False):
         key = query['_id']
         doc = self.docs.get(key)

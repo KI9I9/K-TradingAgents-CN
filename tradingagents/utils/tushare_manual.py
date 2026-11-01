@@ -316,14 +316,22 @@ def validate_frame(frame):
 
 async def enforce_manual_jobs(scheduler, db):
     """Called before restore_preferences dispatch; failures propagate fail-closed."""
-    for job_id in JOB_IDS:
+    from app.services.tushare_history_schedule import configure_history_job
+    closed=list(JOB_IDS)
+    try:
+        configure_history_job(scheduler)
+    except (TushareEgressStopped, ValueError):
+        pass
+    else:
+        closed.remove('tushare_historical_sync')
+    for job_id in closed:
         if scheduler.get_job(job_id) is not None:
             scheduler.pause_job(job_id)
         await db.scheduler_preferences.update_one(
             {'_id': job_id}, {'$set': {'enabled': False, 'updated_at': datetime.now(BJ).replace(tzinfo=None)}},
             upsert=True)
-    count = await db.scheduler_preferences.count_documents({'_id': {'$in': list(JOB_IDS)}, 'enabled': False})
-    if count != len(JOB_IDS):
+    count = await db.scheduler_preferences.count_documents({'_id': {'$in': closed}, 'enabled': False})
+    if count != len(closed):
         raise RuntimeError('TushareManualSchedulerPauseUnverified')
 
 

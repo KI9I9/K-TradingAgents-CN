@@ -14,13 +14,19 @@ def now_local():
 async def save_enabled(scheduler, db, job_id, enabled):
     """保存显式开关选择；保存失败时恢复原调度状态。"""
     from tradingagents.utils.tushare_manual import JOB_IDS
-    if enabled and job_id in JOB_IDS:
-        raise ValueError("Tushare 首期仅允许股票详情页的受限手动历史同步，自动任务不可启用")
     job = scheduler.get_job(job_id)
     if job is None:
         raise ValueError(f"任务不存在: {job_id}")
     previous = job.next_run_time
+    previous_trigger = job.trigger
+    previous_options = dict(max_instances=job.max_instances, coalesce=job.coalesce,
+                            misfire_grace_time=job.misfire_grace_time)
     try:
+        if enabled and job_id in JOB_IDS:
+            if job_id != 'tushare_historical_sync':
+                raise ValueError("该 Tushare 自动任务尚未开放")
+            from app.services.tushare_history_schedule import configure_history_job
+            configure_history_job(scheduler)
         if enabled:
             scheduler.resume_job(job_id)
         else:
@@ -31,7 +37,7 @@ async def save_enabled(scheduler, db, job_id, enabled):
             upsert=True,
         )
     except Exception:
-        scheduler.modify_job(job_id, next_run_time=previous)
+        scheduler.modify_job(job_id, next_run_time=previous, trigger=previous_trigger, **previous_options)
         raise
 
 

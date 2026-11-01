@@ -45,9 +45,13 @@ class HistoryBatchService:
         self.historical_service,self.provider_factory=historical_service,provider_factory
         self.clock=clock or (lambda:datetime.now(BJ))
 
-    async def submit(self,*,force=False,incremental=True):
+    async def submit(self,*,force=False,incremental=True,scheduled=False):
         if force or type(incremental) is not bool:
             raise HTTPException(400,'历史同步不支持强制绕过并发或授权检查，请使用普通执行。')
+        if type(scheduled) is not bool or (scheduled and incremental is not True):
+            raise HTTPException(400,'定时历史同步仅支持非复权增量执行。')
+        self.scheduled=scheduled
+        reserved=False
         fd=None
         try:
             fd=os.open(self.gate.admission_path,os.O_RDWR|os.O_NOFOLLOW)
@@ -56,12 +60,30 @@ class HistoryBatchService:
             except BlockingIOError:raise TushareEgressStopped('busy') from None
             self.gate.assert_selected()
             policy,state=self.gate.status()
+            if scheduled:
+                from app.services.tushare_history_schedule import load_schedule, trade_day_reason, reserve_day
+                load_schedule(self.gate)
+                now=self.clock().astimezone(BJ)
+                reason=await trade_day_reason(now)
+                if reason is None:
+                    reserved=reserve_day(self.gate,now)
+                    if not reserved:reason='already_scheduled_today'
+                if reason:
+                    await self.executions.insert_one(dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',
+                        status='skipped',timestamp=now,scheduled_time=now,updated_at=now,finished_at=now,
+                        is_manual=False,reason=reason,progress=100,processed_items=0,success_count=0,
+                        progress_message='定时历史同步未取数：'+reason))
+                    return dict(_execution_recorded=True, success=True, skipped=True, reason=reason)
             if len(policy['codes'])>50:
                 now=self.clock()
                 inserted=await self.executions.insert_one(dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',
-                    status='running',timestamp=now,scheduled_time=now,updated_at=now,is_manual=True,
+                    status='running',timestamp=now,scheduled_time=now,updated_at=now,is_manual=not scheduled,
                     cancel_requested=False,job_kwargs={'incremental':incremental},total_items=len(policy['codes']),
                     processed_items=0,progress=0,progress_message='正在核验全市场股票池与历史断点'))
+                if scheduled:
+                    owned,fd=fd,None
+                    await self._prepare_and_run(owned,inserted.inserted_id,policy,state,incremental)
+                    return await self._scheduled_result(inserted.inserted_id)
                 task=asyncio.create_task(self._prepare_and_run(fd,inserted.inserted_id,policy,state,incremental))
                 _TASKS.add(task);task.add_done_callback(_TASKS.discard)
                 fd=None
@@ -69,23 +91,40 @@ class HistoryBatchService:
             plan,checkpoint=await self._prepare(policy,state,incremental)
             now=self.clock()
             record=dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',status='running',timestamp=now,
-                scheduled_time=now,updated_at=now,is_manual=True,cancel_requested=False,
+                scheduled_time=now,updated_at=now,is_manual=not scheduled,cancel_requested=False,
                 plan_sha256=plan['plan_sha256'],job_kwargs={'incremental':incremental},
                 total_items=len(plan['items']),processed_items=checkpoint['counts']['committed'],
                 progress=int(100*checkpoint['counts']['committed']/len(plan['items'])),
                 progress_message=f"同步授权范围内 {len(plan['items'])} 只股票；结束日期 {plan['end']}")
             inserted=await self.executions.insert_one(record)
+            if scheduled:
+                owned,fd=fd,None
+                await self._run(owned,inserted.inserted_id,plan)
+                return await self._scheduled_result(inserted.inserted_id)
             task=asyncio.create_task(self._run(fd,inserted.inserted_id,plan))
             _TASKS.add(task);task.add_done_callback(_TASKS.discard)
             fd=None  # background owns admission lock until it exits
             return True
         except FileNotFoundError:
+            if reserved:self.gate.stop()
             raise HTTPException(400,message('not_authorized')) from None
         except (TushareEgressStopped,BatchStopped,PlanError) as error:
+            if reserved:self.gate.stop()
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error)
             raise HTTPException(400,message(reason)) from None
+        except BaseException:
+            if reserved:self.gate.stop()
+            raise
         finally:
             if fd is not None:os.close(fd)
+
+    async def _scheduled_result(self, execution_id):
+        """Let the scheduler retain the batch's one detailed terminal record."""
+        row=await self.executions.find_one({'_id':execution_id})
+        if not row or row.get('status') not in ('success','partial','failed','cancelled'):
+            raise RuntimeError('scheduled_execution_result_unverified')
+        return dict(_execution_recorded=True, execution_id=str(execution_id),
+                    success=row['status']=='success', status=row['status'])
 
     async def _prepare(self,policy,state,incremental):
         plan=state['plan']
@@ -118,6 +157,8 @@ class HistoryBatchService:
                 quota=dict(daily_requests=policy['daily_requests'],rolling_minute_requests=policy['minute_requests'],
                            evidence_ref='explicit-local-policy'))
             blocked=[i for i in plan['items'] if i['status']=='blocked']
+            if blocked and getattr(self,'scheduled',False):
+                raise PlanError('scheduled_inventory_blocked')
             if blocked and len(blocked)==len(plan['items']):
                 preview=', '.join(i['code']+':'+i['reason'] for i in blocked[:8])
                 raise HTTPException(400,f'历史计划有 {len(blocked)} 只股票未通过检查，未请求上游：{preview}')
@@ -149,6 +190,7 @@ class HistoryBatchService:
             await self.executions.update_one({'_id':execution_id},{'$set':{'plan_sha256':plan['plan_sha256']}})
         except BaseException as error:
             os.close(fd)
+            if getattr(self,'scheduled',False):self.gate.stop()
             detail=error.detail if isinstance(error,HTTPException) else message(error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted')
             await self.executions.update_one({'_id':execution_id},{'$set':dict(status='failed',finished_at=self.clock(),error_message=detail,progress_message=detail)})
             if not isinstance(error,Exception):raise
@@ -168,13 +210,19 @@ class HistoryBatchService:
         try:
             async def progress(result):
                 await self._progress(execution_id,result,'running',plan)
+                if getattr(self,'scheduled',False) and (result.get('skipped') or any(o['reason']!='no_daily_rows' for o in result.get('outcomes',[]))):
+                    self.gate.stop()
+                    raise BatchStopped('write_outcome_unresolved')
             with history_transport_session():
                 while True:
                     result=await self.workspace.advance_async(identity,adapter,max_items=10000,on_progress=progress)
+                    if getattr(self,'scheduled',False) and (result.get('skipped') or any(o['reason']!='no_daily_rows' for o in result.get('outcomes',[]))):
+                        self.gate.stop()
                     await self._progress(execution_id,result,('partial' if (result.get('skipped') or any(o['reason']!='no_daily_rows' for o in result.get('outcomes',[]))) else 'success') if result['complete'] else 'running',plan)
                     if result['complete']:break
                     await asyncio.sleep(0)
         except BaseException as error:
+            if getattr(self,'scheduled',False):self.gate.stop()
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted'
             try:
                 checkpoint=self.workspace.status(identity)
@@ -211,7 +259,7 @@ class HistoryBatchService:
             progress=update['progress'],processed_items=count,total_items=total)
 
 
-async def submit_history_batch(*,force=False,incremental=True):
+async def submit_history_batch(*,force=False,incremental=True,scheduled=False):
     try:
         gate=selected_gate()
         policy,_ = gate.status()  # refuse BEFORE opening database/provider on unconfigured hosts
@@ -228,4 +276,4 @@ async def submit_history_batch(*,force=False,incremental=True):
     collection = db.stock_daily_quotes_unadjusted if raw else db.stock_daily_quotes
     service=HistoryBatchService(gate,Workspace(gate.directory/'runs'),collection,
         db.scheduler_executions,HistoricalDataService(unadjusted_stock=raw),provider_factory)
-    return await service.submit(force=force,incremental=incremental)
+    return await service.submit(force=force,incremental=incremental,scheduled=scheduled)
