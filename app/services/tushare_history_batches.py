@@ -45,6 +45,11 @@ class HistoryBatchService:
         self.historical_service,self.provider_factory=historical_service,provider_factory
         self.clock=clock or (lambda:datetime.now(BJ))
 
+    def record_now(self):
+        # Scheduler records use naive Beijing time throughout the existing API,
+        # activity queries and zombie checker. Keep policy/plan clocks aware.
+        return self.clock().astimezone(BJ).replace(tzinfo=None)
+
     async def submit(self,*,force=False,incremental=True,scheduled=False):
         if force or type(incremental) is not bool:
             raise HTTPException(400,'历史同步不支持强制绕过并发或授权检查，请使用普通执行。')
@@ -69,13 +74,14 @@ class HistoryBatchService:
                     reserved=reserve_day(self.gate,now)
                     if not reserved:reason='already_scheduled_today'
                 if reason:
+                    recorded=self.record_now()
                     await self.executions.insert_one(dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',
-                        status='skipped',timestamp=now,scheduled_time=now,updated_at=now,finished_at=now,
+                        status='skipped',timestamp=recorded,scheduled_time=recorded,updated_at=recorded,finished_at=recorded,
                         is_manual=False,reason=reason,progress=100,processed_items=0,success_count=0,
                         progress_message='定时历史同步未取数：'+reason))
                     return dict(_execution_recorded=True, success=True, skipped=True, reason=reason)
             if len(policy['codes'])>50:
-                now=self.clock()
+                now=self.record_now()
                 inserted=await self.executions.insert_one(dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',
                     status='running',timestamp=now,scheduled_time=now,updated_at=now,is_manual=not scheduled,
                     cancel_requested=False,job_kwargs={'incremental':incremental},total_items=len(policy['codes']),
@@ -89,7 +95,7 @@ class HistoryBatchService:
                 fd=None
                 return True
             plan,checkpoint=await self._prepare(policy,state,incremental)
-            now=self.clock()
+            now=self.record_now()
             record=dict(job_id=JOB_ID,job_name='历史数据同步（Tushare）',status='running',timestamp=now,
                 scheduled_time=now,updated_at=now,is_manual=not scheduled,cancel_requested=False,
                 plan_sha256=plan['plan_sha256'],job_kwargs={'incremental':incremental},
@@ -169,6 +175,10 @@ class HistoryBatchService:
                 self.workspace.status(plan['plan_sha256'])
             self.gate.bind(plan)
         checkpoint=self.workspace.status(plan['plan_sha256'])
+        if getattr(self,'scheduled',False) and not checkpoint['complete'] and reuse:
+            # A prior interrupted/manual run needs explicit review, rather than
+            # silently consuming today's scheduled slot to resume an old end date.
+            raise BatchStopped('scheduled_previous_plan_incomplete')
         if checkpoint['counts']['fetching']:
             raise BatchStopped('request_outcome_unknown')
         identity=plan['plan_sha256']
@@ -192,7 +202,7 @@ class HistoryBatchService:
             os.close(fd)
             if getattr(self,'scheduled',False):self.gate.stop()
             detail=error.detail if isinstance(error,HTTPException) else message(error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted')
-            await self.executions.update_one({'_id':execution_id},{'$set':dict(status='failed',finished_at=self.clock(),error_message=detail,progress_message=detail)})
+            await self.executions.update_one({'_id':execution_id},{'$set':dict(status='failed',finished_at=self.record_now(),error_message=detail,progress_message=detail)})
             if not isinstance(error,Exception):raise
             return
         await self._run(fd,execution_id,plan)
@@ -245,13 +255,13 @@ class HistoryBatchService:
         outcomes=result.get('outcomes',[])
         skipped+=outcomes
         count-=len(outcomes)
-        update=dict(status=status,updated_at=self.clock(),processed_items=count,total_items=total,
+        update=dict(status=status,updated_at=self.record_now(),processed_items=count,total_items=total,
             success_count=count,skipped_count=len(skipped),skipped_items=skipped,progress=int(100*finished/total),
             price_adjustment='none' if plan['mode'].endswith('_none') else 'qfq',
             progress_message=error or ('非复权日线：' if plan['mode'].endswith('_none') else '前复权日线：') + f"已同步 {count}/{total} 只，跳过 {len(skipped)} 只（可查看跳过名单，结束日期 {plan['end']}）",
             error_message=error,result=dict(success=result['complete'] and all(i['reason']=='no_daily_rows' for i in skipped),complete=result['complete'],skipped_items=skipped,success_count=count,total_processed=finished,
                 plan_sha256=plan['plan_sha256'],end=plan['end']))
-        if status!='running':update['finished_at']=self.clock()
+        if status!='running':update['finished_at']=self.record_now()
         await self.executions.update_one({'_id':execution_id},{'$set':update})
         # Existing scheduler progress endpoint reads this cache first.
         from app.routers.scheduler import _update_scheduler_progress_cache

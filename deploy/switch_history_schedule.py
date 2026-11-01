@@ -15,7 +15,7 @@ import sys
 import time
 import types
 
-ROOT = Path('/home/ubuntu/k-tradingagents-history-schedule-v1-20261102')
+ROOT = Path('/home/ubuntu/k-tradingagents-history-schedule-v2-20261102')
 STAGED = ROOT / 'staged'
 BACKEND = 'ta-live-088a60b962bf-backend-1'
 FRONTEND = 'ta-live-088a60b962bf-frontend-1'

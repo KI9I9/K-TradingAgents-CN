@@ -15,9 +15,9 @@ import time
 
 REPO=Path(__file__).resolve().parents[1]
 EVIDENCE=Path('/home/ubuntu/quote-guard-releases/production-20261028')
-RELEASE=Path('/home/ubuntu/quote-guard-releases/history-schedule-v1-20261102')
-ROOT='/home/ubuntu/k-tradingagents-history-schedule-v1-20261102'
-PREFLIGHT=EVIDENCE/'history-schedule-v1-preflight.json'
+RELEASE=Path('/home/ubuntu/quote-guard-releases/history-schedule-v2-20261102')
+ROOT='/home/ubuntu/k-tradingagents-history-schedule-v2-20261102'
+PREFLIGHT=EVIDENCE/'history-schedule-v2-preflight.json'
 FILES=('app/worker/tushare_sync_service.py','app/services/tushare_history_batches.py',
        'app/services/scheduler_runtime.py','tradingagents/utils/tushare_manual.py',
        'app/services/tushare_history_schedule.py','app/services/scheduler_service.py')

@@ -276,6 +276,35 @@ class ScheduledHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(button._TASKS)
         self.assertFalse(self.f.sent)
 
+    async def test_new_execution_heartbeat_matches_real_activity_query_after_bson_roundtrip(self):
+        from bson import BSON
+        from datetime import timedelta
+        entered,release=asyncio.Event(),asyncio.Event()
+        async def factory():entered.set();await release.wait();return self.f.provider
+        self.f.factory.side_effect=factory
+        task=asyncio.create_task(self.worker())
+        try:
+            await asyncio.wait_for(entered.wait(),2)
+            stored=BSON.encode(self.f.executions.rows['1']).decode()
+            tree=ast.parse(Path('app/services/scheduler_service.py').read_text())
+            node=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='build_active_running_query')
+            from typing import Optional,Dict,Any
+            ns=dict(Optional=Optional,Dict=Dict,Any=Any,ACTIVE_EXECUTION_WINDOW_MINUTES=30,timedelta=timedelta,
+                    get_utc8_now=lambda:self.f.clock.astimezone(gate_module.BJ).replace(tzinfo=None))
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),'<activity-query>','exec'),ns)
+            threshold=ns['build_active_running_query']()['$or'][0]['updated_at']['$gte']
+            self.assertGreaterEqual(stored['updated_at'],threshold)
+            self.assertEqual(stored['timestamp'],self.f.clock.replace(tzinfo=None))
+        finally:release.set();await task
+
+    async def test_incomplete_old_plan_requires_explicit_review_before_scheduling(self):
+        policy,state=self.f.gate.status()
+        await self.f.service._prepare(policy,state,True)
+        # A manual preparation interruption before a request can leave ready/pending.
+        with self.assertRaises(HTTPException):await self.worker()
+        self.assertFalse(self.f.sent)
+        self.assertTrue((self.f.gate.directory/'STOP').exists())
+
 
 if __name__=='__main__':
     unittest.main(defaultTest='ScheduledHistoryTests')
