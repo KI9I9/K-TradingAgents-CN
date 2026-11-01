@@ -94,7 +94,9 @@ def main():
     manifest=json.loads((ROOT/'manifest.json').read_text())
     assert manifest['candidate']==WINDOW and manifest['timer_sha256']==sha(NEW_TIMER),'candidate_changed'
     for path,entry in manifest['files'].items():
-        path=Path(path);assert sha(path.read_bytes())==entry['sha256'] and path.stat().st_mode&0o777==entry['mode'],'config_drift'
+        path=Path(path);info=path.stat()
+        assert (sha(path.read_bytes())==entry['sha256'] and info.st_mode&0o777==entry['mode']
+                and info.st_uid==entry['uid'] and info.st_gid==entry['gid']),'config_drift'
     assert run(['systemctl','is-active','ta-tushare-forward.service'])=='active','transport_not_active'
     assert WINDOW['not_before']<=time.time()<WINDOW['expires_at'],'candidate_expired'
     private('apply-reserved',str(time.time()).encode())

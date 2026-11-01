@@ -38,6 +38,9 @@ def save(name,value):
     fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
     with os.fdopen(fd,'wb') as stream:stream.write(raw);stream.flush();os.fsync(stream.fileno())
     require(path.read_bytes()==raw,'backup_readback_failed')
+    directory_fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try:os.fsync(directory_fd)
+    finally:os.close(directory_fd)
     return sha(raw)
 
 
@@ -116,6 +119,15 @@ def main(r):
         save('previous-execution.json',latest);save('new-policy.json',new_policy)
         registry=Path('/app/runtime/tushare-history-generations')
         shutil.copytree(registry,RUN/'generation-backup')
+        for path in (RUN/'generation-backup').rglob('*'):
+            if path.is_file():
+                copied=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+                try:os.fsync(copied)
+                finally:os.close(copied)
+        for path in [*(p for p in (RUN/'generation-backup').rglob('*') if p.is_dir()),RUN/'generation-backup']:
+            copied=os.open(path,os.O_RDONLY|os.O_DIRECTORY)
+            try:os.fsync(copied)
+            finally:os.close(copied)
         tree={str(p.relative_to(registry)):sha(p.read_bytes()) for p in registry.rglob('*') if p.is_file()}
         require(tree=={str(p.relative_to(RUN/'generation-backup')):sha(p.read_bytes()) for p in (RUN/'generation-backup').rglob('*') if p.is_file()},'ledger_backup_mismatch')
         save('backup-manifest.json',dict(history=backups,ledger_files=tree,completed=True))
