@@ -29,12 +29,13 @@ def probe(route):
  for index in range(3):
   started=time.monotonic();stage='connect';raw=None;secure=None
   row=dict(index=index+1,at=time.time())
-  def expire():
+  watchdog_socket=[None]
+  def expire(holder=watchdog_socket):
    # Shutdown the original descriptor, which TLS wrap detaches, via a duplicate.
-   if watchdog_socket[0] is not None:
-    try:watchdog_socket[0].shutdown(socket.SHUT_RDWR)
+   if holder[0] is not None:
+    try:holder[0].shutdown(socket.SHUT_RDWR)
     except OSError:pass
-  watchdog_socket=[None];timer=threading.Timer(30,expire);timer.daemon=True
+  timer=threading.Timer(30,expire);timer.daemon=True
   try:
    ctx=ssl.create_default_context();ctx.minimum_version=ssl.TLSVersion.TLSv1_2
    if route=='direct':raw=socket.socket(socket.AF_INET,socket.SOCK_STREAM);endpoint=('api.waditu.com',443)
