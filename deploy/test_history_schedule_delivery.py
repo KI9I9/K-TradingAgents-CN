@@ -37,15 +37,19 @@ class DeliveryTests(unittest.TestCase):
                 p=base/('fixed'+str(name));p.write_text('unchanged');p.chmod(0o600);others.append(p)
             watch=(auth,timer,*others);before={p:(p.read_bytes(),p.stat().st_mode&0o777,p.stat().st_uid,p.stat().st_gid) for p in watch}
             calls=[]
+            readiness=[]
             def run(argv):
                 calls.append(argv)
                 if argv[:2]==['systemctl','is-active']:return 'active'
+                if argv[:2]==['systemctl','show'] and '--property=ActiveState' in argv:
+                    readiness.append(True)
+                    return 'active' if len(readiness)>=3 else 'activating'
                 if argv[:2]==['systemctl','show']:return 'Sun 2026-11-08 14:00:00 CST'
                 if argv[:2]==['date','-u']:return str(renewal.EXPIRY+14*3600)
                 if argv[:2]==['busctl','get-property']:return 't '+str(renewal.EXPIRY*1000000)
                 return ''
             def invoke(action,runner):
-                with patch('sys.argv',['renew','--action',action]),patch.object(renewal,'run',side_effect=runner),redirect_stdout(io.StringIO()):renewal.main()
+                with patch('sys.argv',['renew','--action',action]),patch.object(renewal,'run',side_effect=runner),patch.object(renewal.time,'sleep'),redirect_stdout(io.StringIO()):renewal.main()
             with patch.multiple(renewal,ROOT=base/'release',AUTH=auth,TIMER=timer,WATCH=watch),patch.object(renewal.os,'geteuid',return_value=0):
                 invoke('prepare',run)
                 if fail:
@@ -62,7 +66,8 @@ class DeliveryTests(unittest.TestCase):
                     for p in (auth,timer):self.assertEqual((p.stat().st_mode&0o777,p.stat().st_uid,p.stat().st_gid),before[p][1:])
                     for p in others:self.assertEqual(p.read_bytes(),before[p][0])
             self.assertFalse(any(c[:2]==['systemctl','restart'] and c[-1]=='ta-tushare-forward.service' for c in calls))
-            self.assertFalse(any(c[0]=='date' or c[:2]==['systemctl','show'] for c in calls))
+            self.assertGreaterEqual(len(readiness),3)
+            self.assertFalse(any(c[0]=='date' or (c[:2]==['systemctl','show'] and '--property=ActiveState' not in c) for c in calls))
 
     def test_renewal_keeps_original_group_read_permissions_and_service_configuration(self):self.exercise_renewal()
     def test_timer_verification_failure_restores_exact_original_files(self):self.exercise_renewal(fail=True)

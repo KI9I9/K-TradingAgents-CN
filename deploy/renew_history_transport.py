@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import time
 
-ROOT=Path('/home/ubuntu/quote-guard-releases/history-schedule-transport-v2-20261102')
+ROOT=Path('/home/ubuntu/quote-guard-releases/history-schedule-transport-v3-20261102')
 AUTH=Path('/etc/ta-tushare-egress/authorization.json')
 TIMER=Path('/etc/systemd/system/ta-tushare-expire.timer')
 WATCH=(AUTH,TIMER,Path('/etc/ta-tushare-egress/check_deadline.py'),
@@ -41,7 +41,24 @@ WantedBy=timers.target
 def sha(raw):return hashlib.sha256(raw).hexdigest()
 
 
-def run(argv):return subprocess.check_output(argv,text=True,timeout=20,stderr=subprocess.DEVNULL).strip()
+def run(argv):
+    result=subprocess.run(argv,text=True,timeout=20,capture_output=True)
+    if result.returncode:
+        if ROOT.exists():private('command-failure-'+str(time.time_ns())+'.json',json.dumps(dict(
+            command=argv,returncode=result.returncode,stdout=result.stdout,stderr=result.stderr)).encode())
+        raise RuntimeError('command_failed:'+argv[0])
+    return result.stdout.strip()
+
+
+def wait_forward_active():
+    # The forward unit Requires=ta-tushare-expire.timer. Restarting that timer
+    # also restarts the forward unit, whose ExecCondition briefly leaves it
+    # activating. Observe readiness before treating that transition as failure.
+    deadline=time.monotonic()+20
+    while True:
+        if run(['systemctl','show','--property=ActiveState','--value','ta-tushare-forward.service'])=='active':return
+        if time.monotonic()>=deadline:raise RuntimeError('transport_not_active_after_timer_restart')
+        time.sleep(0.25)
 
 
 def timer_deadline_usec():
@@ -123,17 +140,19 @@ def main():
         run(['systemctl','daemon-reload']);run(['systemctl','restart','ta-tushare-expire.timer'])
         assert run(['systemctl','is-active','ta-tushare-expire.timer'])=='active','timer_not_active'
         assert timer_deadline_usec()==EXPIRY*1000000,'timer_deadline_mismatch'
-        assert run(['systemctl','is-active','ta-tushare-forward.service'])=='active','transport_not_active_after_reload'
+        wait_forward_active()
         for path in WATCH[2:]:assert sha(path.read_bytes())==manifest['files'][str(path)]['sha256'],'fixed_transport_changed'
         result=dict(status='renewed',expires_at=EXPIRY,expiry_utc=WINDOW['expiry_utc'],route_keys_tls_unchanged=True)
-    except BaseException:
-        result=dict(status='failed',restored=False)
+    except BaseException as error:
+        result=dict(status='failed',restored=False,error_type=type(error).__name__,
+            reason=str(error) if isinstance(error,(AssertionError,RuntimeError)) else 'details_withheld')
         if applied:
             for path in (AUTH,TIMER):
                 raw=(ROOT/'backup'/str(path).lstrip('/')).read_bytes()
                 entry=manifest['files'][str(path)]
                 replace(path,raw,entry['mode'],entry['uid'],entry['gid'])
             run(['systemctl','daemon-reload']);run(['systemctl','restart','ta-tushare-expire.timer'])
+            wait_forward_active()
             result['restored']=all(sha(p.read_bytes())==manifest['files'][str(p)]['sha256'] for p in (AUTH,TIMER))
     private('result.json',json.dumps(result).encode());print(json.dumps(result))
     if result['status']!='renewed':raise SystemExit(1)
