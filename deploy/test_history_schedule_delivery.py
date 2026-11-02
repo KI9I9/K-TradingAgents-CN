@@ -40,9 +40,9 @@ class DeliveryTests(unittest.TestCase):
             def run(argv):
                 calls.append(argv)
                 if argv[:2]==['systemctl','is-active']:return 'active'
-                if argv[:2]==['systemctl','show']:return 'Sun 2026-11-08 06:00:00 UTC'
-                if argv[:2]==['date','-u']:return str(renewal.EXPIRY)
-                if fail and argv[:2]==['systemctl','show']:raise RuntimeError('timer mismatch')
+                if argv[:2]==['systemctl','show']:return 'Sun 2026-11-08 14:00:00 CST'
+                if argv[:2]==['date','-u']:return str(renewal.EXPIRY+14*3600)
+                if argv[:2]==['busctl','get-property']:return 't '+str(renewal.EXPIRY*1000000)
                 return ''
             def invoke(action,runner):
                 with patch('sys.argv',['renew','--action',action]),patch.object(renewal,'run',side_effect=runner),redirect_stdout(io.StringIO()):renewal.main()
@@ -50,7 +50,7 @@ class DeliveryTests(unittest.TestCase):
                 invoke('prepare',run)
                 if fail:
                     def bad_run(argv):
-                        if argv[:2]==['systemctl','show']:raise RuntimeError('synthetic verification failure')
+                        if argv[:2]==['busctl','get-property']:return 't '+str((renewal.EXPIRY+14*3600)*1000000)
                         return run(argv)
                     with self.assertRaises(SystemExit):invoke('apply',bad_run)
                     self.assertEqual(json.loads((base/'release/result.json').read_text())['status'],'failed')
@@ -62,6 +62,7 @@ class DeliveryTests(unittest.TestCase):
                     for p in (auth,timer):self.assertEqual((p.stat().st_mode&0o777,p.stat().st_uid,p.stat().st_gid),before[p][1:])
                     for p in others:self.assertEqual(p.read_bytes(),before[p][0])
             self.assertFalse(any(c[:2]==['systemctl','restart'] and c[-1]=='ta-tushare-forward.service' for c in calls))
+            self.assertFalse(any(c[0]=='date' or c[:2]==['systemctl','show'] for c in calls))
 
     def test_renewal_keeps_original_group_read_permissions_and_service_configuration(self):self.exercise_renewal()
     def test_timer_verification_failure_restores_exact_original_files(self):self.exercise_renewal(fail=True)

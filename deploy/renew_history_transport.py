@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 import time
 
-ROOT=Path('/home/ubuntu/quote-guard-releases/history-schedule-transport-v1-20261102')
+ROOT=Path('/home/ubuntu/quote-guard-releases/history-schedule-transport-v2-20261102')
 AUTH=Path('/etc/ta-tushare-egress/authorization.json')
 TIMER=Path('/etc/systemd/system/ta-tushare-expire.timer')
 WATCH=(AUTH,TIMER,Path('/etc/ta-tushare-egress/check_deadline.py'),
@@ -42,6 +42,16 @@ def sha(raw):return hashlib.sha256(raw).hexdigest()
 
 
 def run(argv):return subprocess.check_output(argv,text=True,timeout=20,stderr=subprocess.DEVNULL).strip()
+
+
+def timer_deadline_usec():
+    # Never parse systemctl's localized CST string: GNU date interprets CST as
+    # America/Chicago, even when the host uses Asia/Shanghai (14 hours apart).
+    value=run(['busctl','get-property','org.freedesktop.systemd1',
+        '/org/freedesktop/systemd1/unit/ta_2dtushare_2dexpire_2etimer',
+        'org.freedesktop.systemd1.Timer','NextElapseUSecRealtime']).split()
+    assert len(value)==2 and value[0]=='t' and value[1].isdigit(),'timer_deadline_invalid'
+    return int(value[1])
 
 
 def private(name,raw):
@@ -76,6 +86,7 @@ def main():
         assert not ROOT.exists(),'already_prepared'
         assert run(['systemctl','is-active','ta-tushare-forward.service'])=='active','transport_not_active'
         run(['runuser','-u','ta-tushare-forward','--','python3','-B',str(WATCH[2]),str(AUTH)])
+        assert timer_deadline_usec()>0,'timer_not_scheduled'
         ROOT.mkdir(mode=0o700)
         files={}
         for path in WATCH:
@@ -111,8 +122,7 @@ def main():
         run(['systemd-analyze','verify',str(TIMER)])
         run(['systemctl','daemon-reload']);run(['systemctl','restart','ta-tushare-expire.timer'])
         assert run(['systemctl','is-active','ta-tushare-expire.timer'])=='active','timer_not_active'
-        next_time=run(['systemctl','show','--property=NextElapseUSecRealtime','--value','ta-tushare-expire.timer'])
-        assert int(run(['date','-u','--date',next_time,'+%s']))==EXPIRY,'timer_deadline_mismatch'
+        assert timer_deadline_usec()==EXPIRY*1000000,'timer_deadline_mismatch'
         assert run(['systemctl','is-active','ta-tushare-forward.service'])=='active','transport_not_active_after_reload'
         for path in WATCH[2:]:assert sha(path.read_bytes())==manifest['files'][str(path)]['sha256'],'fixed_transport_changed'
         result=dict(status='renewed',expires_at=EXPIRY,expiry_utc=WINDOW['expiry_utc'],route_keys_tls_unchanged=True)
