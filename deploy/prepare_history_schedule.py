@@ -12,6 +12,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import time
+import zlib
 
 REPO=Path(__file__).resolve().parents[1]
 EVIDENCE=Path('/home/ubuntu/quote-guard-releases/production-20261028')
@@ -170,12 +171,27 @@ def package():
     return dict(root=ROOT,files=files,manifest=manifest,override=override,image=baseline['backend']['image'],new_targets=sorted(NEW),seals=old_request['seal_hashes'],backend=BACKEND,verify=(REPO/'deploy/verify_compose_merge.py').read_text(),db_probe=db_probe(),backend_request=dict(modules=modules,generation=baseline['inside']['generation'],plan=baseline['inside']['plan_sha256'],protected_paths=list(old_request['protected_files']),targets=list(files),runtime=(REPO/'deploy/quote_guard_runtime.py').read_text()))
 
 
+REMOTE_BOOTSTRAP = (
+    "import sys,json,zlib,io; "
+    "q=json.loads(zlib.decompress(sys.stdin.buffer.read())); "
+    "sys.stdin=io.StringIO(json.dumps(q['request'])); "
+    "exec(compile(q['code'],'<history-schedule-management>','exec'))"
+)
+
+
 def remote(code,request,socket):
-    argv=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config','-S',str(socket) if socket else 'none','-C','-o','BatchMode=yes','-o','IPQoS=none','-o','ConnectTimeout=20','osaka-migration','sudo -n python3 -B -c '+shlex.quote(code)]
-    try:p=subprocess.run(argv,input=json.dumps(request) if request is not None else None,capture_output=True,text=True,timeout=240)
-    except subprocess.TimeoutExpired:raise SystemExit('management_timeout: inspect status, never repeat uncertain mutations') from None
+    # Keep the SSH command small. Code and credentials travel only on stdin;
+    # the remote operation cannot start until its complete envelope is decoded.
+    argv=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config','-S',str(socket) if socket else 'none','-o','BatchMode=yes','-o','IPQoS=none','-o','ConnectTimeout=20','-o','ConnectionAttempts=1','-o','ServerAliveInterval=10','-o','ServerAliveCountMax=3','osaka-migration','sudo -n python3 -B -c '+shlex.quote(REMOTE_BOOTSTRAP)]
+    wire=zlib.compress(json.dumps(dict(code=code,request=request)).encode(),9)
     stamp=EVIDENCE/('history-schedule-management-'+str(time.time_ns()))
-    stamp.with_suffix('.private').write_text(p.stderr)
+    try:p=subprocess.run(argv,input=wire,capture_output=True,timeout=240)
+    except subprocess.TimeoutExpired as error:
+        stamp.with_suffix('.stdout.private').write_bytes(error.stdout or b'')
+        stamp.with_suffix('.private').write_bytes(error.stderr or b'')
+        raise SystemExit('management_timeout: inspect status, never repeat uncertain mutations') from None
+    stamp.with_suffix('.stdout.private').write_bytes(p.stdout)
+    stamp.with_suffix('.private').write_bytes(p.stderr)
     if p.returncode:raise SystemExit('management_failed; details withheld; inspect status before retry')
     result=json.loads(p.stdout);stamp.with_suffix('.json').write_text(json.dumps(result,indent=2));return result
 
