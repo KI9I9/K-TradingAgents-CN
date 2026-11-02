@@ -36,6 +36,28 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):raise RuntimeError('redirect_refused')
 
 
+def raw_history(db,name,backup=False):
+    """Stream exact BSON and its readback, without holding the market in RAM."""
+    collection=db.get_collection(name,codec_options=CodecOptions(document_class=RawBSONDocument))
+    stream=None;h=hashlib.sha256();count=0
+    try:
+        if backup:
+            fd=os.open(RUN/(name+'.bson'),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            stream=os.fdopen(fd,'wb')
+        for row in collection.find({'data_source':'tushare'}).sort('_id',1).batch_size(500).max_time_ms(30000):
+            h.update(row.raw);count+=1
+            if stream is not None:stream.write(row.raw)
+        if stream is not None:stream.flush();os.fsync(stream.fileno())
+    finally:
+        if stream is not None:stream.close()
+    if backup:
+        readback=hashlib.sha256()
+        with (RUN/(name+'.bson')).open('rb') as f:
+            for chunk in iter(lambda:f.read(1024*1024),b''):readback.update(chunk)
+        require(readback.hexdigest()==h.hexdigest(),'backup_readback_failed')
+    return dict(count=count,sha256=h.hexdigest())
+
+
 def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
          run_directory=None, scheduled_recovery=False, check_only=False):
     global RUN
@@ -97,12 +119,8 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
                 gate.directory/'policy.json',gate.directory/'STOP',PERMIT,Path('/app/runtime/tushare-egress/STOP')]
             baseline={'files':{str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in protected},'history':{}}
             for name,expected in [('stock_daily_quotes',2112),('stock_daily_quotes_unadjusted',raw_count)]:
-                col=db.get_collection(name,codec_options=CodecOptions(document_class=RawBSONDocument))
-                h=hashlib.sha256();count=0
-                for row in col.find({'data_source':'tushare'}).sort('_id',1).max_time_ms(30000):
-                    h.update(row.raw);count+=1
-                require(count==expected,'inventory_changed')
-                baseline['history'][name]=dict(count=count,sha256=h.hexdigest())
+                actual=raw_history(db,name);require(actual['count']==expected,'inventory_changed')
+                baseline['history'][name]=actual
             require(check_only or baseline==r['baseline'],'recovery_baseline_changed')
         os.environ.update(env)
         async def recover(readonly=False):
@@ -133,12 +151,15 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
         report['stage']='backup'
         hashes={};before={}
         for name,expected in [('stock_daily_quotes',2112),('stock_daily_quotes_unadjusted',raw_count)]:
-            collection=db.get_collection(name,codec_options=CodecOptions(document_class=RawBSONDocument)) if scheduled_recovery else db[name]
-            cursor=collection.find({'data_source':'tushare'})
-            rows=list((cursor.sort('_id',1) if scheduled_recovery else cursor).max_time_ms(30000))
-            require(len(rows)==expected,'inventory_changed')
-            raw=b''.join(row.raw for row in rows) if scheduled_recovery else b''.join(BSON.encode(row) for row in sorted(rows,key=lambda x:str(x['_id'])))
-            hashes[name+'.bson']=save(name+'.bson',raw);before[name]=rows
+            if scheduled_recovery:
+                actual=raw_history(db,name,backup=True)
+                require(actual==baseline['history'][name],'history_changed_during_backup')
+                hashes[name+'.bson']=actual['sha256'];before[name]=None
+            else:
+                rows=list(db[name].find({'data_source':'tushare'}).max_time_ms(15000))
+                require(len(rows)==expected,'inventory_changed')
+                raw=b''.join(BSON.encode(row) for row in sorted(rows,key=lambda x:str(x['_id'])))
+                hashes[name+'.bson']=save(name+'.bson',raw);before[name]=rows
             hashes[name+'-indexes.json']=save(name+'-indexes.json',db[name].index_information())
         # Preserve every old ledger byte, including STOP, before modifying just one item.
         ledger={str(p.relative_to(gate.directory)):p.read_bytes().hex() for p in gate.directory.rglob('*') if p.is_file()}
@@ -154,11 +175,12 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
         report['stage']='verify_data'
         # No writes should have occurred during recovery; preserve exact BSON proof.
         for name,rows in before.items():
-            collection=db.get_collection(name,codec_options=CodecOptions(document_class=RawBSONDocument)) if scheduled_recovery else db[name]
-            cursor=collection.find({'data_source':'tushare'})
-            current=list((cursor.sort('_id',1) if scheduled_recovery else cursor).max_time_ms(30000))
-            raw=b''.join(row.raw for row in current) if scheduled_recovery else b''.join(BSON.encode(row) for row in sorted(current,key=lambda x:str(x['_id'])))
-            require(hashlib.sha256(raw).hexdigest()==hashes[name+'.bson'],'data_changed_during_recovery')
+            if scheduled_recovery:
+                require(raw_history(db,name)==baseline['history'][name],'data_changed_during_recovery')
+            else:
+                current=list(db[name].find({'data_source':'tushare'}).max_time_ms(15000))
+                raw=b''.join(BSON.encode(row) for row in sorted(current,key=lambda x:str(x['_id'])))
+                require(hashlib.sha256(raw).hexdigest()==hashes[name+'.bson'],'data_changed_during_recovery')
         if scheduled_recovery:
             with gate.locked() as fd:
                 _,current=gate.read(fd)

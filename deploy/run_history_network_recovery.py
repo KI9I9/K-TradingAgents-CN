@@ -115,8 +115,8 @@ def package():
                 id='289f124728af45e8a27475e5bdd908e9',sent=['daily'],start='2026-10-29')))
 
 
-def remote(code,data=None,mss=False):
-    cmd=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config','-S','none',
+def remote(code,data=None,mss=False,control_socket=None):
+    cmd=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config','-S',str(control_socket) if control_socket else 'none',
          '-o','BatchMode=yes','-o','ConnectTimeout=20','-o','ConnectionAttempts=1','-o','IPQoS=none',
          '-o','ServerAliveInterval=5','-o','ServerAliveCountMax=2']
     if mss:cmd+=['-o','ProxyCommand=python3 -B /home/ubuntu/quote-guard-releases/paper-supply-research-20261102/ssh_mss_probe.py']
@@ -136,8 +136,9 @@ def main():
     parser.add_argument('--check-result',type=Path)
     parser.add_argument('--credentials-file',type=Path)
     parser.add_argument('--mss',action='store_true')
+    parser.add_argument('--control-socket',type=Path)
     args=parser.parse_args();os.umask(0o077);RELEASE.mkdir(mode=0o700,exist_ok=True)
-    if args.action=='status':value=remote(STATUS,mss=args.mss)
+    if args.action=='status':value=remote(STATUS,mss=args.mss,control_socket=args.control_socket)
     elif args.action=='freeze':
         require(args.check_result is not None,'check_receipt_required')
         check=json.loads(args.check_result.read_text())['check'];result=check['result.json']
@@ -161,7 +162,7 @@ def main():
                     and {k:v for k,v in frozen['request'].items() if k!='baseline'}==current['request'],'operator_changed')
         request=dict(package=raw.decode(),sha256=sha(raw),check_only=args.action=='check',attempt=uuid.uuid4().hex)
         if args.action=='execute':request['auth']=read_auth(args.credentials_file,True)
-        value=remote(LAUNCH,request,args.mss)
+        value=remote(LAUNCH,request,args.mss,args.control_socket)
     print(json.dumps(value,ensure_ascii=False))
 
 
