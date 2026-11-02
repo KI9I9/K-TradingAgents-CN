@@ -75,7 +75,7 @@ class PreparationTests(unittest.TestCase):
         elif args[0] == 'systemctl':
             self.assertEqual(args[1], 'show')
             unit = args[2]
-            p = dict(FragmentPath=str(self.unitdir / unit), DropInPaths='', ActiveState='active', ExecCondition='')
+            p = dict(FragmentPath=str(self.unitdir / unit), DropInPaths='', ActiveState='active', SubState='running', ExecCondition='')
             if unit == tool.UNIT:
                 p.update(User='ta-tushare-proxy', Group='ta-tushare-proxy', DynamicUser='yes', PrivateNetwork='no',
                          ExecStart='{ argv[]=/usr/lib/systemd/systemd-socket-proxyd --connections-max=4 127.0.0.1:32879 ; pid=1 }')
