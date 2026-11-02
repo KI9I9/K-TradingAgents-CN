@@ -261,14 +261,26 @@ class FrozenEnvelope(unittest.TestCase):
                     compile(packet['code'],'<ssh-bootstrap>','exec')
                     self.assertIn("root/'execution-v2-reserved'",packet['code'])
                     self.assertEqual(packet['data']['auth']['password'],'SECRET_CANARY')
-                    uploaded=json.loads(packet['data']['upload'])
-                    self.assertNotIn('SECRET_CANARY',packet['data']['upload'])
+                    data=packet['data']
+                    if 'upload' in data:
+                        uploaded=json.loads(data['upload'])
+                        self.assertNotIn('SECRET_CANARY',data['upload'])
+                    else:
+                        self.assertEqual(data['base_sha256'],switch.digest(raw))
+                        uploaded=json.loads(raw);replacement=data['replacement']
+                        uploaded.update(code=replacement['code'],code_sha256=replacement['code_sha256'])
+                        uploaded['payload']['check_only']=replacement['check_only']
+                        uploaded['payload']['baseline_recovery']=replacement['baseline_recovery']
+                        self.assertNotIn('SECRET_CANARY',json.dumps(replacement))
+                    self.assertEqual(switch.digest(switch.canonical(uploaded)),data['upload_sha256'])
                     calls.append(uploaded['payload']['check_only'])
                     return subprocess.CompletedProcess(argv,0,b'{"attempt":"fake"}',b'')
                 with patch.object(runner.subprocess,'run',side_effect=ssh):
                     runner.remote('check',auth)
                     runner.remote('execute',auth)
-                self.assertEqual(calls,[True,False])
+                    with patch.object(runner,'RELEASE',release2):
+                        runner.remote('check',auth,reuse_base=release/'controller.json')
+                self.assertEqual(calls,[True,False,True])
 
 
 if __name__=='__main__':

@@ -64,7 +64,7 @@ def freeze(preflight_file,recovery_file=None,preferences_diff_file=None,recovery
                 quote_permit_installed=False)
 
 
-def remote(action,credentials=None,control_socket=None):
+def remote(action,credentials=None,control_socket=None,reuse_base=None):
     old_root=launch.REMOTE_ROOT
     if action in ('check','execute'):
         raw=(RELEASE/'controller.json').read_bytes()
@@ -77,12 +77,36 @@ def remote(action,credentials=None,control_socket=None):
         # The legacy envelope provides detached execution and one-shot reserve;
         # its fixed upload prefix is harmless because the content hash is unique.
         path='/home/ubuntu/history-button-switch-upload-'+identity+'.json'
-        code="import pathlib,sys,json,io,hashlib,os\nos.umask(0o077)\nr=json.load(sys.stdin);raw=r['upload'].encode();p=pathlib.Path("+repr(path)+")\n"
+        code="import pathlib,sys,json,io,hashlib,os\nos.umask(0o077)\nr=json.load(sys.stdin)\n"
+        data=dict(upload_sha256=identity,auth=read_auth(credentials,True))
+        if reuse_base is None:
+            data['upload']=upload.decode()
+            code+="raw=r['upload'].encode()\n"
+        else:
+            # Reuse verified non-secret bytes already uploaded for v1. Rebuild
+            # only the controller and recovery anchor, then compare the entire
+            # canonical package, both locally and remotely, with the frozen SHA.
+            base_raw=reuse_base.read_bytes();base=json.loads(base_raw)
+            replacement=dict(code=package['code'],code_sha256=package['code_sha256'],
+                check_only=package['payload']['check_only'],
+                baseline_recovery=package['payload'].get('baseline_recovery'))
+            rebuilt=json.loads(base_raw)
+            rebuilt.update(code=replacement['code'],code_sha256=replacement['code_sha256'])
+            rebuilt['payload']['check_only']=replacement['check_only']
+            if replacement['baseline_recovery'] is not None:
+                rebuilt['payload']['baseline_recovery']=replacement['baseline_recovery']
+            require(canonical(rebuilt)==upload,'reuse_base_cannot_reconstruct_frozen_package')
+            data.update(base_sha256=digest(base_raw),replacement=replacement)
+            code+="base=pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+r['base_sha256']+'.json')\n"
+            code+="original=base.read_bytes();assert hashlib.sha256(original).hexdigest()==r['base_sha256'],'reuse_base_changed'\n"
+            code+="value=json.loads(original);patch=r['replacement'];value.update(code=patch['code'],code_sha256=patch['code_sha256'])\n"
+            code+="value['payload']['check_only']=patch['check_only']\nif patch['baseline_recovery'] is not None:value['payload']['baseline_recovery']=patch['baseline_recovery']\n"
+            code+="raw=json.dumps(value,sort_keys=True,separators=(',',':')).encode()\n"
+        code+="p=pathlib.Path("+repr(path)+")\n"
         code+="assert hashlib.sha256(raw).hexdigest()==r['upload_sha256'],'upload_hash_changed'\nif p.exists():assert p.read_bytes()==raw,'upload_changed'\nelse:\n with p.open('xb') as f:f.write(raw);f.flush();os.fsync(f.fileno())\n"
         code+="sys.stdin=io.StringIO(json.dumps({'upload_sha256':r['upload_sha256'],'auth':r['auth']}))\n"
         code+=launch.LAUNCH.replace(old_root,str(ROOT)).replace(
             "root/'execution-reserved'", "root/'execution-v2-reserved'")
-        data=dict(upload=upload.decode(),upload_sha256=identity,auth=read_auth(credentials,True))
     else:
         code=launch.STATUS.replace(old_root,str(ROOT))
         code=code.replace("process=json.loads((root/'latest-attempt.json').read_text())",
@@ -120,13 +144,14 @@ def main():
     parser.add_argument('--recovery-attempt')
     parser.add_argument('--credentials-file',type=Path)
     parser.add_argument('--control-socket',type=Path)
+    parser.add_argument('--reuse-base-package',type=Path)
     args=parser.parse_args();os.umask(0o077)
     if args.action=='freeze':
         require(args.preflight_file is not None,'preflight_file_required')
         result=freeze(args.preflight_file,args.recovery_file,args.preferences_diff_file,args.recovery_attempt)
     else:
         if args.action in ('check','execute'):require(args.credentials_file is not None,'credentials_required')
-        result=remote(args.action,args.credentials_file,args.control_socket)
+        result=remote(args.action,args.credentials_file,args.control_socket,args.reuse_base_package)
     print(json.dumps(result))
 
 
