@@ -150,6 +150,9 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         status = json.loads((Path(self.r['root']) / 'status.json').read_text())
         self.assertEqual(status['stage'], 'failed_no_route_change')
+        errors = list(Path(self.r['root']).glob('command-failure-*.json'))
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(json.loads(errors[0].read_text())['stderr'], 'TLS failed')
 
 
 if __name__ == '__main__':

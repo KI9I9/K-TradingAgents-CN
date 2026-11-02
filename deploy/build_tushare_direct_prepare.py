@@ -60,6 +60,8 @@ def require(ok,reason):
 def digest(raw):return hashlib.sha256(raw).hexdigest()
 def run(args,timeout=12):
  p=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
+ if p.returncode and args[0] in ('runuser','systemd-analyze'):
+  save(root/('command-failure-'+str(time.time_ns())+'.json'),json.dumps(dict(program=args[0],returncode=p.returncode,stderr=p.stderr)).encode())
  require(p.returncode==0,'command_failed:'+args[0]);return p.stdout.strip()
 def properties(unit):
  fields=['FragmentPath','DropInPaths','ExecStart','ExecCondition','User','Group','ActiveState','SubState','IPAddressDeny','IPAddressAllow','PrivateNetwork','RestrictAddressFamilies','Listen']
