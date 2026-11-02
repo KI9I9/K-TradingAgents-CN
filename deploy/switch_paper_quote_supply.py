@@ -23,6 +23,38 @@ JOBS = ['akshare_quotes_sync','quotes_ingestion_service','etf_sync',
 HISTORY = {'tushare_historical_sync','akshare_historical_sync'}
 MIN_HISTORY_WINDOW_SECONDS = 1800  # Includes the possible rollback window.
 
+# enforce_manual_jobs refreshes only these disabled jobs on every application
+# startup. Keep their full BSON (and every other preference) in the backup;
+# exclude only their expected updated_at values from the restart comparison.
+PREFERENCE_TIMESTAMP_JOBS = (
+    'tushare_basic_info_sync', 'tushare_financial_sync',
+    'tushare_status_check', 'tushare_realtime_quotes_hourly',
+)
+PREFERENCES_GUARD = r'''
+from bson import BSON, decode_all
+from bson.codec_options import CodecOptions
+from bson.raw_bson import RawBSONDocument
+from datetime import datetime
+allowed = {'tushare_basic_info_sync', 'tushare_financial_sync',
+           'tushare_status_check', 'tushare_realtime_quotes_hourly'}
+assert hashlib.sha256(raw).hexdigest() == collections['scheduler_preferences']['sha256'], 'preference_raw_snapshot_mismatch'
+rows = decode_all(bytes(raw), codec_options=CodecOptions(document_class=RawBSONDocument))
+normalized = bytearray(); seen = set()
+for row in rows:
+    job_id = row['_id']
+    if job_id in allowed:
+        assert row.get('enabled') is False, 'closed_preference_enabled'
+        assert isinstance(row.get('updated_at'), datetime), 'preference_timestamp_invalid'
+        value = dict(row); del value['updated_at']
+        normalized.extend(BSON.encode(value)); seen.add(job_id)
+    else:
+        normalized.extend(row.raw)
+assert seen == allowed, 'closed_preference_missing'
+assert len(rows) == collections['scheduler_preferences']['count'], 'preference_count_mismatch'
+print('PAPER_PREF_GUARD:' + json.dumps(dict(count=len(rows),
+    sha256=hashlib.sha256(normalized).hexdigest(), ignored_updated_at_jobs=sorted(seen))))
+'''
+
 
 def require(value, reason):
     if not value:
@@ -86,10 +118,13 @@ def expected_modules(new):
 def snapshot(new,backup=False):
     request=dict(runtime=REQUEST['runtime'],entry_hash=HELPER.ENTRY_HASH,
                  modules=expected_modules(new),backup=backup)
-    raw=run(['docker','exec','-i',BACKEND,'python3','-B','-c',HELPER.BACKEND_SNAPSHOT],json.dumps(request))
+    raw=run(['docker','exec','-i',BACKEND,'python3','-B','-c',HELPER.BACKEND_SNAPSHOT+'\n'+PREFERENCES_GUARD],json.dumps(request))
     rows=[line.split(':',1)[1] for line in raw.splitlines() if line.startswith('PAPER_SNAPSHOT:')]
     require(len(rows)==1,'snapshot_invalid')
     result=json.loads(rows[0])
+    guards=[line.split(':',1)[1] for line in raw.splitlines() if line.startswith('PAPER_PREF_GUARD:')]
+    require(len(guards)==1,'preference_guard_missing')
+    result['scheduler_preferences_guard']=json.loads(guards[0])
     backups=result.pop('backups')
     if backup:
         for name,encoded in backups.items():
@@ -106,7 +141,18 @@ def snapshot(new,backup=False):
 
 
 def protected(snapshot_value):
-    return {key:value for key,value in snapshot_value.items() if key!='modules'}
+    result=json.loads(json.dumps({key:value for key,value in snapshot_value.items() if key!='modules'}))
+    preferences=result.get('collections',{}).get('scheduler_preferences')
+    if preferences is not None:
+        guard=result.get('scheduler_preferences_guard',{})
+        require(guard.get('count')==preferences['count']
+                and guard.get('ignored_updated_at_jobs')==sorted(PREFERENCE_TIMESTAMP_JOBS)
+                and isinstance(guard.get('sha256'),str) and len(guard['sha256'])==64,
+                'preference_guard_invalid')
+        # The raw hash remains in the evidence and backup manifest. The guard
+        # still detects every other field, type, document and enabled flag.
+        del preferences['sha256']
+    return result
 
 
 def seal_check(info):
@@ -183,14 +229,29 @@ def original_check():
         require(digest(Path(source).read_bytes())==REQUEST['modules'][target],'original_source_changed')
 
 
+def check_baseline(info,fresh):
+    recovery=PAYLOAD.get('baseline_recovery')
+    if recovery is not None:
+        directory=ROOT/'attempts'/recovery['attempt']
+        require(directory.parent==ROOT/'attempts','invalid_recovery_attempt')
+        saved=directory/'recovery-original.json'
+        require(json.loads(saved.read_text())==recovery['report'],'recovery_receipt_changed')
+        fields=saved.with_name('recovery-preference-diff.json')
+        require(json.loads(fields.read_text())==recovery['preference_diff'],'recovery_preference_evidence_changed')
+        require(recovery['report']['status']=='original_backend_recovered'
+                and recovery['report']['protected_except_preferences_digest_unchanged'] is True
+                and recovery['report']['id']==info['Id'],'recovered_baseline_changed')
+    else:
+        require(info['Id']==fresh['backend_id'],'baseline_container_changed')
+
+
 def preflight():
     fresh=PAYLOAD['preflight']
     require(fresh['ok'] and fresh['stage']=='prepared_no_switch','successful_preparation_required')
     require(digest(canonical(json.loads((ROOT/'preflight.json').read_text())))==digest(canonical(fresh)),'preparation_receipt_changed')
     require(canonical(json.loads((ROOT/'request.json').read_text()))==canonical(REQUEST),'preparation_request_changed')
     staged_check();original_check()
-    info=check_running(False)
-    require(info['Id']==fresh['backend_id'],'baseline_container_changed')
+    info=check_running(False);check_baseline(info,fresh)
     labels=info['Config']['Labels']
     require(labels['com.docker.compose.project.config_files'].split(',')==[
         arg for i,arg in enumerate(chain(False)) if i and chain(False)[i-1]=='-f'],'compose_chain_changed')

@@ -10,6 +10,9 @@ from unittest.mock import patch
 import subprocess
 import os
 import zlib
+import hashlib
+import io
+from contextlib import redirect_stdout
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'deploy'))
 import switch_paper_quote_supply as switch
@@ -48,6 +51,28 @@ class SwitchBranches(unittest.TestCase):
         self.ns['PAYLOAD']['check_only']=True
         self.assertEqual(self.ns['main'](),0);self.assertEqual(self.actions,[])
 
+    def preferences(self):
+        self.before['collections']['scheduler_preferences']={'count':22,'sha256':'a'*64}
+        self.before['scheduler_preferences_guard']={'count':22,'sha256':'b'*64,
+            'ignored_updated_at_jobs':sorted(switch.PREFERENCE_TIMESTAMP_JOBS)}
+        self.after=copy.deepcopy(self.before);self.after['modules']['paper']='new'
+        self.after['collections']['scheduler_preferences']['sha256']='c'*64
+
+    def test_restart_timestamp_changes_do_not_trigger_rollback(self):
+        self.preferences()
+        self.assertEqual(self.ns['main'](),0)
+        self.assertNotIn(('up',False),self.actions)
+
+    def test_other_preference_changes_still_trigger_rollback(self):
+        self.preferences();self.after['scheduler_preferences_guard']['sha256']='d'*64
+        self.assertEqual(self.ns['main'](),1)
+        self.assertEqual(self.events[-1],'rolled_back_quote_delivery')
+
+    def test_missing_preference_guard_never_bypasses_verification(self):
+        self.preferences();self.after.pop('scheduler_preferences_guard')
+        self.assertEqual(self.ns['main'](),1)
+        self.assertEqual(self.ns['STATE']['failure_code'],'preference_guard_invalid')
+
     def test_backup_failure_never_stops_backend(self):
         self.ns['preflight']=lambda:(_ for _ in ()).throw(RuntimeError('backup_failed'))
         self.assertEqual(self.ns['main'](),1);self.assertEqual(self.actions,[])
@@ -85,6 +110,28 @@ class SwitchBranches(unittest.TestCase):
 
 
 class RealGuards(unittest.TestCase):
+    def test_recovered_baseline_requires_matching_remote_receipts_and_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);attempt=root/'attempts/recovered';attempt.mkdir(parents=True)
+            report=dict(status='original_backend_recovered',id='recovered',
+                        protected_except_preferences_digest_unchanged=True)
+            fields={'changes':['only_expected_metadata']}
+            saved=attempt/'recovery-original.json';saved.write_text(json.dumps(report))
+            proof=attempt/'recovery-preference-diff.json';proof.write_text(json.dumps(fields))
+            ns={'__name__':'offline_baseline'}
+            exec(compile(Path(switch.__file__).read_text(),switch.__file__,'exec'),ns)
+            ns.update(ROOT=root,PAYLOAD={'baseline_recovery':dict(attempt='recovered',
+                report=report,preference_diff=fields)})
+            ns['check_baseline']({'Id':'recovered'},{'backend_id':'original'})
+            with self.assertRaisesRegex(RuntimeError,'recovered_baseline_changed'):
+                ns['check_baseline']({'Id':'another'},{'backend_id':'original'})
+            proof.write_text('{}')
+            with self.assertRaisesRegex(RuntimeError,'recovery_preference_evidence_changed'):
+                ns['check_baseline']({'Id':'recovered'},{'backend_id':'original'})
+            ns['PAYLOAD']={}
+            with self.assertRaisesRegex(RuntimeError,'baseline_container_changed'):
+                ns['check_baseline']({'Id':'recovered'},{'backend_id':'original'})
+
     def test_no_container_left_is_already_stopped(self):
         ns={'__name__':'offline_stop'}
         exec(compile(Path(switch.__file__).read_text(),switch.__file__,'exec'),ns)
@@ -128,6 +175,43 @@ class RealGuards(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'original_compose_changed'):ns['original_check']()
 
 
+class PreferenceBsonGuard(unittest.TestCase):
+    def rows(self):
+        return [dict(_id=job,enabled=False,updated_at=datetime(2026,11,2,7),extra='retained')
+                for job in sorted(switch.PREFERENCE_TIMESTAMP_JOBS)]+[
+            dict(_id='tushare_historical_sync',enabled=True,updated_at=datetime(2026,11,2,6))]
+
+    def guard(self,rows,raw_sha=None):
+        from bson import BSON
+        raw=b''.join(BSON.encode(row) for row in rows);output=io.StringIO()
+        with redirect_stdout(output):
+            exec(switch.PREFERENCES_GUARD,dict(raw=raw,hashlib=hashlib,json=json,
+                collections={'scheduler_preferences':{'count':len(rows),
+                    'sha256':raw_sha or hashlib.sha256(raw).hexdigest()}}))
+        return json.loads(output.getvalue().split(':',1)[1])
+
+    def test_only_known_disabled_startup_timestamps_are_ignored(self):
+        before=self.rows();after=copy.deepcopy(before)
+        for row in after[:-1]:row['updated_at']+=timedelta(minutes=5)
+        self.assertEqual(self.guard(before),self.guard(after))
+        after[-1]['updated_at']+=timedelta(minutes=5)
+        self.assertNotEqual(self.guard(before),self.guard(after))
+
+    def test_other_fields_on_closed_jobs_remain_protected(self):
+        before=self.rows();after=copy.deepcopy(before);after[0]['extra']='changed'
+        self.assertNotEqual(self.guard(before),self.guard(after))
+
+    def test_enabling_or_dropping_closed_job_rejects(self):
+        rows=self.rows();rows[0]['enabled']=True
+        with self.assertRaisesRegex(AssertionError,'closed_preference_enabled'):self.guard(rows)
+        with self.assertRaisesRegex(AssertionError,'closed_preference_missing'):self.guard(self.rows()[1:])
+
+    def test_bad_timestamp_and_wrong_raw_snapshot_reject(self):
+        rows=self.rows();rows[0]['updated_at']='2026-11-02'
+        with self.assertRaisesRegex(AssertionError,'preference_timestamp_invalid'):self.guard(rows)
+        with self.assertRaisesRegex(AssertionError,'preference_raw_snapshot_mismatch'):self.guard(self.rows(),'0'*64)
+
+
 class FrozenEnvelope(unittest.TestCase):
     def test_freeze_requires_real_success_and_credentials_stay_out_of_artifact_and_argv(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -152,11 +236,30 @@ class FrozenEnvelope(unittest.TestCase):
                 self.assertEqual(switch.digest(raw),frozen['sha256'])
                 self.assertNotIn(b'SECRET_CANARY',raw)
                 self.assertEqual((release/'controller.json').stat().st_mode&0o777,0o600)
+                recovery=work/'recovery.json';field_diff=work/'fields.json'
+                recovery.write_text(json.dumps(dict(status='original_backend_recovered',id='a'*64,
+                    running=True,health='healthy',mounts=43,quote_permit_absent=True,
+                    protected_except_preferences_digest_unchanged=True)))
+                fields=dict(before_count=22,after_count=22,changes=[
+                    dict(job_id=job,changed_fields=['updated_at'],before_enabled=False,after_enabled=False)
+                    for job in switch.PREFERENCE_TIMESTAMP_JOBS])
+                changed=copy.deepcopy(fields);changed['changes'][0]['changed_fields']=['enabled']
+                field_diff.write_text(json.dumps(changed));release2=work/'v2'
+                with patch.object(runner,'RELEASE',release2):
+                    with self.assertRaisesRegex(ValueError,'unexpected_preference_changes'):
+                        runner.freeze(receipt,recovery,field_diff,'20261102T070244Z-97c5cc40')
+                    self.assertFalse(release2.exists())
+                    field_diff.write_text(json.dumps(fields))
+                    runner.freeze(receipt,recovery,field_diff,'20261102T070244Z-97c5cc40')
+                    adopted=json.loads((release2/'controller.json').read_text())['payload']['baseline_recovery']
+                    self.assertEqual(adopted['report']['id'],'a'*64)
+                    self.assertEqual(adopted['preference_diff'],fields)
                 calls=[]
                 def ssh(argv,**kw):
                     self.assertNotIn('SECRET_CANARY',str(argv))
                     packet=json.loads(zlib.decompress(kw['input']))
                     compile(packet['code'],'<ssh-bootstrap>','exec')
+                    self.assertIn("root/'execution-v2-reserved'",packet['code'])
                     self.assertEqual(packet['data']['auth']['password'],'SECRET_CANARY')
                     uploaded=json.loads(packet['data']['upload'])
                     self.assertNotIn('SECRET_CANARY',packet['data']['upload'])
