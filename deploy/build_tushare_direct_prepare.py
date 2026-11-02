@@ -6,12 +6,22 @@ from pathlib import Path
 
 from build_route_assessment_console import BACKEND_ID, IMAGE
 
-ROOT = '/home/ubuntu/k-tradingagents-direct-route-20261103-v1'
+ROOT = '/home/ubuntu/k-tradingagents-direct-route-20261103-v2'
 EXPIRY = 1794117600  # 2026-11-08 14:00 Asia/Shanghai; no extension.
 UNIT = 'ta-tushare-egress.service'
 SOCKET = 'ta-tushare-egress.socket'
 EXPIRY_UNIT = 'ta-tushare-direct-expire-20261103'
 DROPIN_PATH = '/etc/systemd/system/ta-tushare-egress.service.d/90-direct-route-20261103.conf'
+PROBE_UNIT = 'ta-tushare-direct-preflight-20261103-v2.service'
+# Match the original service sandbox, using a distinct transient dynamic user.
+# The proxy's DynamicUser identity is not a static account for runuser.
+SANDBOX = dict(DynamicUser='yes', User='ta-tushare-proxy', UMask='0077',
+               LimitCORE='0', LimitNOFILE='64', MemoryMax='32M', TasksMax='8', CPUQuota='20%',
+               NoNewPrivileges='yes', CapabilityBoundingSet='', AmbientCapabilities='',
+               PrivateTmp='yes', PrivateDevices='yes', ProtectSystem='strict', ProtectHome='yes',
+               ProtectKernelTunables='yes', ProtectKernelModules='yes', ProtectControlGroups='yes',
+               RestrictSUIDSGID='yes', RestrictNamespaces='yes', LockPersonality='yes',
+               RestrictAddressFamilies='AF_UNIX AF_INET')
 
 DROPIN = f'''[Service]
 ExecCondition=/usr/bin/python3 -c "import sys,time; sys.exit(0 if time.time() < {EXPIRY} else 1)"
@@ -53,18 +63,18 @@ print(json.dumps(rows))
 '''
 
 PREPARE = r'''
-import fcntl,hashlib,json,os,pathlib,stat,subprocess,time
+import configparser,fcntl,hashlib,json,os,pathlib,stat,subprocess,time
 os.umask(0o077)
 def require(ok,reason):
  if not ok:raise RuntimeError(reason)
 def digest(raw):return hashlib.sha256(raw).hexdigest()
 def run(args,timeout=12):
  p=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
- if p.returncode and args[0] in ('runuser','systemd-analyze'):
+ if p.returncode and args[0] in ('systemd-run','systemd-analyze'):
   save(root/('command-failure-'+str(time.time_ns())+'.json'),json.dumps(dict(program=args[0],returncode=p.returncode,stderr=p.stderr)).encode())
  require(p.returncode==0,'command_failed:'+args[0]);return p.stdout.strip()
 def properties(unit):
- fields=['FragmentPath','DropInPaths','ExecStart','ExecCondition','User','Group','ActiveState','SubState','IPAddressDeny','IPAddressAllow','PrivateNetwork','RestrictAddressFamilies','Listen']
+ fields=['FragmentPath','DropInPaths','ExecStart','ExecCondition','User','Group','DynamicUser','ActiveState','SubState','IPAddressDeny','IPAddressAllow','PrivateNetwork','RestrictAddressFamilies','Listen']
  return dict(l.split('=',1) for l in run(['systemctl','show',unit]+sum([['-p',k] for k in fields],[])).splitlines() if '=' in l)
 def entry(path):
  s=path.lstat();require(stat.S_ISREG(s.st_mode),'not_regular:'+str(path))
@@ -119,7 +129,7 @@ else:
   require(service['FragmentPath']==str(unit_directory/request['unit']) and sock['FragmentPath']==str(unit_directory/request['socket']),'unit_path_changed')
   require(not service.get('DropInPaths') and not sock.get('DropInPaths') and not service.get('ExecCondition'),'existing_overrides')
   require(all(p['ActiveState']=='active' for p in [service,sock]),'proxy_not_active')
-  require(service['User']==service['Group']=='ta-tushare-proxy' and service['PrivateNetwork']=='no' and not service.get('IPAddressDeny') and not service.get('IPAddressAllow'),'proxy_security_context_changed')
+  require(service['User']==service['Group']=='ta-tushare-proxy' and service.get('DynamicUser')=='yes' and service['PrivateNetwork']=='no' and not service.get('IPAddressDeny') and not service.get('IPAddressAllow'),'proxy_security_context_changed')
   argv=service['ExecStart'].split('argv[]=',1)[1].split(' ;',1)[0]
   require(argv=='/usr/lib/systemd/systemd-socket-proxyd --connections-max=4 127.0.0.1:32879','proxy_command_changed')
   require(sock['Listen']==request['socket_path']+' (Stream)','socket_changed')
@@ -137,18 +147,25 @@ else:
   candidates={}
   for path,source in destinations.items():
    name=pathlib.Path(path).name;save(root/'candidate'/name,source.encode());candidates[path]=dict(file=name,sha256=digest(source.encode()))
-  merged=(pathlib.Path(service['FragmentPath']).read_text()+'\n'+request['dropin_source']).encode()
+  original_source=pathlib.Path(service['FragmentPath']).read_text()
+  parser=configparser.ConfigParser(interpolation=None);parser.optionxform=str;parser.read_string(original_source)
+  require(set(parser['Service'])==set(request['sandbox'])|{'Type','ExecStart','Restart','StandardOutput','StandardError'},'unexpected_service_options')
+  require(all(parser['Service'][k]==v for k,v in request['sandbox'].items()),'sandbox_changed')
+  merged=(original_source+'\n'+request['dropin_source']).encode()
   save(root/'candidate'/request['unit'],merged)
   save(root/'candidate'/request['socket'],pathlib.Path(sock['FragmentPath']).read_bytes())
   run(['systemd-analyze','verify',str(root/'candidate'/request['unit']),str(root/'candidate'/(request['expiry_unit']+'.service')),str(root/'candidate'/(request['expiry_unit']+'.timer'))],timeout=20)
-  print('BACKUP_VERIFIED; checking direct TLS as ta-tushare-proxy; HTTP requests=0',flush=True)
-  tls=json.loads(run(['runuser','-u','ta-tushare-proxy','--','python3','-B','-c',request['tls_probe']],timeout=100))
+  print('BACKUP_VERIFIED; checking direct TLS in matching transient DynamicUser sandbox; HTTP requests=0',flush=True)
+  probe_properties=dict(request['sandbox'],User='ta-ts-direct-probe',RuntimeMaxSec='100',WorkingDirectory='/',Restart='no')
+  probe_command=['systemd-run','--quiet','--wait','--pipe','--collect','--service-type=exec','--unit='+request['probe_unit']]
+  for k,v in probe_properties.items():probe_command.append('--property='+k+'='+v)
+  tls=json.loads(run(probe_command+['/usr/bin/python3','-B','-c',request['tls_probe']],timeout=110))
   require(len(tls)==3 and all(p['verified'] and p['tls'] in ['TLSv1.2','TLSv1.3'] for p in tls),'direct_tls_unverified')
   require(time.time()<request['expiry'],'expired_during_check')
   require(all(entry(pathlib.Path(p))==v for p,v in (originals|protected_info).items()),'protected_files_changed')
   require(properties(request['unit'])==service and properties(request['socket'])==sock,'unit_state_changed')
   after=socket_path.stat();require((si.st_dev,si.st_ino)==(after.st_dev,after.st_ino),'socket_inode_changed')
-  manifest=dict(schema=1,backend_id=b['Id'],image=b['Image'],mounts=44,runtime_source=str(runtime),expiry=request['expiry'],originals=originals,protected=protected_info,service=service,socket=sock,socket_inode=[si.st_dev,si.st_ino],candidates=candidates,source_sha256=digest(request['operator_source'].encode()),backup_files={str(i):p for i,p in enumerate(list(originals)+list(protected_info))},tls_probes=tls,prepared_at=time.time(),http_requests=0)
+  manifest=dict(schema=1,backend_id=b['Id'],image=b['Image'],mounts=44,runtime_source=str(runtime),expiry=request['expiry'],originals=originals,protected=protected_info,service=service,socket=sock,socket_inode=[si.st_dev,si.st_ino],candidates=candidates,source_sha256=digest(request['operator_source'].encode()),backup_files={str(i):p for i,p in enumerate(list(originals)+list(protected_info))},tls_probes=tls,probe_unit=request['probe_unit'],probe_properties=probe_properties,prepared_at=time.time(),http_requests=0)
   save(root/'manifest.json',json.dumps(manifest,sort_keys=True,indent=2).encode())
   atomic_json(root/'status.json',dict(stage='prepared_no_route_change',at=time.time()))
   report()
@@ -166,7 +183,7 @@ def request():
                 expiry_unit=EXPIRY_UNIT, dropin=DROPIN_PATH, dropin_source=DROPIN,
                 expiry_service=EXPIRY_SERVICE, expiry_timer=EXPIRY_TIMER, tls_probe=TLS_PROBE,
                 operator_source=PREPARE, unit_directory='/etc/systemd/system',
-                socket_path='/run/ta-tushare-egress/upstream.sock')
+                socket_path='/run/ta-tushare-egress/upstream.sock', sandbox=SANDBOX, probe_unit=PROBE_UNIT)
 
 
 def build():

@@ -50,7 +50,8 @@ class PreparationTests(unittest.TestCase):
                    expires_at=tool.EXPIRY, cron='30 18 * * mon-fri', timezone='Asia/Shanghai'))
         self.unitdir = self.base / 'systemd'
         self.unitdir.mkdir()
-        (self.unitdir / tool.UNIT).write_text('[Service]\nExecStart=/usr/lib/systemd/systemd-socket-proxyd --connections-max=4 127.0.0.1:32879\n')
+        (self.unitdir / tool.UNIT).write_text('[Service]\n' + '\n'.join(k+'='+v for k,v in tool.SANDBOX.items()) +
+            '\nType=exec\nRestart=no\nStandardOutput=null\nStandardError=journal\nExecStart=/usr/lib/systemd/systemd-socket-proxyd --connections-max=4 127.0.0.1:32879\n')
         (self.unitdir / tool.SOCKET).write_text('[Socket]\nListenStream=/run/ta-tushare-egress/upstream.sock\n')
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(self.sock.close)
@@ -76,7 +77,7 @@ class PreparationTests(unittest.TestCase):
             unit = args[2]
             p = dict(FragmentPath=str(self.unitdir / unit), DropInPaths='', ActiveState='active', ExecCondition='')
             if unit == tool.UNIT:
-                p.update(User='ta-tushare-proxy', Group='ta-tushare-proxy', PrivateNetwork='no',
+                p.update(User='ta-tushare-proxy', Group='ta-tushare-proxy', DynamicUser='yes', PrivateNetwork='no',
                          ExecStart='{ argv[]=/usr/lib/systemd/systemd-socket-proxyd --connections-max=4 127.0.0.1:32879 ; pid=1 }')
             else:
                 p['Listen'] = str(self.sockpath) + ' (Stream)'
@@ -85,8 +86,16 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual(args[1], 'verify')
             self.assertTrue(all(Path(p).is_file() for p in args[2:]))
             output = ''
-        elif args[0] == 'runuser':
-            self.assertEqual(args[1:4], ['-u', 'ta-tushare-proxy', '--'])
+        elif args[0] == 'systemd-run':
+            self.assertIn('--wait', args)
+            self.assertIn('--collect', args)
+            self.assertIn('--property=DynamicUser=yes', args)
+            self.assertIn('--property=User=ta-ts-direct-probe', args)
+            for k, v in tool.SANDBOX.items():
+                if k != 'User':
+                    self.assertIn('--property='+k+'='+v, args)
+            self.assertIn('--property=RuntimeMaxSec=100', args)
+            self.assertEqual(args[-4:-1], ['/usr/bin/python3', '-B', '-c'])
             output = json.dumps([dict(verified=True, tls='TLSv1.2', elapsed_s=1)] * 3)
         else:
             self.fail('unexpected command: ' + str(args))
@@ -141,7 +150,7 @@ class PreparationTests(unittest.TestCase):
     def test_tls_failure_preserves_route_and_records_failure(self):
         original = self.external
         def fail_tls(args, **kwargs):
-            if args[0] == 'runuser':
+            if args[0] == 'systemd-run':
                 return subprocess.CompletedProcess(args, 1, stdout='', stderr='TLS failed')
             return original(args, **kwargs)
         before = self.snapshot()
@@ -153,6 +162,15 @@ class PreparationTests(unittest.TestCase):
         errors = list(Path(self.r['root']).glob('command-failure-*.json'))
         self.assertEqual(len(errors), 1)
         self.assertEqual(json.loads(errors[0].read_text())['stderr'], 'TLS failed')
+
+    def test_unexpected_sandbox_setting_prevents_probe(self):
+        with (self.unitdir / tool.UNIT).open('a') as f:
+            f.write('PrivateNetwork=yes\n')
+        before = self.snapshot()
+        with self.assertRaises(SystemExit):
+            self.execute()
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(any(c[0] == 'systemd-run' for c in self.commands))
 
 
 if __name__ == '__main__':
