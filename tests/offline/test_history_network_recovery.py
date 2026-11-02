@@ -1,5 +1,6 @@
 """Real policy/journal/flock/fsync; fake DB matching and TLS handshake only."""
 import asyncio
+import ast
 from copy import deepcopy
 from datetime import datetime,timezone
 import hashlib
@@ -124,6 +125,34 @@ class Launcher(unittest.TestCase):
             launch.assert_not_called()
             for p in root.rglob('*'):
                 if p.is_file():self.assertNotIn('SECRET_CANARY',p.read_text())
+
+
+class RawBackup(unittest.TestCase):
+    def test_streams_exact_bytes_and_never_overwrites_an_existing_backup(self):
+        source=ROOT/'deploy/history_timeout_recovery.py'
+        node=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='raw_history')
+        class Cursor(list):
+            def sort(self,*a):return self
+            def batch_size(self,*a):return self
+            def max_time_ms(self,*a):return self
+        raw=[b'first\x00\xff',b'x'*(1024*1024+3)]
+        class Collection:
+            def find(self,q):return Cursor(types.SimpleNamespace(raw=v) for v in raw)
+        db=types.SimpleNamespace(get_collection=lambda *a,**k:Collection())
+        def require(v,r):
+            if not v:raise RuntimeError(r)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            ns=dict(os=os,hashlib=hashlib,RUN=root,CodecOptions=lambda **kw:None,RawBSONDocument=object,require=require)
+            exec(compile(ast.Module(body=[node],type_ignores=[]),str(source),'exec'),ns)
+            expected=dict(count=2,sha256=hashlib.sha256(b''.join(raw)).hexdigest())
+            self.assertEqual(ns['raw_history'](db,'history'),expected)
+            self.assertEqual(list(root.iterdir()),[])
+            self.assertEqual(ns['raw_history'](db,'history',backup=True),expected)
+            path=root/'history.bson';self.assertEqual(path.read_bytes(),b''.join(raw))
+            self.assertEqual(path.stat().st_mode&0o777,0o600)
+            with self.assertRaises(FileExistsError):ns['raw_history'](db,'history',backup=True)
+            self.assertEqual(path.read_bytes(),b''.join(raw))
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
