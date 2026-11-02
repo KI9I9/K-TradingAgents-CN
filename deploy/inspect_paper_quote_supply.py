@@ -59,6 +59,7 @@ print(json.dumps(out))
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--control-socket", type=Path)
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit("output_already_exists")
@@ -66,7 +67,8 @@ def main():
     request = dict(code=INSIDE, request=dict(
         runtime=(REPO/"deploy/quote_guard_runtime.py").read_text(), files=["/app/"+p for p in FILES]))
     bootstrap = "import sys,json,zlib,io;q=json.loads(zlib.decompress(sys.stdin.buffer.read()));sys.stdin=io.StringIO(json.dumps(q['request']));exec(q['code'])"
-    cmd = ["ssh", "-F", "/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config", "-S", "none",
+    cmd = ["ssh", "-F", "/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config", "-S",
+           str(args.control_socket) if args.control_socket else "none",
            "-o", "BatchMode=yes", "-o", "IPQoS=none", "-o", "ConnectTimeout=10",
            "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
            "osaka-migration", "sudo -n python3 -B -c " + shlex.quote(bootstrap)]
