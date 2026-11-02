@@ -44,7 +44,15 @@ async def recover_raw_timeout_verified(gate, collection, *, expected_plan, expec
                                        expected_used=expected_used,expected_reason='timeout')
 
 
-async def _recover_raw_transport(gate, collection, *, expected_plan, expected_used, expected_reason):
+async def recover_raw_network_verified(gate, collection, *, expected_plan, expected_used,
+                                       expected_active=None, check_only=False):
+    return await _recover_raw_transport(gate,collection,expected_plan=expected_plan,
+        expected_used=expected_used,expected_reason='network_failed',
+        expected_active=expected_active,check_only=check_only)
+
+
+async def _recover_raw_transport(gate, collection, *, expected_plan, expected_used, expected_reason,
+                                 expected_active=None, check_only=False):
     """Reconcile exactly one blocked daily attempt, then remove STOP last.
 
     Full database/journal backups are a caller precondition. As with the timeout
@@ -52,7 +60,7 @@ async def _recover_raw_transport(gate, collection, *, expected_plan, expected_us
     A successful TLS handshake today does not classify the old SSL exception;
     this is an explicit operator recovery, never an automatic TLS retry.
     """
-    require(expected_reason in ('tls_failed','timeout'),'invalid_recovery_reason')
+    require(expected_reason in ('tls_failed','timeout','network_failed'),'invalid_recovery_reason')
     fd=os.open(gate.admission_path,os.O_RDWR|os.O_NOFOLLOW)
     try:
         _private_fd(fd)
@@ -80,6 +88,7 @@ async def _recover_raw_transport(gate, collection, *, expected_plan, expected_us
             folder,plan,states=workspace._load(expected_plan)
             require(plan==s['plan'],'state_invalid')
             active=s['active']
+            require(expected_active is None or active==expected_active,'attempt_changed')
             require([c for c,v in states.items() if v['phase']=='fetching']==[active['code']],
                     'previous_attempt_incomplete')
             adapter=HistoricalAdapter(collection,None,None,None,None,price_adjustment='none')
@@ -103,7 +112,12 @@ async def _recover_raw_transport(gate, collection, *, expected_plan, expected_us
                 raise RuntimeError('tls_probe_failed:'+type(error).__name__) from None
             now=check_budget()
             gate.assert_selected()
-            prefix='tls-recovery-' if expected_reason=='tls_failed' else 'timeout-recovery-'
+            if check_only:
+                return dict(checked_only=True,plan_sha256=expected_plan,used=s['used'],
+                    resume_code=active['code'],previous_reason=expected_reason,
+                    verified_all_items=True,tls_probes=probes)
+            prefix={'tls_failed':'tls-recovery-','timeout':'timeout-recovery-',
+                    'network_failed':'network-recovery-'}[expected_reason]
             receipt=gate.directory/(prefix+active['id'])
             receipt.mkdir(mode=0o700)
             _sync_dir(gate.directory)
