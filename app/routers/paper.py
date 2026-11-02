@@ -292,7 +292,19 @@ async def _get_stock_name(code: str, market: str) -> str:
 async def _load_cn_candidates(
     db, code: str, code6: str, now: datetime, mode: str
 ) -> Dict[str, Optional[Dict[str, Any]]]:
-    """只负责取数，判定交给 quote_contract.resolve_cn_*（取数与判定分开才好测）。"""
+    """只负责取数，判定交给 quote_contract.resolve_cn_*。"""
+    if mode == "strict":
+        from app.services.paper_quote_supply import get_paper_quote
+
+        selected, quote, reason = await get_paper_quote(code6)
+        if selected:
+            if quote is None:
+                logger.warning("[模拟交易] 按需行情不可用 %s: %s", code6, reason)
+            # A selected source failing (including suspension) cannot be
+            # overridden by an old quote or an unrelated daily bar.
+            return {"market_quotes": quote, "stock_basic_info": None,
+                    "etf_daily_quotes": None, "stock_daily_quotes": None,
+                    "_on_demand_supply": {"selected": True, "reason": reason}}
     projection = {
         "_id": 0, "close": 1, "high": 1, "low": 1, "open": 1, "trade_date": 1,
         "updated_at": 1, "quote_time": 1, "quote_time_source": 1,
@@ -345,7 +357,7 @@ async def _get_last_price_detail(
         now = cn_now()
         mode = "strict" if strict else "display"
         candidates = await _load_cn_candidates(db, code, code6, now, mode)
-        return resolve_cn_price(candidates, now, strict=strict)
+        return resolve_cn_price(candidates, cn_now(), strict=strict)
 
     if market in {"HK", "US"}:
         try:
@@ -395,7 +407,7 @@ async def _get_today_price_range_detail(
         code6 = str(code or "").strip().zfill(6)
         now = cn_now()
         candidates = await _load_cn_candidates(db, code, code6, now, "strict")
-        return resolve_cn_range(candidates, now)
+        return resolve_cn_range(candidates, cn_now())
 
     if market in {"HK", "US"}:
         try:
@@ -857,6 +869,23 @@ async def get_quote(
     """获取股票价格信息（当前价格和当天价格区间）"""
     # 1. 识别市场类型
     market, normalized_code, is_etf = _resolve_market_and_code(code, market)
+
+    if market in {"CN", "ETF"}:
+        # Preview uses the same response for price and range. Do not combine a
+        # historical display price with an on-demand execution range.
+        candidates = await _load_cn_candidates(
+            get_mongo_db(), normalized_code, normalized_code, cn_now(), "strict")
+        if candidates.get("_on_demand_supply"):
+            now = cn_now()
+            price, basis, _ = resolve_cn_price(candidates, now, strict=True)
+            span, _, _ = resolve_cn_range(candidates, now)
+            return ok({
+                "code": normalized_code, "market": "ETF" if is_etf else market,
+                "current_price": price,
+                "high": span.get("high") if span else None,
+                "low": span.get("low") if span else None,
+                "pricing_basis": basis,
+            })
     
     # 2. 获取当前价格
     current_price = await _get_last_price(normalized_code, market)

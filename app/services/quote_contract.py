@@ -290,6 +290,13 @@ def quote_is_usable(
     if not quote:
         return False, "quote_missing"
 
+    # An adapter may tighten the age limit, never enlarge this caller's limit.
+    declared_age = quote.get("max_quote_age_seconds")
+    if declared_age is not None:
+        if type(declared_age) is not int or not 0 < declared_age <= DEFAULT_MAX_QUOTE_AGE_SECONDS:
+            return False, "max_quote_age_invalid"
+        max_age_seconds = min(max_age_seconds, declared_age)
+
     if require_trade_date and not is_same_trade_date(quote.get("trade_date"), now.date()):
         return False, f"trade_date_mismatch:{quote.get('trade_date')}"
 
@@ -369,15 +376,28 @@ def quote_pricing_basis(quote: Dict[str, Any], now: datetime) -> Optional[Dict[s
 
     quote_time = parse_quote_time(quote.get("quote_time"))
     if quote_time is not None:
-        return {
+        declared_age = quote.get("max_quote_age_seconds")
+        if declared_age is not None and (
+            type(declared_age) is not int or not 0 < declared_age <= DEFAULT_MAX_QUOTE_AGE_SECONDS
+        ):
+            return None
+        basis = {
             "source": "market_quotes",
             "channel": QUOTE_TIME_SOURCE_UPSTREAM,
             "as_of": quote_time.astimezone(CN_TZ).isoformat(),
             "trade_date": coerce_trade_date(quote.get("trade_date")),
             "delay_seconds": int((now - quote_time).total_seconds()),
-            "max_delay_seconds": DEFAULT_MAX_QUOTE_AGE_SECONDS,
+            "max_delay_seconds": min(DEFAULT_MAX_QUOTE_AGE_SECONDS,
+                                     declared_age or DEFAULT_MAX_QUOTE_AGE_SECONDS),
             "notice": _notice_upstream(quote_time),
         }
+        if quote.get("quote_delivery") == "on_demand" and quote.get("data_source") == "sina_l1":
+            basis.update(source="sina_l1_on_demand", fetched_at=quote.get("fetched_at"),
+                         payload_sha256=quote.get("payload_sha256"),
+                         trading_status=quote.get("trading_status"),
+                         trading_status_raw=quote.get("trading_status_raw"),
+                         trading_status_source=quote.get("trading_status_source"))
+        return basis
 
     allowed, _ = snapshot_delay_bound(quote)
     fetched_at = parse_quote_time(quote.get("fetched_at"))

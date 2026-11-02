@@ -51,7 +51,7 @@ class FakeDB:
         return FakeCollection(self._mapping.get(name))
 
 
-def load_paper_functions(names, db_mapping, now):
+def load_paper_functions(names, db_mapping, now, extra_namespace=None):
     """从真实源文件抽取函数并执行，注入假 DB 与固定时钟。"""
     tree = ast.parse(PAPER.read_text(encoding="utf-8"))
     wanted = []
@@ -77,6 +77,7 @@ def load_paper_functions(names, db_mapping, now):
         "get_mongo_db": lambda: FakeDB(db_mapping),
         "logger": _SilentLogger(),
     }
+    namespace.update(extra_namespace or {})
     exec(compile(module, str(PAPER), "exec"), namespace)
     return namespace
 
