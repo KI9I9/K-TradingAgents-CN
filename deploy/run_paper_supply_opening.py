@@ -18,7 +18,7 @@ import run_paper_supply_switch as delivery
 from prepare_paper_quote_supply import CONTROLLER,EVIDENCE,REPO,ROOT,canonical,digest,require
 from query_quote_guard_jobs import read_auth,REMOTE as QUERY
 
-RELEASE=CONTROLLER.parent/'paper-supply-opening-v1-20261102'
+RELEASE=CONTROLLER.parent/'paper-supply-opening-v2-20261102'
 ACTIVATION_ROOT=ROOT/'activation'
 
 REMOTE_CONTROLLER=r'''
@@ -57,6 +57,7 @@ except BaseException as error:
 
 
 def freeze():
+    from paper_supply_opening import isolated_history_snapshot
     require(not subprocess.check_output(['git','status','--porcelain'],cwd=REPO).strip(),'commit_before_freeze')
     raw=(delivery.RELEASE/'controller.json').read_bytes()
     require((delivery.RELEASE/'SHA256SUMS').read_text()==digest(raw)+'  controller.json\n','delivery_package_changed')
@@ -66,7 +67,7 @@ def freeze():
     exec(base['prepare_code'],helper.__dict__)
     payload=dict(check_only=False,delivery_package_sha256=digest(raw),request=request,
         source_head=request['manifest']['source_head'],entry_hash=helper.ENTRY_HASH,
-        snapshot_code=helper.BACKEND_SNAPSHOT,query_code=QUERY,
+        snapshot_code=isolated_history_snapshot(helper.BACKEND_SNAPSHOT),query_code=QUERY,
         backend_code=(REPO/'deploy/paper_supply_opening.py').read_text(),
         modules=request['modules']|{target:item['sha256'] for target,item in request['files'].items()},
         policy=dict(version=1,duration_seconds=86400,source='sina_l1',scope='paper_execution_sh_sz'))

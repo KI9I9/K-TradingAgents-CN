@@ -19,6 +19,38 @@ from contextlib import redirect_stdout
 
 PERMIT=Path('/app/runtime/paper-quote-supply.json')
 ABSENT_CHECK="assert not Path('/app/runtime/paper-quote-supply.json').exists(),'paper_permit_already_present'"
+HISTORY_IDLE_CHECK="assert generation.parent==root and state['active'] is None and state['phase']=='ready' and not (generation/'STOP').exists(),'history_not_idle'"
+HISTORY_ISOLATION_GUARD = r'''
+assert generation.parent==root,'history_generation_invalid'
+history_stop=generation/'STOP'
+assert not history_stop.is_symlink(),'history_stop_symlink'
+history_ready=(state['phase']=='ready' and state['active'] is None and not history_stop.exists())
+history_active=state['active']
+history_blocked=(state['phase']=='blocked' and history_stop.is_file()
+    and state.get('reason') in ('network_failed','tls_failed','timeout')
+    and isinstance(history_active,dict) and history_active.get('sent')==['daily'])
+assert history_ready or history_blocked,'history_not_quiescent'
+history_isolation='stopped_transport_failure' if history_blocked else 'ready'
+'''
+
+
+def isolated_history_snapshot(code):
+    """Freeze an opening-only guard; delivery's idle-only guard stays intact.
+
+    A stopped history attempt is not a running worker. The existing DB check
+    still rejects running/cancelling executions, and both snapshots include
+    the exact STOP bytes as well as the policy, counters and unresolved attempt.
+    This function never reopens history or changes its recovery policy.
+    """
+    paths_anchor="runtime_files={str(p):base64.b64encode(p.read_bytes()).decode() for p in paths}"
+    report_anchor="generation=str(generation),used=state['used'],preferences=prefs"
+    require(all(code.count(anchor)==1 for anchor in
+                (HISTORY_IDLE_CHECK,paths_anchor,report_anchor)), 'snapshot_history_guard_changed')
+    code=code.replace(HISTORY_IDLE_CHECK,HISTORY_ISOLATION_GUARD)
+    code=code.replace(paths_anchor,
+        "if history_blocked:paths.append(history_stop)\n"+paths_anchor)
+    return code.replace(report_anchor,
+        "history_isolation=history_isolation,"+report_anchor)
 
 
 def require(value,reason):

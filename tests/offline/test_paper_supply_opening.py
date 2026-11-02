@@ -16,6 +16,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'deploy'))
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 import paper_supply_opening as opening
 import run_paper_supply_opening as runner
+from prepare_paper_quote_supply import BACKEND_SNAPSHOT
 from app.services import paper_quote_supply as supply
 from app.services.quote_contract import CN_TZ
 from datetime import datetime
@@ -132,6 +133,93 @@ class HostController(unittest.TestCase):
                 self.assertEqual(len(calls),1 if healthy else 0)
                 for path in attempt.rglob('*'):
                     if path.is_file():self.assertNotIn('SECRET_CANARY',path.read_text())
+
+
+class HistoryIsolation(unittest.TestCase):
+    """Execute the actual frozen snapshot with real ledger files and fake DB I/O."""
+    def snapshot(self,root,state,stop=b'',running=False,symlink=False):
+        registry=root/'tushare-history-generations';generation=registry/'current'
+        generation.mkdir(parents=True,exist_ok=True)
+        (registry/'active.json').write_text(json.dumps({'generation':'current'}))
+        (generation/'policy.json').write_text('{}')
+        (generation/'state.json').write_text(json.dumps(dict(used=6425,**state)))
+        stop_path=generation/'STOP'
+        if stop_path.exists() or stop_path.is_symlink():stop_path.unlink()
+        if symlink:stop_path.symlink_to(root/'absent')
+        elif stop is not None:stop_path.write_bytes(stop)
+        legacy=root/'tushare-egress';legacy.mkdir(exist_ok=True)
+        (legacy/'STOP').write_bytes(b'')
+        (root/'tushare-history-schedule.json').write_text(json.dumps(
+            dict(generation=str(generation),expires_at=4102444800)))
+        class Rows(list):
+            def sort(self,*args):return self
+            def max_time_ms(self,*args):return self
+        class Collection:
+            def count_documents(self,query):return int(running) if 'status' in query else 0
+            def find(self,query):return Rows()
+        class Preferences:
+            def find(self,query):return [dict(_id=k,enabled=k=='tushare_historical_sync')
+                for k in query['_id']['$in']]
+        class DB:
+            scheduler_executions=Collection()
+            scheduler_preferences=Preferences()
+            def get_collection(self,*args,**kw):return Collection()
+            def __getitem__(self,name):return Collection()
+        class Client:
+            def __init__(self,**kw):pass
+            def __getitem__(self,name):return DB()
+            def close(self):pass
+        modules={'pymongo':types.ModuleType('pymongo'),'bson':types.ModuleType('bson'),
+                 'bson.codec_options':types.ModuleType('bson.codec_options'),
+                 'bson.raw_bson':types.ModuleType('bson.raw_bson')}
+        modules['pymongo'].MongoClient=Client
+        modules['bson.codec_options'].CodecOptions=lambda **kw:None
+        modules['bson.raw_bson'].RawBSONDocument=object
+        runtime="def reconstruct(*args):return ({'MONGODB_HOST':'fake','MONGODB_PORT':'27017','MONGODB_USERNAME':'fake','MONGODB_PASSWORD':'canary','MONGODB_DATABASE':'fake'}, {})"
+        payload=dict(request={'runtime':runtime},entry_hash='unused',modules={},
+                     snapshot_code=opening.isolated_history_snapshot(BACKEND_SNAPSHOT))
+        real_path=Path
+        def mapped_path(value):
+            value=str(value)
+            return root/value.removeprefix('/app/runtime/') if value.startswith('/app/runtime/') else real_path(value)
+        with patch.dict(sys.modules,modules),patch('pathlib.Path',side_effect=mapped_path):
+            return opening.snapshot(payload)
+
+    def blocked(self,reason='network_failed'):
+        return dict(phase='blocked',reason=reason,active={'sent':['daily'],'code':'002309.SZ'})
+
+    def test_stopped_history_is_preserved_and_stop_bytes_participate_in_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);before=self.snapshot(root,self.blocked())
+            self.assertEqual(before['history_isolation'],'stopped_transport_failure')
+            stop=root/'tushare-history-generations/current/STOP'
+            self.assertEqual(before['runtime_files'][str(stop)],'')
+            self.assertTrue(stop.is_file())
+            self.assertEqual(before,self.snapshot(root,self.blocked()))
+            self.assertNotEqual(before,self.snapshot(root,self.blocked(),stop=b'changed'))
+            changed=self.blocked();changed['active']['code']='002310.SZ'
+            self.assertNotEqual(before,self.snapshot(root,changed))
+            self.assertNotIn('canary',json.dumps(before))
+
+    def test_ready_idle_history_still_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report=self.snapshot(Path(directory),dict(phase='ready',active=None),stop=None)
+            self.assertEqual(report['history_isolation'],'ready')
+
+    def test_running_worker_or_unisolated_blocked_state_refuses(self):
+        for options in ({'running':True},{'stop':None},{'symlink':True}):
+            with self.subTest(options=options),tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(AssertionError):self.snapshot(Path(directory),self.blocked(),**options)
+
+    def test_other_failures_and_malformed_attempts_refuse(self):
+        for state in (self.blocked('response_invalid'),dict(phase='in_flight',active={'sent':['daily']}),
+                      dict(phase='blocked',reason='network_failed',active=None)):
+            with self.subTest(state=state),tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(AssertionError):self.snapshot(Path(directory),state)
+
+    def test_unknown_frozen_snapshot_is_not_silently_relaxed(self):
+        with self.assertRaisesRegex(RuntimeError,'snapshot_history_guard_changed'):
+            opening.isolated_history_snapshot(BACKEND_SNAPSHOT.replace(opening.HISTORY_IDLE_CHECK,'pass'))
 
 
 if __name__=='__main__':unittest.main(verbosity=2)
