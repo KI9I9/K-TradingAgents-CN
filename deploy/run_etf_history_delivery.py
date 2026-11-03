@@ -28,7 +28,8 @@ def freeze(args):
     backend=selected['backend'];frontend=selected['frontend']
     labels=backend['labels'];files=labels['com.docker.compose.project.config_files'].split(',')
     chain=['docker','compose','--project-name',labels['com.docker.compose.project'],
-           '--project-directory',labels['com.docker.compose.project.working_dir']]
+           '--project-directory',labels['com.docker.compose.project.working_dir'],
+           '--profile','cutover-approved']
     for path in files:chain+=['-f',path]
     modules={}
     for m in backend['mounts']:
@@ -76,7 +77,7 @@ def remote(args):
         upload=canonical(package);sha=digest(upload)
         code="import json,sys,io,pathlib,hashlib,os\nos.umask(0o077)\nq=json.load(sys.stdin)\n"
         if args.reuse_upload:
-            code+="base=(pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+q['base_sha256']+'.json')).read_bytes()\nassert hashlib.sha256(base).hexdigest()==q['base_sha256']\nv=json.loads(base);v['payload']['check_only']=q['check_only'];raw=json.dumps(v,sort_keys=True,separators=(',',':')).encode()\n"
+            code+="base=(pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+q['base_sha256']+'.json')).read_bytes()\nassert hashlib.sha256(base).hexdigest()==q['base_sha256']\nv=json.loads(base);v['payload']['check_only']=q['check_only']\nif 'chain' in q:v['payload']['request']['chain']=q['chain']\nraw=json.dumps(v,sort_keys=True,separators=(',',':')).encode()\n"
         else:code+="raw=q['upload'].encode()\n"
         code+="assert hashlib.sha256(raw).hexdigest()==q['upload_sha256']\np=pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+q['upload_sha256']+'.json')\nif p.exists():assert p.read_bytes()==raw\nelse:p.write_bytes(raw)\nsys.stdin=io.StringIO(json.dumps(dict(upload_sha256=q['upload_sha256'],auth=q['auth'])))\n"
         code+='pathlib.Path('+repr(str(ROOT))+').mkdir(mode=0o711,exist_ok=True)\n'
@@ -84,6 +85,12 @@ def remote(args):
         payload=dict(upload=upload.decode(),upload_sha256=sha,auth=read_auth(args.credentials,True))
         if args.reuse_upload:
             payload.pop('upload');payload.update(base_sha256=digest(raw),check_only=args.action=='check')
+            if args.reuse_base_package:
+                base_raw=args.reuse_base_package.read_bytes();rebuilt=json.loads(base_raw)
+                rebuilt['payload']['check_only']=args.action=='check'
+                rebuilt['payload']['request']['chain']=package['payload']['request']['chain']
+                require(canonical(rebuilt)==upload,'base_can_only_change_compose_chain')
+                payload.update(base_sha256=digest(base_raw),chain=package['payload']['request']['chain'])
     else:code=STATUS.replace('/home/ubuntu/k-tradingagents-history-button-v1-20261029',str(ROOT))
     bootstrap="import json,sys,zlib,io;q=json.loads(zlib.decompress(sys.stdin.buffer.read()));sys.stdin=io.StringIO(json.dumps(q['data']));exec(q['code'])"
     cmd=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config','-S',str(args.control_socket),
@@ -105,6 +112,7 @@ if __name__=='__main__':
     p.add_argument('--dist',type=Path);p.add_argument('--probe',type=Path)
     p.add_argument('--credentials',type=Path)
     p.add_argument('--reuse-upload',action='store_true',help='Use previously checksum-verified chunk upload')
+    p.add_argument('--reuse-base-package',type=Path,help='Reconstruct a corrected Compose chain; verify complete target hash')
     p.add_argument('--control-socket',type=Path)
     args=p.parse_args();os.umask(0o077)
     print(json.dumps(freeze(args) if args.action=='freeze' else remote(args)))
