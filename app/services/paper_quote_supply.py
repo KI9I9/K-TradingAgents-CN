@@ -30,6 +30,7 @@ MAX_AGE_SECONDS = 90
 MAX_RESPONSE_BYTES = 8192
 MAX_REQUESTS_PER_MINUTE = 20  # per backend process; not a cluster-wide quota
 MAX_IN_FLIGHT = 2
+PERMIT_MAX_SECONDS = {1: 86400, 2: 7 * 86400}
 STATUS_CODES = {"00": "normal", **{s: "suspended" for s in ("01", "02", "03", "04", "05", "07")}}
 
 
@@ -54,7 +55,11 @@ def source_symbol(code: str) -> str:
 
 
 def read_permit(now: datetime, path: Path = PERMIT_PATH) -> Optional[dict]:
-    """Read-only capability; maximum 24h, fixed source and execution-only scope."""
+    """Read-only capability: initial 24h or explicitly renewed, at most seven days.
+
+    Version 1 keeps its original limit. Version 2 requires the hash of the
+    replaced permit for operator traceability; reading never renews either.
+    """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
@@ -65,14 +70,17 @@ def read_permit(now: datetime, path: Path = PERMIT_PATH) -> Optional[dict]:
         if len(raw) > 4096:
             return None
         doc = json.loads(raw)
-        if (not isinstance(doc, dict) or type(doc.get("version")) is not int or doc.get("version") != 1
+        if (not isinstance(doc, dict) or type(doc.get("version")) is not int or doc.get("version") not in PERMIT_MAX_SECONDS
                 or doc.get("enabled") is not True
                 or doc.get("source") != "sina_l1"
                 or doc.get("scope") != "paper_execution_sh_sz"):
             return None
+        if doc['version'] == 2 and (not isinstance(doc.get('renewal_of_sha256'), str)
+                or re.fullmatch(r'[0-9a-f]{64}', doc['renewal_of_sha256']) is None):
+            return None
         start = parse_quote_time(doc.get("not_before"))
         end = parse_quote_time(doc.get("expires_at"))
-        if start is None or end is None or not (0 < (end-start).total_seconds() <= 86400):
+        if start is None or end is None or not (0 < (end-start).total_seconds() <= PERMIT_MAX_SECONDS[doc['version']]):
             return None
         if not start <= now < end:
             return None

@@ -36,6 +36,27 @@ def permission(**changes):
 
 
 class PermitAndParser(unittest.TestCase):
+    def test_renewed_permit_is_explicit_finite_and_does_not_expand_v1(self):
+        start = NOW - timedelta(hours=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'permit.json'
+            def read(**changes):
+                value = permission(version=2, renewal_of_sha256='a'*64,
+                    not_before=start.isoformat(), expires_at=(start+timedelta(days=7)).isoformat())
+                value.update(changes); path.write_text(json.dumps(value)); path.chmod(0o600)
+                return supply.read_permit(NOW, path)
+            self.assertIsNotNone(read())
+            self.assertIsNone(read(version=1))
+            self.assertIsNone(read(version=3))
+            self.assertIsNone(read(version=True))
+            for proof in (None, '', 'a'*63, 'Z'*64, 123):
+                self.assertIsNone(read(renewal_of_sha256=proof))
+            self.assertIsNone(read(expires_at=(start+timedelta(days=7, seconds=1)).isoformat()))
+            self.assertIsNone(read(expires_at=NOW.isoformat()))
+            self.assertIsNone(read(not_before=(NOW+timedelta(seconds=1)).isoformat()))
+            self.assertIsNone(read(scope='all'))
+            self.assertIsNone(read(source='tushare'))
+
     def test_absent_invalid_expired_wrong_scope_permit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "permit.json"
