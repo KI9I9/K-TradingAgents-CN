@@ -9,6 +9,8 @@ ETF 数据同步服务
 
 import asyncio
 import logging
+import math
+import re
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, Any, List, Optional, Callable
@@ -439,63 +441,105 @@ def _fetch_etf_hist_tushare(symbol: str, start_date: str, end_date: str) -> List
         return []
 
 
-def _fetch_etf_hist_akshare(symbol: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
-    """从 AKShare 获取单只 ETF 历史日线（阻塞调用）"""
-    try:
-        import akshare as ak
-        code = _normalize_etf_code(symbol)
-        if not code:
-            return []
-        df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start_date, end_date=end_date)
-        if df is None or df.empty:
-            return []
-
-        # 列名兼容：日期/date、开盘/open、收盘/close、最高/high、最低/low、成交量/volume、成交额/amount、涨跌幅
-        date_col = "日期" if "日期" in df.columns else "date"
-        open_col = "开盘" if "开盘" in df.columns else "open"
-        high_col = "最高" if "最高" in df.columns else "high"
-        low_col = "最低" if "最低" in df.columns else "low"
-        close_col = "收盘" if "收盘" in df.columns else "close"
-        vol_col = "成交量" if "成交量" in df.columns else "volume"
-        amt_col = "成交额" if "成交额" in df.columns else "amount"
-        pct_col = "涨跌幅" if "涨跌幅" in df.columns else "增长率"
-        nav_col = "单位净值" if "单位净值" in df.columns else None
-        accum_col = "累计净值" if "累计净值" in df.columns else None
-
-        records = []
-        full_symbol = _get_full_symbol(code)
-        for _, r in df.iterrows():
-            trade_date = r.get(date_col)
-            if trade_date is None:
-                continue
-            if hasattr(trade_date, "strftime"):
-                trade_date = trade_date.strftime("%Y-%m-%d")
-            else:
-                trade_date = str(trade_date)[:10].replace("/", "-")
-
-            rec = {
-                "symbol": code,
-                "code": code,  # 与 stock_daily_quotes 一致，便于 UnifiedStockService 查询
-                "full_symbol": full_symbol,
-                "trade_date": trade_date,
-                "open": r.get(open_col),
-                "high": r.get(high_col),
-                "low": r.get(low_col),
-                "close": r.get(close_col),
-                "volume": r.get(vol_col),
-                "amount": r.get(amt_col),
-                "pct_chg": r.get(pct_col),
-                "data_source": "akshare",  # 由 sync 方法按实际 source 覆盖
-            }
-            if nav_col and nav_col in r:
-                rec["unit_nav"] = r.get(nav_col)
-            if accum_col and accum_col in r:
-                rec["accum_nav"] = r.get(accum_col)
-            records.append(rec)
-        return records
-    except Exception as e:
-        logger.warning(f"AKShare fund_etf_hist_em {symbol} 获取失败: {e}")
+def _normalize_etf_history_frame(df, code: str, start_date: str, end_date: str,
+                                 endpoint: str, volume_divisor: float) -> List[Dict[str, Any]]:
+    """Keep vendor price basis, dates and units explicit; never invent finality/status."""
+    if df is None or df.empty:
         return []
+    start = datetime.strptime(start_date, "%Y%m%d").date()
+    end = datetime.strptime(end_date, "%Y%m%d").date()
+    records = []
+    dates = set()
+    for _, row in df.iterrows():
+        day = _normalize_date_text(row.get("日期", row.get("date")))
+        parsed = datetime.strptime(day, "%Y-%m-%d").date()
+        if not start <= parsed <= end:
+            continue
+        if day in dates:
+            raise ValueError("ETF 日线日期重复")
+        dates.add(day)
+        values = {name: _safe_float(row.get(cn, row.get(name))) for name, cn in
+                  [("open", "开盘"), ("high", "最高"), ("low", "最低"), ("close", "收盘") ]}
+        if not all(v is not None and math.isfinite(v) and v > 0 for v in values.values()):
+            raise ValueError("ETF 日线 OHLC 无效")
+        if not values['low'] <= min(values['open'], values['close']) <= max(values['open'], values['close']) <= values['high']:
+            raise ValueError("ETF 日线 OHLC 区间不一致")
+        volume = _safe_float(row.get("成交量", row.get("volume")))
+        amount = _safe_float(row.get("成交额", row.get("amount")))
+        if volume is None or not math.isfinite(volume) or volume < 0:
+            raise ValueError("ETF 日线成交量无效")
+        if amount is not None and (not math.isfinite(amount) or amount < 0):
+            raise ValueError("ETF 日线成交额无效")
+        pct = _safe_float(row.get("涨跌幅", row.get("增长率")))
+        record = dict(symbol=code, code=code, full_symbol=_get_full_symbol(code),
+            trade_date=day, **values, volume=volume / volume_divisor, amount=amount,
+            pct_chg=pct if pct is not None and math.isfinite(pct) else None,
+            data_source='akshare', source_endpoint=endpoint, price_adjustment='none',
+            volume_unit='lot', amount_unit='CNY')
+        for column, name in [('单位净值', 'unit_nav'), ('累计净值', 'accum_nav')]:
+            value = _safe_float(row.get(column))
+            if value is not None and math.isfinite(value):
+                record[name] = value
+        records.append(record)
+    return sorted(records, key=lambda r: r['trade_date'])
+
+
+def _parse_etf_sina_payload(raw: bytes) -> str:
+    # Sina appends a block comment to the quoted assignment. Only decode the
+    # quoted data; neither that comment nor downloaded JavaScript is executed.
+    match = re.fullmatch(
+        r'\s*(?:var\s+)?[A-Za-z_$][\w$]*\s*=\s*"([^"\r\n]*)"\s*;?\s*(?:/\*[\s\S]*?\*/\s*)?',
+        raw.decode('utf-8-sig'))
+    if match is None:
+        raise ValueError('ETF 新浪日线格式无效')
+    return match.group(1)
+
+
+def _fetch_etf_hist_sina_frame(code: str):
+    """AKShare's Sina daily layout/decoder, with bounded HTTP and decode time."""
+    import pandas as pd
+    import requests
+    from py_mini_racer import py_mini_racer
+    from akshare.stock.cons import hk_js_decode
+
+    symbol = ('sh' if code.startswith(ETF_SH_PREFIXES) else 'sz') + code
+    url = f'https://finance.sina.com.cn/realstock/company/{symbol}/hisdata_klc2/klc_kl.js'
+    with requests.get(url, timeout=(5, 10), stream=True) as response:
+        response.raise_for_status()
+        raw = bytearray()
+        for chunk in response.iter_content(65536):
+            raw.extend(chunk)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError('ETF 日线响应过大')
+    decoder = py_mini_racer.MiniRacer()
+    decoder.eval(hk_js_decode, timeout=5000)
+    frame = pd.DataFrame(decoder.call('d', _parse_etf_sina_payload(raw), timeout=5000))
+    if not frame.empty:
+        frame['date'] = pd.to_datetime(frame['date'], errors='raise').dt.tz_localize(None).dt.date
+    return frame
+
+
+def _fetch_etf_hist_akshare(symbol: str, start_date: str, end_date: str) -> List[Dict[str, Any]]:
+    """Unadjusted ETF daily: Eastmoney first, bounded Sina fallback; no Tushare."""
+    import akshare as ak
+    code = _normalize_etf_code(symbol)
+    if not _is_etf_code(code) or code.startswith(ETF_BJ_PREFIXES):
+        raise ValueError('仅支持沪深 ETF 历史日线')
+    try:
+        frame = ak.fund_etf_hist_em(symbol=code, period='daily', start_date=start_date,
+                                    end_date=end_date, adjust='')
+        records = _normalize_etf_history_frame(frame, code, start_date, end_date,
+                                               'fund_etf_hist_em', 1)
+        if records:
+            return records
+    except Exception as error:
+        logger.warning('ETF 东方财富历史取数不可用，尝试新浪: %s (%s)', code, type(error).__name__)
+    frame = _fetch_etf_hist_sina_frame(code)
+    records = _normalize_etf_history_frame(frame, code, start_date, end_date,
+                                           'fund_etf_hist_sina', 100)
+    if not records:
+        raise ValueError('ETF 历史接口未返回请求窗口内的有效日线')
+    return records
 
 
 def _fetch_etf_spot_list_qmt() -> List[Dict[str, Any]]:
@@ -1105,6 +1149,8 @@ class EtfSyncService:
                             f"elapsed={fetch_elapsed:.2f}s"
                         )
                     if not records:
+                        if start_date <= end_date:
+                            raise ValueError('ETF 历史接口未返回请求窗口内的有效日线')
                         inserted = 0
                         logger.info(
                             f"💾 [{source}] 跳过数据库写入: code={code}, name={current_name or '-'}, records=0"

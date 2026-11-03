@@ -183,18 +183,22 @@
         </el-form-item>
         <el-form-item label="同步内容">
           <el-checkbox-group v-model="syncForm.syncTypes">
-            <el-checkbox label="realtime">实时行情</el-checkbox>
-            <el-checkbox label="historical">历史行情数据</el-checkbox>
+            <el-checkbox v-if="!isEtf" label="realtime">实时行情</el-checkbox>
+            <el-checkbox label="historical">{{ isEtf ? '历史行情数据（ETF价格走势）' : '历史行情数据' }}</el-checkbox>
             <el-checkbox v-if="!isEtf" label="financial">财务数据</el-checkbox>
             <el-checkbox label="basic">基础数据</el-checkbox>
           </el-checkbox-group>
         </el-form-item>
         <el-form-item label="数据源">
           <el-radio-group v-model="syncForm.dataSource">
-            <el-radio label="tushare" :disabled="!availableSyncSources.tushare">Tushare</el-radio>
+            <el-radio label="tushare" :disabled="isEtf || !availableSyncSources.tushare">Tushare</el-radio>
             <el-radio label="akshare" :disabled="!availableSyncSources.akshare">AKShare</el-radio>
             <el-radio v-if="!isJdyunMode()" label="qmt" :disabled="!availableSyncSources.qmt">QMT</el-radio>
           </el-radio-group>
+          <div v-if="isEtf" class="etf-sync-help">
+            价格走势需要同步历史行情；当前 Tushare 同步入口不支持 ETF，请使用 AKShare。
+            模拟交易的盘中报价按需获取，无需在此同步实时行情。
+          </div>
         </el-form-item>
         <el-form-item label="历史数据天数" v-if="syncForm.syncTypes.includes('historical')">
           <el-input-number v-model="syncForm.days" :min="1" :max="3650" />
@@ -492,7 +496,9 @@ const syncForm = reactive({
 
 watch(isEtf, (value) => {
   if (value) {
-    syncForm.syncTypes = syncForm.syncTypes.filter(type => type !== 'financial')
+    syncForm.syncTypes = syncForm.syncTypes.filter(type => type !== 'financial' && type !== 'realtime')
+    if (syncForm.syncTypes.length === 0) syncForm.syncTypes = ['historical']
+    if (syncForm.dataSource === 'tushare') syncForm.dataSource = 'akshare'
   }
 }, { immediate: true })
 
@@ -522,6 +528,12 @@ async function loadPreferredSyncDataSource() {
     availableSyncSources.tushare = sourceState.availableSources.tushare
     availableSyncSources.akshare = sourceState.availableSources.akshare
     availableSyncSources.qmt = isJdyunMode() ? false : sourceState.availableSources.qmt
+
+    if (isEtf.value) {
+      syncForm.dataSource = availableSyncSources.akshare ? 'akshare'
+        : availableSyncSources.qmt ? 'qmt' : 'akshare'
+      return
+    }
 
     if (sourceState.preferredSource) {
       // 京东云模式下，若首选是 qmt 则回退
@@ -636,6 +648,11 @@ async function handleSync() {
     return
   }
 
+  if (isEtf.value && (syncForm.dataSource === 'tushare' || !availableSyncSources[syncForm.dataSource])) {
+    ElMessage.warning('当前没有选中可用的 ETF 同步数据源，请启用并选择 AKShare')
+    return
+  }
+
   syncLoading.value = true
   try {
     const res = await stockSyncApi.syncSingle({
@@ -649,7 +666,7 @@ async function handleSync() {
     })
 
     if (res.success) {
-      ElMessage.success(`股票 ${code.value} 同步任务已提交，后台执行中`)
+      ElMessage.success(`${securityName.value} ${code.value} 同步任务已提交，正在查询执行结果`)
       syncDialogVisible.value = false
       void monitorSingleSyncTask(res.data.task_id, code.value)
     } else {
@@ -2067,6 +2084,13 @@ function handlePeriodChange(p: string) {
 </script>
 
 <style scoped lang="scss">
+.etf-sync-help {
+  margin-top: 8px;
+  color: #606266;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .stock-detail {
   display: flex; flex-direction: column; gap: 16px;
 }

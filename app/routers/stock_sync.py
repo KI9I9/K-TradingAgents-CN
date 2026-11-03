@@ -52,7 +52,17 @@ def _serialize_task_doc(task_doc: Optional[Dict[str, Any]]) -> Optional[Dict[str
 def _get_single_task_message(symbol: str, result: Dict[str, Any]) -> str:
     if result.get("overall_success"):
         return f"股票 {symbol} 数据同步成功"
-    return f"股票 {symbol} 数据同步部分失败"
+    if any((result.get(key) or {}).get('success') for key in
+           ('realtime_sync', 'historical_sync', 'financial_sync', 'basic_sync')):
+        return f"股票 {symbol} 数据同步部分失败"
+    return f"股票 {symbol} 数据同步失败"
+
+
+def _get_single_task_status(result: Dict[str, Any]) -> str:
+    if result.get('overall_success'):
+        return 'success'
+    return 'success_with_errors' if any((result.get(key) or {}).get('success') for key in
+        ('realtime_sync', 'historical_sync', 'financial_sync', 'basic_sync')) else 'failed'
 
 
 def _get_batch_task_status(request: "BatchStockSyncRequest", result: Dict[str, Any]) -> str:
@@ -157,7 +167,7 @@ async def _execute_stock_sync_task(task_id: str, task_type: str, payload: Dict[s
         if task_type == "single":
             request = SingleStockSyncRequest(**payload)
             result = await run_single_stock_sync(request)
-            status = "success" if result.get("overall_success") else "success_with_errors"
+            status = _get_single_task_status(result)
             message = _get_single_task_message(request.symbol, result)
         elif task_type == "batch":
             request = BatchStockSyncRequest(**payload)
@@ -391,6 +401,10 @@ async def run_single_stock_sync(request: SingleStockSyncRequest) -> dict:
                     "records": hist_result.get("records_inserted", 0),
                     "message": f"同步了 {hist_result.get('records_inserted', 0)} 条 ETF 历史记录"
                 }
+                if not result['historical_sync']['success']:
+                    result['historical_sync']['error'] = '; '.join(
+                        str(item.get('error', 'ETF 历史同步失败')) for item in hist_result.get('errors', [])
+                    ) or 'ETF 历史接口未返回有效日线'
                 logger.info(f"✅ {request.symbol} ETF 历史数据同步完成: {hist_result.get('records_inserted', 0)} 条记录")
             else:
                 if request.data_source == "tushare":
@@ -765,6 +779,8 @@ async def sync_single_stock(
 ):
     """提交单股同步任务，立即返回任务状态。"""
     if request.data_source == "tushare":
+        if _is_cn_etf_symbol(request.symbol):
+            raise HTTPException(422, '当前 Tushare 同步入口不支持 ETF；请选择 AKShare 并勾选历史行情数据。')
         from app.services.tushare_manual_sync import submit
         return await submit(request, "single", current_user)
     try:
