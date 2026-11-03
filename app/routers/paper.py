@@ -14,6 +14,8 @@ from app.services.quote_contract import (
     resolve_cn_price,
     resolve_cn_range,
     validate_price,
+    parse_quote_time,
+    CN_TZ,
 )
 
 router = APIRouter(prefix="/paper", tags=["paper"])
@@ -293,8 +295,9 @@ async def _load_cn_candidates(
     db, code: str, code6: str, now: datetime, mode: str
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """只负责取数，判定交给 quote_contract.resolve_cn_*。"""
+    unavailable_reason = None
     if mode == "strict":
-        from app.services.paper_quote_supply import get_paper_quote
+        from app.services.paper_quote_supply import get_paper_quote, permit_status
 
         selected, quote, reason = await get_paper_quote(code6)
         if selected:
@@ -305,6 +308,7 @@ async def _load_cn_candidates(
             return {"market_quotes": quote, "stock_basic_info": None,
                     "etf_daily_quotes": None, "stock_daily_quotes": None,
                     "_on_demand_supply": {"selected": True, "reason": reason}}
+        _, unavailable_reason = permit_status(now)
     projection = {
         "_id": 0, "close": 1, "high": 1, "low": 1, "open": 1, "trade_date": 1,
         "updated_at": 1, "quote_time": 1, "quote_time_source": 1,
@@ -340,7 +344,48 @@ async def _load_cn_candidates(
          "updated_at": 1, "is_final": 1, "final_state": 1, "trading_status": 1},
         sort=[("trade_date", -1)],
     )
+    if unavailable_reason:
+        candidates['_supply_unavailable_reason'] = unavailable_reason
     return candidates
+
+
+def _price_failure_reason(candidates, reason):
+    """Prefer the selected provider's cause over a generic missing-record error."""
+    selected = candidates.get('_on_demand_supply') or {}
+    selected_reason = selected.get('reason')
+    unavailable = candidates.get('_supply_unavailable_reason')
+    return (selected_reason if selected_reason and selected_reason != 'ok' else
+            unavailable + '|' + reason if unavailable and unavailable != 'ok' else reason)
+
+
+def _quote_failure(reason):
+    """Only public, allowlisted messages; never return a provider exception body."""
+    messages = {
+        'security_suspended': '该证券当前停牌，暂不能模拟下单。',
+        'outside_continuous_session': '当前不在连续交易时段（09:30–11:30、13:00–15:00），暂不能获取下单报价。',
+        'calendar_unverified': '暂未确认今日交易日状态，请稍后刷新报价。',
+        'paper_supply_timeout': '获取行情超时，请稍后刷新报价。',
+        'paper_supply_unavailable': '行情服务暂不可用，请稍后刷新报价。',
+        'paper_supply_busy': '报价请求较多，请稍后刷新，避免连续操作。',
+        'paper_supply_revoked': '报价服务状态已变化，请重新刷新报价。',
+        'paper_supply_expired': '模拟交易报价服务已到期，请联系管理员续期。',
+        'paper_supply_disabled': '模拟交易报价服务尚未启用，请联系管理员。',
+        'paper_supply_not_started': '模拟交易报价服务尚未到启用时间。',
+        'paper_supply_invalid': '报价服务配置异常，请联系管理员核查。',
+        'symbol_unsupported': '暂不支持该证券的盘中报价。',
+        'symbol_invalid': '证券代码格式无效，请检查代码。',
+        'trading_status_missing': '行情缺少交易状态，暂不能用于模拟下单。',
+        'trading_status_unknown': '暂无法确认该证券的交易状态。',
+        'trading_status_suspended': '该证券当前停牌，暂不能模拟下单。',
+        'upstream_status_unknown': '上游交易状态未知，暂不能模拟下单。',
+    }
+    for code in str(reason or '').split('|'):
+        key = code.split(':', 1)[0]
+        if key in messages:
+            return {'code': key, 'message': messages[key]}
+        if key in ('quote_stale', 'snapshot_too_old', 'trade_date_mismatch'):
+            return {'code': 'quote_stale', 'message': '行情已过期，请刷新报价后再试。'}
+    return {'code': 'quote_unavailable', 'message': '暂无可用于模拟下单的有效行情，请稍后刷新报价。'}
 
 
 async def _get_last_price_detail(
@@ -357,7 +402,8 @@ async def _get_last_price_detail(
         now = cn_now()
         mode = "strict" if strict else "display"
         candidates = await _load_cn_candidates(db, code, code6, now, mode)
-        return resolve_cn_price(candidates, cn_now(), strict=strict)
+        price, basis, reason = resolve_cn_price(candidates, cn_now(), strict=strict)
+        return price, basis, _price_failure_reason(candidates, reason) if strict and price is None else reason
 
     if market in {"HK", "US"}:
         try:
@@ -407,7 +453,8 @@ async def _get_today_price_range_detail(
         code6 = str(code or "").strip().zfill(6)
         now = cn_now()
         candidates = await _load_cn_candidates(db, code, code6, now, "strict")
-        return resolve_cn_range(candidates, cn_now())
+        span, basis, reason = resolve_cn_range(candidates, cn_now())
+        return span, basis, _price_failure_reason(candidates, reason) if span is None else reason
 
     if market in {"HK", "US"}:
         try:
@@ -490,6 +537,29 @@ def _zfill_code(code: str) -> str:
     return s.zfill(6)
 
 
+async def _position_valuation(position):
+    """Read-only reference valuation; missing prices are not zero market value."""
+    code = position.get('code')
+    market = position.get('market', 'CN')
+    qty = int(position.get('quantity', 0))
+    avg_cost = float(position.get('avg_cost', 0.0))
+    price, basis, reason = (await _get_last_price_detail(code, market, strict=False)
+                            if qty else (None, None, 'empty_position'))
+    if basis:
+        basis = dict(basis)
+        stamp = parse_quote_time(basis.get('as_of'))
+        basis['as_of'] = stamp.astimezone(CN_TZ).isoformat() if stamp else None
+    value = 0.0 if qty == 0 else None if price is None else round(price * qty, 2)
+    pnl = 0.0 if qty == 0 else None if price is None else round((price-avg_cost)*qty, 2)
+    return dict(code=code, name=position.get('name', ''), market=market,
+                currency=position.get('currency', 'CNY'), quantity=qty,
+                available_qty=position.get('available_qty', qty), avg_cost=avg_cost,
+                last_price=price, market_value=value, unrealized_pnl=pnl,
+                valuation_basis=basis,
+                valuation_status='empty' if qty == 0 else 'missing' if price is None else 'reference',
+                valuation_reason=reason if qty and price is None else None)
+
+
 @router.get("/account", response_model=dict)
 async def get_account(current_user: dict = Depends(get_current_user)):
     """获取或创建纸上账户，返回资金与持仓估值汇总（支持多市场）"""
@@ -506,32 +576,15 @@ async def get_account(current_user: dict = Depends(get_current_user)):
     }
 
     detailed_positions: List[Dict[str, Any]] = []
+    missing_by_currency = dict.fromkeys(positions_value_by_currency, 0)
     for p in positions:
-        code = p.get("code")
-        name = p.get("name", "")  # 从数据库获取股票名称
-        market = p.get("market", "CN")
-        currency = p.get("currency", "CNY")
-        qty = int(p.get("quantity", 0))
-        avg_cost = float(p.get("avg_cost", 0.0))
-        available_qty = p.get("available_qty", qty)
-
-        # 获取最新价
-        last = await _get_last_price(code, market)
-        mkt_value = round((last or 0.0) * qty, 2)
-        positions_value_by_currency[currency] += mkt_value
-
-        detailed_positions.append({
-            "code": code,
-            "name": name,  # 添加股票名称到响应
-            "market": market,
-            "currency": currency,
-            "quantity": qty,
-            "available_qty": available_qty,
-            "avg_cost": avg_cost,
-            "last_price": last,
-            "market_value": mkt_value,
-            "unrealized_pnl": None if last is None else round((last - avg_cost) * qty, 2)
-        })
+        valued = await _position_valuation(p)
+        currency = valued['currency']
+        if valued['market_value'] is None:
+            missing_by_currency[currency] += 1
+        else:
+            positions_value_by_currency[currency] += valued['market_value']
+        detailed_positions.append(valued)
 
     # 计算总资产（按货币分别显示）
     cash = acc.get("cash", {})
@@ -554,12 +607,12 @@ async def get_account(current_user: dict = Depends(get_current_user)):
             "HKD": round(float(realized_pnl.get("HKD", 0.0)), 2),
             "USD": round(float(realized_pnl.get("USD", 0.0)), 2)
         },
-        "positions_value": positions_value_by_currency,
-        "equity": {
-            "CNY": round(float(cash.get("CNY", 0.0)) + positions_value_by_currency["CNY"], 2),
-            "HKD": round(float(cash.get("HKD", 0.0)) + positions_value_by_currency["HKD"], 2),
-            "USD": round(float(cash.get("USD", 0.0)) + positions_value_by_currency["USD"], 2)
-        },
+        "positions_value": {c: None if missing_by_currency[c] else round(v, 2)
+                            for c, v in positions_value_by_currency.items()},
+        "equity": {c: None if missing_by_currency[c] else round(float(cash.get(c, 0.0)) + v, 2)
+                   for c, v in positions_value_by_currency.items()},
+        "valuation": {c: dict(complete=not missing_by_currency[c], missing_count=missing_by_currency[c],
+                              known_positions_value=round(v, 2)) for c, v in positions_value_by_currency.items()},
         "updated_at": acc.get("updated_at"),
     }
 
@@ -607,8 +660,7 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"行情缺失、过期或无效，暂不可校验价格，请稍后再试（{normalized_code}）。"
-                    f"具体原因见服务端日志"
+                    f"{_quote_failure(range_reason)['message']}（{normalized_code}）"
                 )
             )
 
@@ -635,8 +687,7 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    f"行情缺失、过期或无效，暂不可下单（{normalized_code}）。"
-                    f"具体原因见服务端日志"
+                    f"{_quote_failure(price_reason)['message']}（{normalized_code}）"
                 )
             )
         pricing_notice = _build_market_notice(pricing_basis)
@@ -825,28 +876,7 @@ async def list_positions(current_user: dict = Depends(get_current_user)):
     items = await db["paper_positions"].find({"user_id": current_user["id"]}).to_list(None)
     enriched: List[Dict[str, Any]] = []
     for p in items:
-        code = p.get("code")
-        name = p.get("name", "")  # 从数据库获取股票名称
-        market = p.get("market", "CN")
-        currency = p.get("currency", "CNY")
-        qty = int(p.get("quantity", 0))
-        available_qty = p.get("available_qty", qty)
-        avg_cost = float(p.get("avg_cost", 0.0))
-
-        last = await _get_last_price(code, market)
-        mkt = round((last or 0.0) * qty, 2)
-        enriched.append({
-            "code": code,
-            "name": name,  # 添加股票名称到响应
-            "market": market,
-            "currency": currency,
-            "quantity": qty,
-            "available_qty": available_qty,
-            "avg_cost": avg_cost,
-            "last_price": last,
-            "market_value": mkt,
-            "unrealized_pnl": None if last is None else round((last - avg_cost) * qty, 2)
-        })
+        enriched.append(await _position_valuation(p))
     return ok({"items": enriched})
 
 
@@ -875,16 +905,18 @@ async def get_quote(
         # historical display price with an on-demand execution range.
         candidates = await _load_cn_candidates(
             get_mongo_db(), normalized_code, normalized_code, cn_now(), "strict")
-        if candidates.get("_on_demand_supply"):
-            now = cn_now()
-            price, basis, _ = resolve_cn_price(candidates, now, strict=True)
-            span, _, _ = resolve_cn_range(candidates, now)
-            return ok({
+        now = cn_now()
+        price, basis, price_reason = resolve_cn_price(candidates, now, strict=True)
+        span, _, range_reason = resolve_cn_range(candidates, now)
+        reason = _price_failure_reason(candidates, price_reason if price is None else range_reason)
+        return ok({
                 "code": normalized_code, "market": "ETF" if is_etf else market,
                 "current_price": price,
                 "high": span.get("high") if span else None,
                 "low": span.get("low") if span else None,
                 "pricing_basis": basis,
+                "available": price is not None and span is not None,
+                "unavailable_reason": _quote_failure(reason) if price is None or span is None else None,
             })
     
     # 2. 获取当前价格

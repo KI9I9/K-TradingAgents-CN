@@ -54,7 +54,7 @@ def source_symbol(code: str) -> str:
     raise ValueError("symbol_unsupported")
 
 
-def read_permit(now: datetime, path: Path = PERMIT_PATH) -> Optional[dict]:
+def permit_status(now: datetime, path: Path = PERMIT_PATH) -> tuple[Optional[dict], str]:
     """Read-only capability: initial 24h or explicitly renewed, at most seven days.
 
     Version 1 keeps its original limit. Version 2 requires the hash of the
@@ -65,28 +65,37 @@ def read_permit(now: datetime, path: Path = PERMIT_PATH) -> Optional[dict]:
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
-                return None
+                return None, "paper_supply_invalid"
             raw = stream.read(4097)
         if len(raw) > 4096:
-            return None
+            return None, "paper_supply_invalid"
         doc = json.loads(raw)
         if (not isinstance(doc, dict) or type(doc.get("version")) is not int or doc.get("version") not in PERMIT_MAX_SECONDS
                 or doc.get("enabled") is not True
                 or doc.get("source") != "sina_l1"
                 or doc.get("scope") != "paper_execution_sh_sz"):
-            return None
+            return None, "paper_supply_disabled" if isinstance(doc, dict) and doc.get('enabled') is False else "paper_supply_invalid"
         if doc['version'] == 2 and (not isinstance(doc.get('renewal_of_sha256'), str)
                 or re.fullmatch(r'[0-9a-f]{64}', doc['renewal_of_sha256']) is None):
-            return None
+            return None, "paper_supply_invalid"
         start = parse_quote_time(doc.get("not_before"))
         end = parse_quote_time(doc.get("expires_at"))
         if start is None or end is None or not (0 < (end-start).total_seconds() <= PERMIT_MAX_SECONDS[doc['version']]):
-            return None
-        if not start <= now < end:
-            return None
-        return doc
+            return None, "paper_supply_invalid"
+        if now < start:
+            return None, "paper_supply_not_started"
+        if now >= end:
+            return None, "paper_supply_expired"
+        return doc, "ok"
+    except FileNotFoundError:
+        return None, "paper_supply_disabled"
     except (OSError, ValueError, TypeError, OverflowError):
-        return None
+        return None, "paper_supply_invalid"
+
+
+def read_permit(now: datetime, path: Path = PERMIT_PATH) -> Optional[dict]:
+    """Compatibility reader: status reporting never changes admission policy."""
+    return permit_status(now, path)[0]
 
 
 def parse_sina_quote(raw: bytes, code: str, captured_at: datetime) -> dict:

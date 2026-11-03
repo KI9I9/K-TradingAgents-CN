@@ -53,6 +53,7 @@ class FakeDB:
 
 def load_paper_functions(names, db_mapping, now, extra_namespace=None):
     """从真实源文件抽取函数并执行，注入假 DB 与固定时钟。"""
+    names = set(names) | {'_price_failure_reason', '_quote_failure'}
     tree = ast.parse(PAPER.read_text(encoding="utf-8"))
     wanted = []
     fn_types = (ast.FunctionDef, ast.AsyncFunctionDef)

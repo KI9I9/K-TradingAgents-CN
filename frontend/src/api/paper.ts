@@ -4,11 +4,24 @@ export interface CurrencyAmount {
   CNY: number
 }
 
+export interface ValuationAmount {
+  CNY: number | null
+}
+
+export interface PriceBasis {
+  source: string
+  channel?: string
+  as_of?: string | null
+  trade_date?: string | null
+  notice?: string
+}
+
 export interface PaperAccountSummary {
   cash: CurrencyAmount | number  // 支持新旧格式
   realized_pnl: CurrencyAmount | number  // 支持新旧格式
-  positions_value: CurrencyAmount
-  equity: CurrencyAmount | number  // 支持新旧格式
+  positions_value: ValuationAmount
+  equity: ValuationAmount | number
+  valuation?: { CNY?: { complete: boolean; missing_count: number; known_positions_value: number } }
   updated_at?: string
 }
 
@@ -17,8 +30,10 @@ export interface PaperPositionItem {
   quantity: number
   avg_cost: number
   last_price?: number | null
-  market_value?: number
+  market_value?: number | null
   unrealized_pnl?: number | null
+  valuation_basis?: PriceBasis | null
+  valuation_status?: 'missing' | 'reference' | 'empty'
 }
 
 export interface PaperOrderItem {
@@ -53,6 +68,9 @@ export interface QuoteInfo {
   current_price: number | null
   high: number | null
   low: number | null
+  pricing_basis?: PriceBasis | null
+  available?: boolean
+  unavailable_reason?: { code: string; message: string } | null
 }
 
 export interface InitializeAccountRequest {

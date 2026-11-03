@@ -37,10 +37,13 @@
         </div>
         <div class="kpi-info">
           <div class="kpi-label">模拟交易总资产</div>
-          <div class="kpi-value" v-if="paperAccount">¥{{ formatMoney(getAmount(paperAccount.equity)) }}</div>
+          <div class="kpi-value" v-if="paperAccount">{{ cnyAmount(paperAccount.equity) == null ? '待估值' : '¥' + formatMoney(cnyAmount(paperAccount.equity)!) }}</div>
           <div class="kpi-value kpi-placeholder" v-else>—</div>
-          <div class="kpi-sub" v-if="paperAccount && hasPnl">
-            持仓市值 ¥{{ formatMoney(getAmount(paperAccount.positions_value)) }}
+          <div class="kpi-sub" v-if="paperAccount?.valuation?.CNY?.complete === false">
+            {{ paperAccount.valuation.CNY.missing_count }} 只持仓缺少参考价
+          </div>
+          <div class="kpi-sub" v-else-if="paperAccount && hasPnl">
+            参考持仓市值 ¥{{ formatMoney(cnyAmount(paperAccount.positions_value)!) }}
           </div>
           <div class="kpi-sub kpi-action" v-else-if="paperAccount">查看账户详情 →</div>
           <div class="kpi-sub kpi-action" v-else>前往开通 →</div>
@@ -69,6 +72,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { Calendar, DataAnalysis, Wallet, Coin, Loading, ArrowRight } from '@element-plus/icons-vue'
 import { paperApi, type PaperAccountSummary } from '@/api/paper'
+import { cnyAmount } from '@/utils/paperPresentation'
 import { getUsageStatistics } from '@/api/usage'
 
 interface Props {
@@ -129,14 +133,9 @@ const weekStats = computed(() => {
 
 const hasPnl = computed(() => {
   if (!paperAccount.value) return false
-  const posValue = getAmount(paperAccount.value.positions_value)
-  return posValue > 0
+  const posValue = cnyAmount(paperAccount.value.positions_value)
+  return posValue != null && posValue > 0
 })
-
-const getAmount = (value: number | { CNY: number } | undefined): number => {
-  if (typeof value === 'number') return value
-  return value?.CNY ?? 0
-}
 
 const formatMoney = (value: number) => {
   if (!value || Number.isNaN(value)) return '0.00'

@@ -49,8 +49,8 @@
               <el-tab-pane label="🇨🇳 A股" name="CN">
                 <el-descriptions :column="1" border>
                   <el-descriptions-item label="可用资金">¥{{ fmtAmount(account.cash?.CNY ?? (typeof account.cash === 'number' ? account.cash : 0)) }}</el-descriptions-item>
-                  <el-descriptions-item label="持仓市值">¥{{ fmtAmount(account.positions_value?.CNY ?? (typeof account.positions_value === 'number' ? account.positions_value : 0)) }}</el-descriptions-item>
-                  <el-descriptions-item label="总资产">¥{{ fmtAmount(account.equity?.CNY ?? (typeof account.equity === 'number' ? account.equity : 0)) }}</el-descriptions-item>
+                  <el-descriptions-item label="参考持仓市值">{{ cnyAmount(account.positions_value) == null ? '待估值' : '¥' + fmtAmount(cnyAmount(account.positions_value)) }}</el-descriptions-item>
+                  <el-descriptions-item label="参考总资产">{{ cnyAmount(account.equity) == null ? '待估值' : '¥' + fmtAmount(cnyAmount(account.equity)) }}</el-descriptions-item>
                   <el-descriptions-item label="已实现盈亏">
                     <span :style="{ color: (account.realized_pnl?.CNY ?? (typeof account.realized_pnl === 'number' ? account.realized_pnl : 0)) >= 0 ? '#67C23A' : '#F56C6C' }">
                       ¥{{ fmtAmount(account.realized_pnl?.CNY ?? (typeof account.realized_pnl === 'number' ? account.realized_pnl : 0)) }}
@@ -59,6 +59,9 @@
                 </el-descriptions>
               </el-tab-pane>
             </el-tabs>
+            <el-alert v-if="account.valuation?.CNY?.complete === false" type="warning" :closable="false" style="margin-top: 12px"
+              :title="`${account.valuation.CNY.missing_count} 只持仓缺少参考价，市值与总资产暂无法完整估算。可用资金不受影响。`" />
+            <div style="margin-top: 8px; color: #909399; font-size: 12px">持仓按最近可得参考价估算，非实时资产；价格来源和时间见持仓列表。</div>
 
             <div style="margin-top: 12px; text-align: center; color: #909399; font-size: 12px">
               更新时间: {{ formatDateTime(account.updated_at) }}
@@ -103,14 +106,18 @@
             <el-table-column label="均价" width="100">
               <template #default="{ row }">{{ getCurrencySymbol(row.currency) }}{{ fmtPrice(row.avg_cost) }}</template>
             </el-table-column>
-            <el-table-column label="最新价" width="100">
-              <template #default="{ row }">{{ getCurrencySymbol(row.currency) }}{{ fmtPrice(row.last_price) }}</template>
+            <el-table-column label="参考价 / 来源时间" min-width="190">
+              <template #default="{ row }">
+                <div>{{ row.last_price == null ? '缺少参考价' : getCurrencySymbol(row.currency) + fmtPrice(row.last_price) }}</div>
+                <div v-if="row.last_price != null" style="font-size: 11px; color: #909399; line-height: 1.5">{{ basisDescription(row.valuation_basis) }}</div>
+              </template>
             </el-table-column>
             <el-table-column label="浮盈" width="120">
               <template #default="{ row }">
-                <span :style="{ color: (Number(row.last_price || 0) - Number(row.avg_cost || 0)) >= 0 ? '#67C23A' : '#F56C6C' }">
-                  {{ getCurrencySymbol(row.currency) }}{{ fmtAmount((Number(row.last_price || 0) - Number(row.avg_cost || 0)) * Number(row.quantity || 0)) }}
+                <span v-if="row.unrealized_pnl != null" :style="{ color: row.unrealized_pnl >= 0 ? '#67C23A' : '#F56C6C' }">
+                  {{ getCurrencySymbol(row.currency) }}{{ fmtAmount(row.unrealized_pnl) }}
                 </span>
+                <span v-else style="color: #909399">待估值</span>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="200">
@@ -230,10 +237,14 @@
             (当天区间: {{ priceRange.low?.toFixed(2) || '-' }} - {{ priceRange.high?.toFixed(2) || '-' }})
           </span>
           <span v-else-if="!useCustomPrice && currentPrice" style="margin-left: 8px; font-size: 12px; color: #909399">
-            使用实时价格: {{ currentPrice.toFixed(2) }}
+            当前报价: {{ currentPrice.toFixed(2) }}
           </span>
         </el-form-item>
       </el-form>
+      <div v-if="quoteLoading" style="color: #909399; margin-bottom: 12px">正在获取报价…</div>
+      <el-alert v-else-if="quoteError" :title="quoteError" type="warning" :closable="false" show-icon style="margin-bottom: 12px" />
+      <div v-else-if="quoteBasis" style="font-size: 12px; color: #909399; margin-bottom: 12px">{{ basisDescription(quoteBasis) }}。提交时将重新校验报价。</div>
+      <el-button v-if="order.code && detectedMarket" text size="small" :loading="quoteLoading" @click="fetchPriceInfo">刷新报价</el-button>
       <template #footer>
         <el-button @click="orderDialog=false">取消</el-button>
         <el-button type="primary" @click="submitOrder">提交</el-button>
@@ -283,7 +294,8 @@ import { ref, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CreditCard, Refresh, Plus, Delete, Setting } from '@element-plus/icons-vue'
-import { paperApi } from '@/api/paper'
+import { paperApi, type PriceBasis } from '@/api/paper'
+import { basisDescription, cnyAmount, moneyOrUnknown } from '@/utils/paperPresentation'
 import { analysisApi } from '@/api/analysis'
 import { stocksApi } from '@/api/stocks'
 import { formatDateTime } from '@/utils/datetime'
@@ -313,13 +325,17 @@ const activeMarketTab = ref<string>('CN')
 const useCustomPrice = ref(false)
 const currentPrice = ref<number | null>(null)
 const priceRange = ref<{ high: number; low: number } | null>(null)
+const quoteBasis = ref<PriceBasis | null>(null)
+const quoteError = ref('')
+const quoteLoading = ref(false)
+let quoteRequestId = 0
 
 // 计算属性：根据当前市场标签页过滤持仓
 const filteredPositions = computed(() => {
   if (!positions.value || positions.value.length === 0) return []
   return positions.value.filter(pos => {
     const market = pos.market || 'CN'
-    return market === activeMarketTab.value
+    return market === activeMarketTab.value || (activeMarketTab.value === 'CN' && market === 'ETF')
   })
 })
 
@@ -328,7 +344,7 @@ const filteredOrders = computed(() => {
   if (!orders.value || orders.value.length === 0) return []
   return orders.value.filter(ord => {
     const market = ord.market || 'CN'
-    return market === activeMarketTab.value
+    return market === activeMarketTab.value || (activeMarketTab.value === 'CN' && market === 'ETF')
   })
 })
 
@@ -343,8 +359,7 @@ function fmtPrice(n: number | null | undefined) {
 }
 function fmtAmount(n: number | null | undefined) {
   // 🔥 修复：处理 NaN 和非数字值
-  if (n == null || Number.isNaN(n as any) || typeof n !== 'number') return '0.00'
-  return Number(n).toFixed(2)
+  return moneyOrUnknown(n)
 }
 
 // 获取货币符号
@@ -354,16 +369,24 @@ function getCurrencySymbol(_currency: string | undefined) {
 
 // 获取价格信息（当前价格和价格区间）
 async function fetchPriceInfo() {
-  if (!order.value.code || !detectedMarket.value) {
-    currentPrice.value = null
-    priceRange.value = null
-    return
-  }
+  const requestId = ++quoteRequestId
+  const code = order.value.code.trim()
+  const market = detectedMarket.value
+  currentPrice.value = null
+  priceRange.value = null
+  quoteBasis.value = null
+  quoteError.value = ''
+  quoteLoading.value = false
+  if (!/^\d{6}$/.test(code) || !market) return
+  quoteLoading.value = true
 
   try {
-    const res = await paperApi.getQuote(order.value.code, detectedMarket.value)
+    const res = await paperApi.getQuote(code, market)
+    if (requestId !== quoteRequestId) return
     if (res.success && res.data) {
       currentPrice.value = res.data.current_price || null
+      quoteBasis.value = res.data.pricing_basis || null
+      quoteError.value = res.data.unavailable_reason?.message || (currentPrice.value == null ? '暂无有效报价，请稍后刷新。' : '')
       if (res.data.high && res.data.low) {
         priceRange.value = {
           high: res.data.high,
@@ -372,11 +395,15 @@ async function fetchPriceInfo() {
       } else {
         priceRange.value = null
       }
-    }
+    } else quoteError.value = res.message || '报价暂不可用，请稍后刷新。'
   } catch (e: any) {
+    if (requestId !== quoteRequestId) return
     console.warn('获取价格信息失败:', e)
     currentPrice.value = null
     priceRange.value = null
+    quoteError.value = '获取报价失败，请检查连接后重试。'
+  } finally {
+    if (requestId === quoteRequestId) quoteLoading.value = false
   }
 }
 
@@ -384,9 +411,13 @@ async function fetchPriceInfo() {
 function detectMarket() {
   const code = order.value.code.trim().toUpperCase()
   if (!code) {
+    ++quoteRequestId
     detectedMarket.value = ''
     currentPrice.value = null
     priceRange.value = null
+    quoteBasis.value = null
+    quoteError.value = ''
+    quoteLoading.value = false
     return
   }
 
@@ -478,12 +509,16 @@ async function fetchStockNames(items: any[]) {
 }
 
 function openOrderDialog() {
+  ++quoteRequestId
+  quoteLoading.value = false
   orderDialog.value = true
   // 重置价格相关状态
   useCustomPrice.value = false
   order.value.price = undefined
   currentPrice.value = null
   priceRange.value = null
+  quoteBasis.value = null
+  quoteError.value = ''
   // 如果已有代码，获取价格信息
   if (order.value.code && detectedMarket.value) {
     fetchPriceInfo()
