@@ -74,10 +74,16 @@ def remote(args):
         require(digest(raw)==args.package.with_suffix('.sha256').read_text().strip(),'package_changed')
         package=json.loads(raw);package['payload']['check_only']=args.action=='check'
         upload=canonical(package);sha=digest(upload)
-        code="import json,sys,io,pathlib,hashlib,os\nos.umask(0o077)\nq=json.load(sys.stdin)\nraw=q['upload'].encode();assert hashlib.sha256(raw).hexdigest()==q['upload_sha256']\np=pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+q['upload_sha256']+'.json')\nif p.exists():assert p.read_bytes()==raw\nelse:p.write_bytes(raw)\nsys.stdin=io.StringIO(json.dumps(dict(upload_sha256=q['upload_sha256'],auth=q['auth'])))\n"
+        code="import json,sys,io,pathlib,hashlib,os\nos.umask(0o077)\nq=json.load(sys.stdin)\n"
+        if args.reuse_upload:
+            code+="base=(pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+q['base_sha256']+'.json')).read_bytes()\nassert hashlib.sha256(base).hexdigest()==q['base_sha256']\nv=json.loads(base);v['payload']['check_only']=q['check_only'];raw=json.dumps(v,sort_keys=True,separators=(',',':')).encode()\n"
+        else:code+="raw=q['upload'].encode()\n"
+        code+="assert hashlib.sha256(raw).hexdigest()==q['upload_sha256']\np=pathlib.Path('/home/ubuntu')/('history-button-switch-upload-'+q['upload_sha256']+'.json')\nif p.exists():assert p.read_bytes()==raw\nelse:p.write_bytes(raw)\nsys.stdin=io.StringIO(json.dumps(dict(upload_sha256=q['upload_sha256'],auth=q['auth'])))\n"
         code+='pathlib.Path('+repr(str(ROOT))+').mkdir(mode=0o711,exist_ok=True)\n'
         code+=LAUNCH.replace('/home/ubuntu/k-tradingagents-history-button-v1-20261029',str(ROOT))
         payload=dict(upload=upload.decode(),upload_sha256=sha,auth=read_auth(args.credentials,True))
+        if args.reuse_upload:
+            payload.pop('upload');payload.update(base_sha256=digest(raw),check_only=args.action=='check')
     else:code=STATUS.replace('/home/ubuntu/k-tradingagents-history-button-v1-20261029',str(ROOT))
     bootstrap="import json,sys,zlib,io;q=json.loads(zlib.decompress(sys.stdin.buffer.read()));sys.stdin=io.StringIO(json.dumps(q['data']));exec(q['code'])"
     cmd=['ssh','-F','/home/ubuntu/.ssh/osaka-migration-20261016-hKbxOKhx/config','-S',str(args.control_socket),
@@ -98,6 +104,7 @@ if __name__=='__main__':
     p.add_argument('--mounts',type=Path);p.add_argument('--inventory',type=Path)
     p.add_argument('--dist',type=Path);p.add_argument('--probe',type=Path)
     p.add_argument('--credentials',type=Path)
+    p.add_argument('--reuse-upload',action='store_true',help='Use previously checksum-verified chunk upload')
     p.add_argument('--control-socket',type=Path)
     args=p.parse_args();os.umask(0o077)
     print(json.dumps(freeze(args) if args.action=='freeze' else remote(args)))
