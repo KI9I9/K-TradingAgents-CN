@@ -70,7 +70,7 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
         require(expected_reason in ('timeout','tls_failed','network_failed','http_error')
                 and (expected_reason=='timeout' or recoverer is not None),'invalid_recovery_reason')
         require(not check_only or scheduled_recovery,'invalid_check_mode')
-        require(not scheduled_recovery or expected_reason=='network_failed','invalid_scheduled_recovery')
+        require(not scheduled_recovery or expected_reason in ('network_failed','http_error'),'invalid_scheduled_recovery')
         require(not RUN.exists(),'already_reserved')
         require(shutil.disk_usage('/app/runtime').free>1024**3,'backup_space')
         for p,h in r['source_hashes'].items():require(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h,'source_changed')
