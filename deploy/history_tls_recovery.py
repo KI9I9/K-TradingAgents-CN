@@ -51,6 +51,14 @@ async def recover_raw_network_verified(gate, collection, *, expected_plan, expec
         expected_active=expected_active,check_only=check_only)
 
 
+async def recover_raw_http_error(gate, collection, *, expected_plan, expected_used,
+                                 expected_active=None, check_only=False):
+    """Reconcile one blocked HTTP-status attempt after status diagnostics ship."""
+    return await _recover_raw_transport(gate, collection, expected_plan=expected_plan,
+        expected_used=expected_used, expected_reason='http_error',
+        expected_active=expected_active, check_only=check_only)
+
+
 async def _recover_raw_transport(gate, collection, *, expected_plan, expected_used, expected_reason,
                                  expected_active=None, check_only=False):
     """Reconcile exactly one blocked daily attempt, then remove STOP last.
@@ -60,7 +68,7 @@ async def _recover_raw_transport(gate, collection, *, expected_plan, expected_us
     A successful TLS handshake today does not classify the old SSL exception;
     this is an explicit operator recovery, never an automatic TLS retry.
     """
-    require(expected_reason in ('tls_failed','timeout','network_failed'),'invalid_recovery_reason')
+    require(expected_reason in ('tls_failed','timeout','network_failed','http_error'),'invalid_recovery_reason')
     fd=os.open(gate.admission_path,os.O_RDWR|os.O_NOFOLLOW)
     try:
         _private_fd(fd)
@@ -117,7 +125,7 @@ async def _recover_raw_transport(gate, collection, *, expected_plan, expected_us
                     resume_code=active['code'],previous_reason=expected_reason,
                     verified_all_items=True,tls_probes=probes)
             prefix={'tls_failed':'tls-recovery-','timeout':'timeout-recovery-',
-                    'network_failed':'network-recovery-'}[expected_reason]
+                    'network_failed':'network-recovery-','http_error':'http-recovery-'}[expected_reason]
             receipt=gate.directory/(prefix+active['id'])
             receipt.mkdir(mode=0o700)
             _sync_dir(gate.directory)

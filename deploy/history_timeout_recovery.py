@@ -67,7 +67,7 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
     gate=None;client=None;reserved=False
     report=dict(status='failed',stage='preflight',trigger_sent=False,new_gate_stopped=True)
     try:
-        require(expected_reason in ('timeout','tls_failed','network_failed')
+        require(expected_reason in ('timeout','tls_failed','network_failed','http_error')
                 and (expected_reason=='timeout' or recoverer is not None),'invalid_recovery_reason')
         require(not check_only or scheduled_recovery,'invalid_check_mode')
         require(not scheduled_recovery or expected_reason=='network_failed','invalid_scheduled_recovery')
