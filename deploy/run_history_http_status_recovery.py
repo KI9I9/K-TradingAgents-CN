@@ -44,7 +44,7 @@ try:
  assert i['Image']==package['image'],'image_changed'
  if not r['check_only']:assert i['Id']==package['backend_id'],'backend_changed'
  payload=dict(package['request'],auth=r.get('auth'),check_only=r['check_only'])
- code="import json,sys\nr=json.load(sys.stdin)\nc={'__name__':'recovery_core'};exec(r.pop('core'),c)\nh={'__name__':'recovery_helper'};exec(r.pop('helper'),h)\nreadonly=r.pop('check_only')\nraise SystemExit(c['main'](r,recoverer=h['recover_raw_http_error'],expected_reason='http_error',raw_count=107128,run_directory='/app/runtime/history-http-status-recovery-20261105-v1',scheduled_recovery=True,check_only=readonly))"
+ code="import json,sys\nr=json.load(sys.stdin)\nc={'__name__':'recovery_core'};exec(r.pop('core'),c)\nh={'__name__':'recovery_helper'};exec(r.pop('helper'),h)\nreadonly=r.pop('check_only')\nraise SystemExit(c['main'](r,recoverer=h['recover_raw_http_error'],expected_reason='http_error',raw_count=107128,run_directory='/app/runtime/history-http-status-recovery-20261105-v1',scheduled_recovery=False,check_only=readonly))"
  payload.update(core=package['core'],helper=package['helper'])
  p=subprocess.run(['docker','exec','-i',i['Id'],'python3','-B','-c',code],input=json.dumps(payload),text=True,capture_output=True,timeout=1800)
  (directory/'stderr.private').write_text(p.stderr)
