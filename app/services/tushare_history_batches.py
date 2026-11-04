@@ -20,8 +20,8 @@ _TASKS=set()
 BJ=timezone(timedelta(hours=8))
 
 
-def message(reason):
-    return {
+def message(reason, http_status=None):
+    messages = {
         'not_authorized':'历史同步授权尚未配置，未发送上游请求。',
         'disabled':'历史同步运行许可已关闭（不是登录权限）；请联系运维核查停止原因并恢复。',
         'expired':'历史同步授权已到期，未自动续期。',
@@ -35,7 +35,11 @@ def message(reason):
         'request_outcome_unknown':'上次请求结果不确定，已停止自动重试，请核查执行记录。',
         'write_outcome_unresolved':'上次写入结果未完全匹配，已保留现场，不会重复写入。',
         'cancelled':'历史同步已取消，已保存的数据和取数结果保留。',
-    }.get(reason,'历史同步已停止，请核查执行记录。')+' ['+reason+']'
+    }
+    detail = ''
+    if type(http_status) is int and 100 <= http_status <= 599:
+        detail = '（上游 HTTP 状态码 '+str(http_status)+'）'
+    return messages.get(reason,'历史同步已停止，请核查执行记录。') + detail + ' ['+reason+']'
 
 
 class HistoryBatchService:
@@ -117,7 +121,7 @@ class HistoryBatchService:
         except (TushareEgressStopped,BatchStopped,PlanError) as error:
             if reserved:self.gate.stop()
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error)
-            raise HTTPException(400,message(reason)) from None
+            raise HTTPException(400,message(reason,getattr(error,'http_status',None))) from None
         except BaseException:
             if reserved:self.gate.stop()
             raise
@@ -201,7 +205,9 @@ class HistoryBatchService:
         except BaseException as error:
             os.close(fd)
             if getattr(self,'scheduled',False):self.gate.stop()
-            detail=error.detail if isinstance(error,HTTPException) else message(error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted')
+            detail=error.detail if isinstance(error,HTTPException) else message(
+                error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted',
+                getattr(error,'http_status',None))
             await self.executions.update_one({'_id':execution_id},{'$set':dict(status='failed',finished_at=self.record_now(),error_message=detail,progress_message=detail)})
             if not isinstance(error,Exception):raise
             return
@@ -234,12 +240,13 @@ class HistoryBatchService:
         except BaseException as error:
             if getattr(self,'scheduled',False):self.gate.stop()
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted'
+            http_status=getattr(error,'http_status',None)
             try:
                 checkpoint=self.workspace.status(identity)
                 result=dict(committed=checkpoint['counts']['committed'],total=len(plan['items']),complete=False,
                             outcomes=checkpoint['outcomes'])
                 status='cancelled' if reason=='cancelled' else 'partial' if result['committed'] else 'failed'
-                await self._progress(execution_id,result,status,plan,message(reason))
+                await self._progress(execution_id,result,status,plan,message(reason,http_status))
             except Exception:
                 # Journal is authoritative; never retry network/DB side effects
                 # just because the progress collection is unavailable.
