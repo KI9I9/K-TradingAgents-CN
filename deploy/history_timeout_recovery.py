@@ -132,13 +132,15 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
             try:
                 kwargs=dict(expected_plan=r['plan'],expected_used=r['used'])
                 if scheduled_recovery:kwargs.update(expected_active=r['active'],check_only=readonly)
+                else:kwargs.update(check_only=readonly)
                 return await (recoverer or recover_raw_timeout)(gate,
                     motor[env['MONGODB_DATABASE']].stock_daily_quotes_unadjusted,**kwargs)
             finally:motor.close()
         if check_only:
             receipt=asyncio.run(recover(True))
-            require(all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h
-                        for p,h in baseline['files'].items()),'state_changed_during_check')
+            if baseline is not None:
+                require(all(hashlib.sha256(Path(p).read_bytes()).hexdigest()==h
+                            for p,h in baseline['files'].items()),'state_changed_during_check')
             report.update(status='checked',stage='ready_no_recovery',baseline=baseline,recovery=receipt,
                           upstream_requests=0,new_gate_stopped=True)
             return 0
