@@ -85,8 +85,11 @@ def main(r, *, recoverer=None, expected_reason='timeout', raw_count=13136,
         client=MongoClient(**options);db=client[env['MONGODB_DATABASE']]
         require(db.scheduler_executions.count_documents({'job_id':{'$regex':'^tushare_'},'status':{'$in':['running','cancelling']}})==0,'execution_active')
         for job in ('tushare_historical_sync','tushare_realtime_quotes_hourly'):
-            require((db.scheduler_preferences.find_one({'_id':job}) or {}).get('enabled')
-                    is (scheduled_recovery and job=='tushare_historical_sync'),'scheduled_job_enabled')
+            enabled=(db.scheduler_preferences.find_one({'_id':job}) or {}).get('enabled')
+            if scheduled_recovery and job=='tushare_historical_sync':
+                require(enabled is True,'scheduled_job_enabled')
+            else:
+                require(enabled is not True,'scheduled_job_enabled')
         from tradingagents.utils.tushare_batch import selected_gate,recover_raw_timeout
         gate=selected_gate()
         require(str(gate.directory)==r['generation'],'generation_changed')
