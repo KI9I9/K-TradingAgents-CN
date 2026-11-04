@@ -36,11 +36,17 @@ REASONS = frozenset(('none', 'not_authorized', 'disabled', 'invalid_mode', 'busy
 
 
 class TushareEgressStopped(RuntimeError):
-    def __init__(self, reason, api_code=None):
+    def __init__(self, reason, api_code=None, http_status=None):
         self.reason = reason if reason in REASONS else 'state_invalid'
         self.api_code = api_code if type(api_code) is int and -1000000 <= api_code <= 1000000 else None
+        # HTTP status is diagnostic metadata only.  It is deliberately not
+        # persisted in permit.json (api_code remains reserved for Tushare's
+        # JSON API code), and no response body or headers are retained.
+        self.http_status = (http_status if type(http_status) is int and 100 <= http_status <= 599
+                            else None)
         super().__init__('tushare_egress_stopped reason=' + self.reason
-                         + ' code=' + (str(self.api_code) if self.api_code is not None else 'unknown'))
+                         + ' code=' + (str(self.api_code) if self.api_code is not None else 'unknown')
+                         + (' http_status=' + str(self.http_status) if self.http_status is not None else ''))
 
 
 def _pairs(pairs):
@@ -491,9 +497,9 @@ class MainlandTransport:
                 'Connection':'keep-alive' if session is not None else 'close'})
             response = conn.getresponse()
             if 300 <= response.status < 400:
-                raise TushareEgressStopped('redirect_blocked')
+                raise TushareEgressStopped('redirect_blocked', http_status=response.status)
             if not 200 <= response.status < 300:
-                raise TushareEgressStopped('http_error')
+                raise TushareEgressStopped('http_error', http_status=response.status)
             raw = response.read(MAX_BODY+1)
             if conn._expired.is_set():
                 raise TimeoutError()

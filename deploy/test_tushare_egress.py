@@ -163,7 +163,10 @@ class OfflineTests(unittest.TestCase):
     def test_redirect_and_http_errors_never_follow(self):
         for status in (301,302,307,401,403,429,500):
             permit=self.new_permit(str(status));self.status=status
-            with self.assertRaises(egress.TushareEgressStopped):self.query(self.client(permit))
+            with self.assertRaises(egress.TushareEgressStopped) as caught:self.query(self.client(permit))
+            self.assertEqual(caught.exception.http_status,status)
+            self.assertIn('http_status='+str(status),str(caught.exception))
+            self.assertIsNone(self.state(permit)['api_code'])
             with self.assertRaises(egress.TushareEgressStopped):self.query(self.client(permit))
         self.assertEqual(len(self.sent),7)
 
