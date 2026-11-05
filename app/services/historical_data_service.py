@@ -89,7 +89,8 @@ class HistoricalDataService:
         data_source: str,
         market: str = "CN",
         period: str = "daily",
-        overwrite: bool = True
+        overwrite: bool = True,
+        raise_on_error: bool = False,
     ) -> int:
         """
         保存历史数据到数据库
@@ -101,6 +102,9 @@ class HistoricalDataService:
             market: 市场类型 (CN/HK/US)
             period: 数据周期 (daily/weekly/monthly)
             overwrite: 是否覆盖已存在的数据（默认True，保持向后兼容）
+
+            raise_on_error: 非 Tushare 通道发生落库异常时抛出异常。历史批处理使用该模式，
+                避免数据库写失败被伪装成“成功但 0 条”。默认保持旧调用方兼容。
 
         Returns:
             确认处理的记录数量。Tushare 包括内容相同的幂等重放；失败抛异常。
@@ -142,6 +146,7 @@ class HistoricalDataService:
             operations = []
             saved_count = 0
             batch_size = 200  # 进一步减小批量大小，避免超时（从500改为200）
+            row_errors = []
 
             # 🔥 减少日志输出：只在处理大量数据时打印进度
             processed_count = 0
@@ -178,7 +183,9 @@ class HistoricalDataService:
 
                     # 批量执行（每200条）
                     if len(operations) >= batch_size:
-                        batch_saved = await self._execute_bulk_write_with_retry(symbol, operations)
+                        batch_saved = await self._execute_bulk_write_with_retry(
+                            symbol, operations, raise_on_error=raise_on_error
+                        )
                         saved_count += batch_saved
                         operations = []
 
@@ -186,12 +193,15 @@ class HistoricalDataService:
                     # 获取日期信息用于错误日志
                     date_str = str(date_index) if hasattr(date_index, '__str__') else 'unknown'
                     logger.error(f"❌ 处理记录失败 {symbol} {date_str}: {e}")
+                    row_errors.append((date_str, e))
+                    if raise_on_error:
+                        raise RuntimeError(f"{symbol} 历史记录标准化失败 ({date_str})") from e
                     continue
 
             # 执行剩余操作
             if operations:
                 final_batch_saved = await self._execute_bulk_write_with_retry(
-                    symbol, operations
+                    symbol, operations, raise_on_error=raise_on_error
                 )
                 saved_count += final_batch_saved
 
@@ -201,6 +211,8 @@ class HistoricalDataService:
             
         except Exception as e:
             logger.error(f"❌ 保存历史数据失败 {symbol}: {e}")
+            if raise_on_error:
+                raise
             return 0
 
     async def _save_tushare_history(self, symbol, data, market, period, overwrite):
@@ -275,7 +287,8 @@ class HistoricalDataService:
         self,
         symbol: str,
         operations: List,
-        max_retries: int = 5  # 增加重试次数：从3次改为5次
+        max_retries: int = 5,  # 增加重试次数：从3次改为5次
+        raise_on_error: bool = False,
     ) -> int:
         """
         执行批量写入，带重试机制
@@ -311,7 +324,13 @@ class HistoricalDataService:
                         await self.initialize()
                     collection = self.db.stock_daily_quotes
                     result = await collection.bulk_write(operations, ordered=False)
-                saved_count = result.upserted_count + result.modified_count
+                # matched_count 包含“内容未变化”的幂等重放；若只统计 modified_count，
+                # 第二次同步会错误地返回 0，调用方无法区分“已确认”与“写入失败”。
+                saved_count = (
+                    result.upserted_count
+                    + result.modified_count
+                    + getattr(result, "matched_count", 0)
+                )
                 # 🔥 减少日志：只在有错误或重试时才打印详细信息
                 return saved_count
 
@@ -328,6 +347,8 @@ class HistoricalDataService:
                         await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"❌ {symbol} 批量写入失败，已重试{max_retries}次: {e}")
+                    if raise_on_error:
+                        raise
                     return 0
 
             except Exception as e:
@@ -346,9 +367,13 @@ class HistoricalDataService:
                             await asyncio.sleep(wait_time)
                     else:
                         logger.error(f"❌ {symbol} 批量写入失败，已重试{max_retries}次: {e}")
+                        if raise_on_error:
+                            raise
                         return 0
                 else:
                     logger.error(f"❌ {symbol} 批量写入失败: {e}")
+                    if raise_on_error:
+                        raise
                     return 0
 
         return saved_count

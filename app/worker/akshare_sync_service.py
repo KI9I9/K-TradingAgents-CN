@@ -1595,7 +1595,6 @@ class AKShareSyncService:
             # 因此按 20 只切块（约 84 秒，留一倍余量）、最多 4 块并行；
             # 单块仍超时则对半拆开重试一次，避免个别慢股票拖垮整块。
             frames = {}
-            batch_error = None
             chunk_size = 25
             max_parallel = 4
             chunks = [codes[i:i + chunk_size] for i in range(0, len(codes), chunk_size)]
@@ -1604,7 +1603,7 @@ class AKShareSyncService:
             async def _fetch_codes(sub_codes, timeout_seconds):
                 sub_start = min(start_map[c] for c in sub_codes)
                 try:
-                    sub_frames, _fetch_errors, _circuit = await fetch_async(
+                    sub_frames, fetch_errors, _circuit = await fetch_async(
                         "akshare_history_batch",
                         {
                             "codes": sub_codes,
@@ -1614,14 +1613,14 @@ class AKShareSyncService:
                         },
                         timeout=timeout_seconds,
                     )
-                    return sub_frames or {}, None
+                    return sub_frames or {}, fetch_errors or {}, None
                 except Exception as exc:
-                    return {}, exc
+                    return {}, {}, exc
 
             async def _fetch_chunk(chunk):
                 # 每块按自己最早起始日拉取，避免整批被个别老数据股票拖成超长窗口
                 async with semaphore:
-                    chunk_frames, chunk_exc = await _fetch_codes(chunk, 170)
+                    chunk_frames, chunk_errors, chunk_exc = await _fetch_codes(chunk, 170)
                     if chunk_exc is not None and len(chunk) > 8:
                         # 拆半重试：一块里通常只有个别股票特别慢
                         half = len(chunk) // 2
@@ -1630,59 +1629,95 @@ class AKShareSyncService:
                             *[_fetch_codes(p, 130) for p in parts]
                         )
                         chunk_frames = {}
+                        chunk_errors = {}
                         last_exc = None
-                        for part_frames, part_exc in retried:
+                        for part_frames, part_errors, part_exc in retried:
                             chunk_frames.update(part_frames)
+                            chunk_errors.update(part_errors)
                             if part_exc is not None:
                                 last_exc = part_exc
                         chunk_exc = last_exc
-                    return chunk, chunk_frames, chunk_exc
+                    return chunk, chunk_frames, chunk_errors, chunk_exc
 
             chunk_results = await asyncio.gather(*[_fetch_chunk(c) for c in chunks])
-            for chunk, chunk_frames, chunk_exc in chunk_results:
+            failed_codes = {}
+            for chunk, chunk_frames, chunk_errors, chunk_exc in chunk_results:
                 frames.update(chunk_frames)
                 if chunk_exc is not None:
-                    batch_error = chunk_exc
                     logger.warning(
                         f"⚠️ akshare 批量拉取失败 {len(chunk)} 只 "
                         f"(start={min(start_map[c] for c in chunk)}): "
                         f"{type(chunk_exc).__name__}: {chunk_exc}"
                     )
                     for symbol in chunk:
+                        failed_codes.setdefault(
+                            symbol,
+                            f"批量拉取失败: {type(chunk_exc).__name__}: {chunk_exc}",
+                        )
+                for symbol, reason in chunk_errors.items():
+                    if frames.get(symbol) is None:
+                        failed_codes.setdefault(symbol, f"单只拉取失败: {reason}")
+
+            # 批量子进程会把单只失败放进 errors，但旧实现直接丢弃该字段，
+            # 结果是失败股票被记为“无数据”并在恢复时被跳过。对失败代码做一次
+            # 小批重试，成功的只保留一次落库，仍失败的才进入错误清单。
+            if failed_codes:
+                retry_codes = list(failed_codes)
+                retry_chunks = [retry_codes[i:i + 5] for i in range(0, len(retry_codes), 5)]
+
+                async def _fetch_retry_chunk(retry_chunk):
+                    async with semaphore:
+                        return await _fetch_codes(retry_chunk, 90)
+
+                retry_results = await asyncio.gather(
+                    *[_fetch_retry_chunk(c) for c in retry_chunks]
+                )
+                for retry_chunk, (retry_frames, retry_errors, retry_exc) in zip(retry_chunks, retry_results):
+                    frames.update({code: frame for code, frame in retry_frames.items() if frame is not None})
+                    for code in retry_chunk:
+                        if frames.get(code) is not None:
+                            failed_codes.pop(code, None)
+                        elif retry_exc is not None:
+                            failed_codes[code] = (
+                                f"重试拉取失败: {type(retry_exc).__name__}: {retry_exc}"
+                            )
+                        elif code in retry_errors:
+                            failed_codes[code] = f"重试单只拉取失败: {retry_errors[code]}"
+
+            for symbol, reason in failed_codes.items():
+                batch_stats["error_count"] += 1
+                batch_stats["errors"].append({
+                    "code": symbol,
+                    "error": reason,
+                    "context": "_process_historical_batch"
+                })
+
+            for symbol in codes:
+                if symbol in failed_codes:
+                    continue
+                hist_data = frames.get(symbol)
+                if hist_data is not None and not hist_data.empty:
+                    try:
+                        saved_count = await self.historical_service.save_historical_data(
+                            symbol=symbol,
+                            data=hist_data,
+                            data_source="akshare",
+                            market="CN",
+                            period=period,
+                            raise_on_error=True,
+                        )
+                        batch_stats["success_count"] += 1
+                        batch_stats["total_records"] += saved_count
+                    except Exception as exc:
                         batch_stats["error_count"] += 1
                         batch_stats["errors"].append({
                             "code": symbol,
-                            "error": f"批量拉取失败: {type(chunk_exc).__name__}: {chunk_exc}",
+                            "error": f"落库失败: {type(exc).__name__}: {exc}",
                             "context": "_process_historical_batch"
                         })
-
-            # 逐块容错：某块失败只影响该块，其余块的结果照常落库
-            batch_error = None
-
-            if batch_error is None:
-                for symbol in codes:
-                    hist_data = frames.get(symbol)
-                    if hist_data is not None and not hist_data.empty:
-                        try:
-                            saved_count = await self.historical_service.save_historical_data(
-                                symbol=symbol,
-                                data=hist_data,
-                                data_source="akshare",
-                                market="CN",
-                                period=period
-                            )
-                            batch_stats["success_count"] += 1
-                            batch_stats["total_records"] += saved_count
-                        except Exception as exc:
-                            batch_stats["error_count"] += 1
-                            batch_stats["errors"].append({
-                                "code": symbol,
-                                "error": f"落库失败: {type(exc).__name__}: {exc}",
-                                "context": "_process_historical_batch"
-                            })
-                    else:
-                        # 接口正常返回空，与网络失败分开统计
-                        batch_stats["no_data_count"] += 1
+                else:
+                    # 接口正常返回空，与网络失败分开统计
+                    batch_stats["no_data_count"] += 1
 
             processed_count += len(codes)
             batch_stats["processed_count"] = processed_count
