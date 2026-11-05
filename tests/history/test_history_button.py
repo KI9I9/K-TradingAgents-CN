@@ -317,6 +317,7 @@ class ButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent,['daily'])
         self.assertEqual(self.executions.rows['1']['status'],'failed')
         self.assertIn('usage_limit',self.executions.rows['1']['error_message'])
+        self.assertIn('40203',self.executions.rows['1']['error_message'])
         self.assertEqual((await self.click()).status_code,400)
         self.assertEqual(self.sent,['daily']);self.assertEqual(len(self.col.rows),1)
 

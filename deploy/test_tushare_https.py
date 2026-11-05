@@ -101,6 +101,7 @@ class ClassifierTests(unittest.TestCase):
             ('token已经过期', 'token_invalid'),
             ('IP地址被限制', 'ip_restriction'),
             ('参数错误', 'invalid_parameters'),
+            ('服务器错误，请稍后再试', 'service_unavailable'),
             ('系统异常', 'service_unavailable'),
         ):
             with self.subTest(reason=reason):

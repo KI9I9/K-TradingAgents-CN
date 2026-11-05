@@ -20,7 +20,7 @@ _TASKS=set()
 BJ=timezone(timedelta(hours=8))
 
 
-def message(reason, http_status=None):
+def message(reason, http_status=None, api_code=None):
     messages = {
         'not_authorized':'历史同步授权尚未配置，未发送上游请求。',
         'disabled':'历史同步运行许可已关闭（不是登录权限）；请联系运维核查停止原因并恢复。',
@@ -29,6 +29,9 @@ def message(reason, http_status=None):
         'timeout':'上游请求连续超时，已保留完成数据及断点；需核验后从未完成股票继续。',
         'usage_limit':'上游报告调用限额，已停止后续请求。',
         'insufficient_points':'上游积分不足，已停止后续请求。',
+        'service_unavailable':'上游服务返回服务器错误，已停止后续请求；未继续消耗额度。',
+        'api_rejected':'上游拒绝了本次 API 请求，已停止后续请求。',
+        'unclassified':'上游返回未分类 API 错误，无法据此判断权限或额度；已停止后续请求。',
         'generation_changed':'授权已切换，请重新提交普通执行。',
         'generation_incomplete':'授权切换未完成，已停止执行，请运维核查。',
         'busy':'历史同步正在运行，请查看任务进度。',
@@ -36,9 +39,12 @@ def message(reason, http_status=None):
         'write_outcome_unresolved':'上次写入结果未完全匹配，已保留现场，不会重复写入。',
         'cancelled':'历史同步已取消，已保存的数据和取数结果保留。',
     }
-    detail = ''
+    details = []
+    if type(api_code) is int and -1000000 <= api_code <= 1000000:
+        details.append('Tushare API 错误码 '+str(api_code))
     if type(http_status) is int and 100 <= http_status <= 599:
-        detail = '（上游 HTTP 状态码 '+str(http_status)+'）'
+        details.append('上游 HTTP 状态码 '+str(http_status))
+    detail = ('（'+'；'.join(details)+'）') if details else ''
     return messages.get(reason,'历史同步已停止，请核查执行记录。') + detail + ' ['+reason+']'
 
 
@@ -121,7 +127,7 @@ class HistoryBatchService:
         except (TushareEgressStopped,BatchStopped,PlanError) as error:
             if reserved:self.gate.stop()
             reason=error.reason if isinstance(error,TushareEgressStopped) else str(error)
-            raise HTTPException(400,message(reason,getattr(error,'http_status',None))) from None
+            raise HTTPException(400,message(reason,getattr(error,'http_status',None),getattr(error,'api_code',None))) from None
         except BaseException:
             if reserved:self.gate.stop()
             raise
@@ -207,7 +213,7 @@ class HistoryBatchService:
             if getattr(self,'scheduled',False):self.gate.stop()
             detail=error.detail if isinstance(error,HTTPException) else message(
                 error.reason if isinstance(error,TushareEgressStopped) else str(error) if isinstance(error,BatchStopped) else 'interrupted',
-                getattr(error,'http_status',None))
+                getattr(error,'http_status',None), getattr(error,'api_code',None))
             await self.executions.update_one({'_id':execution_id},{'$set':dict(status='failed',finished_at=self.record_now(),error_message=detail,progress_message=detail)})
             if not isinstance(error,Exception):raise
             return
@@ -246,7 +252,8 @@ class HistoryBatchService:
                 result=dict(committed=checkpoint['counts']['committed'],total=len(plan['items']),complete=False,
                             outcomes=checkpoint['outcomes'])
                 status='cancelled' if reason=='cancelled' else 'partial' if result['committed'] else 'failed'
-                await self._progress(execution_id,result,status,plan,message(reason,http_status))
+                await self._progress(execution_id,result,status,plan,message(
+                    reason, http_status, getattr(error,'api_code',None)))
             except Exception:
                 # Journal is authoritative; never retry network/DB side effects
                 # just because the progress collection is unavailable.
@@ -280,7 +287,8 @@ async def submit_history_batch(*,force=False,incremental=True,scheduled=False):
     try:
         gate=selected_gate()
         policy,_ = gate.status()  # refuse BEFORE opening database/provider on unconfigured hosts
-    except TushareEgressStopped as error:raise HTTPException(400,message(error.reason)) from None
+    except TushareEgressStopped as error:raise HTTPException(400,message(
+        error.reason, getattr(error,'http_status',None), getattr(error,'api_code',None))) from None
     from app.core.database import get_mongo_db
     from app.services.historical_data_service import HistoricalDataService
     db=get_mongo_db()

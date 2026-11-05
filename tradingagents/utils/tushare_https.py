@@ -40,8 +40,8 @@ _REJECTION_RULES = (
     ('invalid_parameters', re.compile(
         r'参数.{0,20}(?:错误|无效|缺失|不合法)|invalid.{0,15}param|missing.{0,15}param', re.I)),
     ('service_unavailable', re.compile(
-        r'服务暂不可用|服务异常|系统异常|内部错误|维护中|'
-        r'service unavailable|internal server error|under maintenance', re.I)),
+        r'服务暂不可用|服务异常|服务器错误|系统异常|内部错误|维护中|'
+        r'service unavailable|server error|internal server error|under maintenance', re.I)),
 )
 _USAGE_WINDOWS = (
     ('second', re.compile(r'每(?:\d{1,4}|一)?秒|per second', re.I)),
