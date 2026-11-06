@@ -77,6 +77,7 @@ def main() -> int:
     if host_path.is_symlink() or not host_path.is_file():
         raise SystemExit("permit_host_file_invalid")
     old = host_path.read_bytes()
+    owner = host_path.stat()
     if digest(old) != args.previous_sha256:
         raise SystemExit("previous_permit_changed")
     old_doc = json.loads(old)
@@ -119,6 +120,10 @@ def main() -> int:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "wb") as stream:
             stream.write(candidate); stream.flush(); os.fsync(stream.fileno())
+        # The backend runs as UID 1000.  os.replace() otherwise leaves the
+        # root-owned temporary inode unreadable to the application.
+        os.chown(temporary, owner.st_uid, owner.st_gid)
+        os.chmod(temporary, owner.st_mode & 0o777)
         if host_path.read_bytes() != old:
             raise RuntimeError("permit_changed_before_replace")
         os.replace(temporary, host_path)
@@ -140,7 +145,8 @@ def main() -> int:
         if temporary.exists():
             temporary.unlink()
         if host_path.read_bytes() == candidate:
-            host_path.write_bytes(old); host_path.chmod(0o600)
+            host_path.write_bytes(old); os.chown(host_path, owner.st_uid, owner.st_gid)
+            os.chmod(host_path, owner.st_mode & 0o777)
         raise
     print(json.dumps(result, ensure_ascii=False))
     return 0
