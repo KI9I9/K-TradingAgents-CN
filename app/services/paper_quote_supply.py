@@ -109,7 +109,10 @@ def parse_sina_quote(raw: bytes, code: str, captured_at: datetime) -> dict:
     symbol = source_symbol(code)
     if not raw or len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("response_size_invalid")
-    text = raw.decode("gb18030", errors="strict")
+    try:
+        text = raw.decode("gb18030", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("response_encoding_invalid") from exc
     match = re.fullmatch(r'\s*var\s+hq_str_' + symbol + r'="([^"\r\n]*)";?\s*', text)
     if match is None:
         raise ValueError("response_symbol_or_format_invalid")
@@ -226,6 +229,39 @@ async def fetch_sina(code: str) -> bytes:
             return bytes(body)
 
 
+def summarize_quote_observability(
+    code: str, selected: bool, doc: Optional[dict], reason: str
+) -> dict:
+    """Structured observability summary without raw payloads, URLs, or security names."""
+    if doc is None:
+        return {
+            "event": "paper_quote_probe",
+            "code": code,
+            "selected": bool(selected),
+            "available": False,
+            "reason": reason,
+            "source": None,
+            "quote_time": None,
+            "fetched_at": None,
+            "trading_status": None,
+            "trading_status_raw": None,
+            "payload_sha256": None,
+        }
+    return {
+        "event": "paper_quote_probe",
+        "code": code,
+        "selected": bool(selected),
+        "available": True,
+        "reason": reason,
+        "source": doc.get("data_source"),
+        "quote_time": doc.get("quote_time"),
+        "fetched_at": doc.get("fetched_at"),
+        "trading_status": doc.get("trading_status"),
+        "trading_status_raw": doc.get("trading_status_raw"),
+        "payload_sha256": doc.get("payload_sha256"),
+    }
+
+
 class PaperQuoteSupply:
     def __init__(self, *, clock: Callable = cn_now, permit: Callable = read_permit,
                  calendar: Optional[Callable] = None, fetch: Callable = fetch_sina,
@@ -235,31 +271,50 @@ class PaperQuoteSupply:
         self.monotonic = monotonic
         self.requests = deque()
         self.in_flight = 0
+        self.stats: dict[str, int] = {}
+        self.last_observation: Optional[dict] = None
+
+    def _record(
+        self, code: str, selected: bool, doc: Optional[dict], reason: str
+    ) -> tuple[bool, Optional[dict], str]:
+        self.stats[reason] = self.stats.get(reason, 0) + 1
+        self.last_observation = summarize_quote_observability(code, selected, doc, reason)
+        return selected, doc, reason
+
+    def snapshot_observability(self) -> dict:
+        return {
+            "counts": dict(self.stats),
+            "in_flight": self.in_flight,
+            "window_requests": len(self.requests),
+            "last_observation": (
+                dict(self.last_observation) if self.last_observation is not None else None
+            ),
+        }
 
     async def get(self, code: str) -> tuple[bool, Optional[dict], str]:
         """(selected, quote, reason); selected failures forbid database fallback."""
         now = self.clock()
         permission = self.permit(now)
         if permission is None:
-            return False, None, "paper_supply_disabled"
+            return self._record(code, False, None, "paper_supply_disabled")
         try:
             source_symbol(code)
             if not in_continuous_session(now):
-                return True, None, "outside_continuous_session"
+                return self._record(code, True, None, "outside_continuous_session")
             if not await asyncio.wait_for(self.calendar(now), timeout=6.5):
-                return True, None, "calendar_unverified"
+                return self._record(code, True, None, "calendar_unverified")
             # No await between admission and reservation: concurrent requests
             # in the same event loop cannot oversubscribe these process limits.
             tick = self.monotonic()
             while self.requests and tick - self.requests[0] >= 60:
                 self.requests.popleft()
             if len(self.requests) >= MAX_REQUESTS_PER_MINUTE or self.in_flight >= MAX_IN_FLIGHT:
-                return True, None, "paper_supply_busy"
+                return self._record(code, True, None, "paper_supply_busy")
             admission_time = self.clock()
             if not in_continuous_session(admission_time):
-                return True, None, "outside_continuous_session"
+                return self._record(code, True, None, "outside_continuous_session")
             if self.permit(admission_time) != permission:
-                return True, None, "paper_supply_revoked"
+                return self._record(code, True, None, "paper_supply_revoked")
             self.requests.append(tick)
             self.in_flight += 1
             try:
@@ -268,17 +323,18 @@ class PaperQuoteSupply:
                 self.in_flight -= 1
             captured_at = self.clock()
             if self.permit(captured_at) != permission:
-                return True, None, "paper_supply_revoked"
+                return self._record(code, True, None, "paper_supply_revoked")
             if not in_continuous_session(captured_at):
-                return True, None, "outside_continuous_session"
-            return True, parse_sina_quote(raw, code, captured_at), "ok"
+                return self._record(code, True, None, "outside_continuous_session")
+            doc = parse_sina_quote(raw, code, captured_at)
+            return self._record(code, True, doc, "ok")
         except (TimeoutError, asyncio.TimeoutError):
-            return True, None, "paper_supply_timeout"
+            return self._record(code, True, None, "paper_supply_timeout")
         except ValueError as exc:
-            return True, None, str(exc)
+            return self._record(code, True, None, str(exc))
         except Exception:
             # Do not expose provider response bodies, URLs or auth information.
-            return True, None, "paper_supply_unavailable"
+            return self._record(code, True, None, "paper_supply_unavailable")
 
 
 _supply = PaperQuoteSupply()

@@ -311,5 +311,88 @@ class HttpAdapterBehavior(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(requests), 1)
 
 
+class P2HardeningAndObservabilityTests(unittest.IsolatedAsyncioTestCase):
+    def test_exact_8192_bytes_accepted_and_8193_rejected(self):
+        base = packet("600000")
+        pad = supply.MAX_RESPONSE_BYTES - len(base)
+        exact_8192 = packet("600000", **{"0": "测试" + ("X" * pad)})
+        self.assertEqual(len(exact_8192), 8192)
+        self.assertEqual(supply.parse_sina_quote(exact_8192, "600000", NOW)["close"], 10.2)
+
+        over_8193 = packet("600000", **{"0": "测试" + ("X" * (pad + 1))})
+        self.assertEqual(len(over_8193), 8193)
+        with self.assertRaisesRegex(ValueError, "^response_size_invalid$"):
+            supply.parse_sina_quote(over_8193, "600000", NOW)
+
+    async def test_invalid_gb18030_bytes_raise_response_encoding_invalid(self):
+        bad_raw = b'var hq_str_sh600000="\xff\xfe\xfd' + b",0" * 32 + b'";\n'
+        with self.assertRaisesRegex(ValueError, "^response_encoding_invalid$"):
+            supply.parse_sina_quote(bad_raw, "600000", NOW)
+
+        service = supply.PaperQuoteSupply(
+            clock=lambda: NOW,
+            permit=lambda now: permission(),
+            calendar=AsyncMock(return_value=True),
+            fetch=AsyncMock(return_value=bad_raw),
+        )
+        selected, quote, reason = await service.get("600000")
+        self.assertEqual((selected, quote, reason), (True, None, "response_encoding_invalid"))
+
+    async def test_observability_summary_and_counters_redact_raw_payload_and_name(self):
+        raw_ok = packet("159865", **{"0": "机密证券名称不外泄"})
+        raw_susp = packet("601059", status="03", **{"0": "停牌名称不外泄"})
+        service = supply.PaperQuoteSupply(
+            clock=lambda: NOW,
+            permit=lambda now: permission(),
+            calendar=AsyncMock(return_value=True),
+            fetch=AsyncMock(side_effect=[raw_ok, raw_susp]),
+        )
+        selected_ok, doc_ok, reason_ok = await service.get("159865")
+        self.assertTrue(selected_ok)
+        self.assertIsNotNone(doc_ok)
+        self.assertEqual(reason_ok, "ok")
+
+        obs_ok = service.snapshot_observability()
+        self.assertEqual(obs_ok["counts"], {"ok": 1})
+        last_ok = obs_ok["last_observation"]
+        self.assertEqual(last_ok["code"], "159865")
+        self.assertTrue(last_ok["available"])
+        self.assertEqual(last_ok["source"], "sina_l1")
+        self.assertEqual(last_ok["trading_status"], "normal")
+        self.assertEqual(last_ok["trading_status_raw"], "00")
+        self.assertEqual(len(last_ok["payload_sha256"]), 64)
+        self.assertNotIn("机密证券名称不外泄", json.dumps(obs_ok, ensure_ascii=False))
+        self.assertNotIn("hq.sinajs.cn", json.dumps(obs_ok, ensure_ascii=False))
+
+        selected_s, doc_s, reason_s = await service.get("601059")
+        self.assertEqual((selected_s, doc_s, reason_s), (True, None, "security_suspended"))
+        obs_after = service.snapshot_observability()
+        self.assertEqual(obs_after["counts"], {"ok": 1, "security_suspended": 1})
+        self.assertFalse(obs_after["last_observation"]["available"])
+        self.assertIsNone(obs_after["last_observation"]["payload_sha256"])
+        self.assertNotIn("停牌名称不外泄", json.dumps(obs_after, ensure_ascii=False))
+
+    def test_sh_sz_etf_prefix_matrix_and_bse_closed_rejection(self):
+        expected = {
+            "600000": "sh600000",
+            "688001": "sh688001",
+            "501000": "sh501000",
+            "510300": "sh510300",
+            "520000": "sh520000",
+            "560000": "sh560000",
+            "588000": "sh588000",
+            "000001": "sz000001",
+            "300750": "sz300750",
+            "159865": "sz159865",
+            "160101": "sz160101",
+            "180101": "sz180101",
+        }
+        for code, sym in expected.items():
+            self.assertEqual(supply.source_symbol(code), sym)
+        for bse in ("920363", "830799", "870001", "430001"):
+            with self.assertRaisesRegex(ValueError, "^symbol_unsupported$"):
+                supply.source_symbol(bse)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -76,9 +76,56 @@ class AkShareHistoryIntegrityTests(unittest.TestCase):
         }
         self.assertTrue(any(
             isinstance(item, ast.Constant) and item.value == "matched_count"
-            for item in ast.walk(method)
+        for item in ast.walk(method)
         ))
         self.assertIn("raise_on_error", _names(method))
+
+    def test_is_data_fresh_handles_bson_utc_and_rejects_future_timestamps(self):
+        from datetime import datetime, timezone
+        import sys
+        import types
+        from typing import Any, Optional
+
+        sys.path.insert(0, str(ROOT))
+        from app.services.quote_contract import CN_TZ
+
+        method = _method(
+            ROOT / "app/worker/akshare_sync_service.py",
+            "AKShareSyncService",
+            "_is_data_fresh",
+        )
+        module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(module)
+        ns = {
+            "Any": Any,
+            "Optional": Optional,
+            "datetime": datetime,
+            "logger": types.SimpleNamespace(
+                warning=lambda *a, **k: None,
+                debug=lambda *a, **k: None,
+            ),
+        }
+        exec(compile(module, "akshare_sync_service.py", "exec"), ns)
+        fn = ns["_is_data_fresh"]
+
+        now_cn = datetime(2026, 11, 9, 10, 0, 0, tzinfo=CN_TZ)
+        # BSON naive UTC (5m ago = 01:55 UTC vs 10:00+08:00 = 02:00 UTC) -> True
+        self.assertTrue(fn(None, datetime(2026, 11, 9, 1, 55, 0), minutes=15, now=now_cn))
+        # BSON naive UTC (20m ago = 01:40 UTC) -> False
+        self.assertFalse(fn(None, datetime(2026, 11, 9, 1, 40, 0), minutes=15, now=now_cn))
+        # Future timestamp (+10m in future = 02:10 UTC) -> False
+        self.assertFalse(
+            fn(None, datetime(2026, 11, 9, 2, 10, 0, tzinfo=timezone.utc), minutes=15, now=now_cn)
+        )
+        # Small clock skew (+30s in future, within 60s bound) -> True
+        self.assertTrue(
+            fn(None, datetime(2026, 11, 9, 2, 0, 30, tzinfo=timezone.utc), minutes=15, now=now_cn)
+        )
+        # ISO string with +08:00 (10m ago) -> True
+        self.assertTrue(fn(None, "2026-11-09T09:50:00+08:00", minutes=15, now=now_cn))
+        # Invalid/empty values -> False
+        self.assertFalse(fn(None, "not-a-timestamp", minutes=15, now=now_cn))
+        self.assertFalse(fn(None, None, minutes=15, now=now_cn))
 
 
 if __name__ == "__main__":

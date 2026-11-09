@@ -323,66 +323,63 @@ class AKShareSyncService:
         
         return batch_stats
     
-    def _is_data_fresh(self, updated_at: Any, hours: int = 24, minutes: int = None) -> bool:
+    def _is_data_fresh(
+        self,
+        updated_at: Any,
+        hours: int = 24,
+        minutes: int = None,
+        now: Optional[datetime] = None,
+    ) -> bool:
         """
         检查数据是否新鲜
-        
+
         Args:
             updated_at: 更新时间
             hours: 小时数（默认24小时）
             minutes: 分钟数（如果指定，会覆盖hours参数）
-        
+            now: 可选的基准时间（默认使用 cn_now()）
+
         Returns:
             bool: 数据是否新鲜
         """
         if not updated_at:
             return False
-        
+
         try:
-            # 解析时间字符串
-            if isinstance(updated_at, str):
-                # 处理 ISO 格式时间字符串
-                updated_at_str = updated_at.replace('Z', '+00:00')
-                try:
-                    updated_at = datetime.fromisoformat(updated_at_str)
-                except ValueError:
-                    # 尝试其他格式
-                    try:
-                        updated_at = datetime.strptime(updated_at, '%Y-%m-%d %H:%M:%S')
-                    except ValueError:
-                        logger.warning(f"⚠️ 无法解析时间格式: {updated_at}")
-                        return False
-            elif isinstance(updated_at, datetime):
-                pass
-            else:
+            from app.services.quote_contract import (
+                DEFAULT_MAX_FUTURE_SECONDS,
+                cn_now,
+                parse_quote_time,
+            )
+
+            parsed = parse_quote_time(updated_at)
+            if parsed is None:
+                logger.warning(f"⚠️ 无法解析时间格式: {updated_at}")
                 return False
-            
-            # 🔥 修复时区问题：统一使用本地时间进行比较
-            # 如果 updated_at 有时区信息，转换为本地时间；如果没有，假设是本地时间
-            if updated_at.tzinfo is not None:
-                # 有时区信息，转换为本地时间
-                from datetime import timezone
-                if updated_at.tzinfo == timezone.utc:
-                    # UTC 时间，转换为本地时间（UTC+8）
-                    updated_at = updated_at.replace(tzinfo=None) + timedelta(hours=8)
-                else:
-                    # 其他时区，转换为本地时间
-                    updated_at = updated_at.astimezone().replace(tzinfo=None)
-            
-            # 使用本地时间进行比较
-            now = datetime.now()
-            time_diff = now - updated_at
-            
-            # 如果指定了分钟数，使用分钟数；否则使用小时数
-            if minutes is not None:
-                is_fresh = time_diff.total_seconds() < (minutes * 60)
-            else:
-                is_fresh = time_diff.total_seconds() < (hours * 3600)
-            
-            logger.debug(f"🔍 数据新鲜度检查: updated_at={updated_at}, now={now}, diff={time_diff.total_seconds()/60:.1f}分钟, fresh={is_fresh}")
-            
+
+            threshold_seconds = (minutes * 60) if minutes is not None else (hours * 3600)
+            if threshold_seconds <= 0:
+                return False
+
+            reference_now = parse_quote_time(now) if now is not None else cn_now()
+            if reference_now is None:
+                return False
+
+            age_seconds = (reference_now - parsed).total_seconds()
+            if age_seconds < -DEFAULT_MAX_FUTURE_SECONDS:
+                logger.warning(
+                    f"⚠️ 数据时间戳超前当前时间: updated_at={parsed.isoformat()}, "
+                    f"now={reference_now.isoformat()}, age_seconds={age_seconds:.1f}"
+                )
+                return False
+
+            is_fresh = age_seconds < threshold_seconds
+            logger.debug(
+                f"🔍 数据新鲜度检查: updated_at={parsed.isoformat()}, "
+                f"now={reference_now.isoformat()}, diff={age_seconds/60:.1f}分钟, fresh={is_fresh}"
+            )
             return is_fresh
-            
+
         except Exception as e:
             logger.warning(f"⚠️ 检查数据新鲜度失败: {e}")
             return False
