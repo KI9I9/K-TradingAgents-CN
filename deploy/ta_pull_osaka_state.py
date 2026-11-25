@@ -5,9 +5,11 @@ into /home/ubuntu/quote-guard-releases/osaka-state-backups/ (mode 0700/0600).
 Backs up:
   - /app/runtime essential state (paper-quote-supply.json, tushare-history-schedule.json,
     tushare-egress, tushare-manual-daily-v1, tushare-history-batch-v1 including all 4 generations & STOP gates)
-  - mounts/app_{config,data,reports,results,uploads}
+  - mounts/app_{config,data,reports,results,uploads} under /home/ubuntu/tradingagents/mounts
+  - /home/ubuntu/tradingagents/{compose.live.json,config,secrets,patches,cloudflared}
   - live docker inspect mount/image topology manifest (redacted of env secrets)
   - /etc/systemd/system/osaka-* and ta-* units, /usr/local/bin/osaka-backup-mongo and ta-data-check.sh
+  - /home/ubuntu/colab-gpu-studio (.env with ENCRYPTION_KEY, docker-compose.yml, secrets/, and online SQLite backup of studio.db)
 Never prints any secret content to stdout; all output is sanitized via safe-inspect.py.
 """
 import hashlib
@@ -34,9 +36,9 @@ TMPD=$(mktemp -d /tmp/osaka-state-bk.XXXXXX)
 trap "rm -rf $TMPD" EXIT
 chmod 700 "$TMPD"
 
-MOUNTS_BASE="/home/ubuntu/k-tradingagents-migration-receiver-20261016/final-restore-20261018-v2/mounts"
-RESTORE_BASE="/home/ubuntu/k-tradingagents-migration-receiver-20261016/final-restore-20261018-v2"
-mkdir -p "$TMPD/mounts" "$TMPD/app_runtime" "$TMPD/systemd" "$TMPD/bin" "$TMPD/etc" "$TMPD/meta" "$TMPD/frontend_bundle"
+TA_BASE="/home/ubuntu/tradingagents"
+MOUNTS_BASE="$TA_BASE/mounts"
+mkdir -p "$TMPD/mounts" "$TMPD/app_runtime" "$TMPD/systemd" "$TMPD/bin" "$TMPD/etc" "$TMPD/meta" "$TMPD/frontend_bundle" "$TMPD/tradingagents_meta"
 
 # 1. Copy persistent app mounts (config, data, reports, results, uploads)
 for d in app_config app_data app_reports app_results app_uploads; do
@@ -53,11 +55,15 @@ for item in paper-quote-supply.json paper-quote-supply.renewal.lock tushare-hist
   fi
 done
 
-# 3. Copy systemd timers/services, host scripts & /etc/ta-* configs
+# 3. Copy systemd timers/services, host scripts, /etc/ta-* & consolidated /home/ubuntu/tradingagents meta
 cp -a /etc/systemd/system/osaka-* /etc/systemd/system/ta-* "$TMPD/systemd/" 2>/dev/null || true
 cp -a /usr/local/bin/osaka-* /usr/local/bin/ta-* "$TMPD/bin/" 2>/dev/null || true
 cp -a /etc/ta-* "$TMPD/etc/" 2>/dev/null || true
-cp -a "$RESTORE_BASE"/*.json "$TMPD/meta/" 2>/dev/null || true
+for item in compose.live.json config secrets patches cloudflared; do
+  if [ -e "$TA_BASE/$item" ]; then
+    cp -a "$TA_BASE/$item" "$TMPD/tradingagents_meta/"
+  fi
+done
 
 # 4. Save container image, full inspect & bind-mount topology + compiled frontend static bundle
 docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.CreatedAt}}" > "$TMPD/meta/docker_ps_a.txt"
@@ -65,6 +71,24 @@ docker inspect $(docker ps -q) --format "{{json .Name}} {{json .Image}} {{json .
 docker inspect $(docker ps -q) > "$TMPD/meta/running_containers_full_inspect.json" 2>/dev/null || true
 docker cp ta-live-088a60b962bf-frontend-1:/usr/share/nginx/html "$TMPD/frontend_bundle/html" 2>/dev/null || true
 docker cp ta-live-088a60b962bf-frontend-1:/etc/nginx/conf.d "$TMPD/frontend_bundle/conf.d" 2>/dev/null || true
+
+# 5. Backup Colab GPU Studio configs, secrets & atomic online SQLite snapshot
+CGS_BASE="/home/ubuntu/colab-gpu-studio"
+if [ -d "$CGS_BASE" ]; then
+  mkdir -p "$TMPD/colab_gpu_studio/secrets" "$TMPD/colab_gpu_studio/data"
+  for f in .env docker-compose.yml; do
+    if [ -f "$CGS_BASE/$f" ]; then
+      cp -a "$CGS_BASE/$f" "$TMPD/colab_gpu_studio/"
+    fi
+  done
+  if [ -d "$CGS_BASE/secrets" ]; then
+    cp -a "$CGS_BASE/secrets/." "$TMPD/colab_gpu_studio/secrets/" 2>/dev/null || true
+  fi
+  CGS_VOL="/var/lib/docker/volumes/colab-gpu-studio_studio-data/_data"
+  if [ -f "$CGS_VOL/studio.db" ]; then
+    python3 -c "import sqlite3; s=sqlite3.connect(\"$CGS_VOL/studio.db\"); d=sqlite3.connect(\"$TMPD/colab_gpu_studio/data/studio.db\"); s.backup(d); d.close(); s.close()" 2>/dev/null || cp -a "$CGS_VOL/studio.db"* "$TMPD/colab_gpu_studio/data/" 2>/dev/null || true
+  fi
+fi
 
 tar -C "$TMPD" -czf - .
 '
@@ -91,7 +115,7 @@ def main():
         "osaka-migration",
         REMOTE_TAR_CMD,
     ]
-    p = subprocess.run(ssh_cmd, capture_output=True, timeout=60)
+    p = subprocess.run(ssh_cmd, capture_output=True, timeout=180)
     if p.returncode != 0 or len(p.stdout) < 512:
         err = sanitize_line((p.stderr.decode("utf-8", errors="replace") if p.stderr else f"rc={p.returncode}").strip())
         print(json.dumps({"ok": False, "error": err}, ensure_ascii=False))
