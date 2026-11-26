@@ -199,7 +199,11 @@ class DataValidationService:
             # 所有必需数据都存在
             return DataValidationResult(
                 is_valid=True,
-                message=f"股票 {symbol6} 的数据校验通过",
+                message=(
+                    f"ETF {symbol6} 的数据校验通过"
+                    if market_type == "etf"
+                    else f"股票 {symbol6} 的数据校验通过"
+                ),
                 missing_data=[],
                 details=details
             )

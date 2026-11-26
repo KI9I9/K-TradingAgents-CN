@@ -472,34 +472,42 @@ async def run_single_stock_sync(request: SingleStockSyncRequest) -> dict:
 
     # 同步财务数据
     if request.sync_financial:
-        try:
-            if request.data_source == "qmt":
-                from app.worker.qmt_sync_service import get_qmt_sync_service
-
-                qmt_service = await get_qmt_sync_service()
-                fin_result = await qmt_service.sync_financial_data(symbols=[str(request.symbol).zfill(6)])
-                success = fin_result.get("success_count", 0) > 0
-            else:
-                financial_service = await get_financial_sync_service()
-
-                fin_result = await financial_service.sync_single_stock(
-                    symbol=request.symbol,
-                    data_sources=[request.data_source]
-                )
-
-                success = fin_result.get(request.data_source, False)
+        if is_etf:
             result["financial_sync"] = {
-                "success": success,
-                "message": "财务数据同步成功" if success else "财务数据同步失败"
+                "success": True,
+                "skipped": True,
+                "message": "ETF 不适用上市公司财务报表，已跳过",
             }
-            logger.info(f"✅ {request.symbol} 财务数据同步完成: {success}")
+            logger.info(f"⏭️ {request.symbol} 为 ETF，跳过上市公司财务数据同步")
+        else:
+            try:
+                if request.data_source == "qmt":
+                    from app.worker.qmt_sync_service import get_qmt_sync_service
 
-        except Exception as e:
-            logger.error(f"❌ {request.symbol} 财务数据同步失败: {e}")
-            result["financial_sync"] = {
-                "success": False,
-                "error": str(e)
-            }
+                    qmt_service = await get_qmt_sync_service()
+                    fin_result = await qmt_service.sync_financial_data(symbols=[str(request.symbol).zfill(6)])
+                    success = fin_result.get("success_count", 0) > 0
+                else:
+                    financial_service = await get_financial_sync_service()
+
+                    fin_result = await financial_service.sync_single_stock(
+                        symbol=request.symbol,
+                        data_sources=[request.data_source]
+                    )
+
+                    success = fin_result.get(request.data_source, False)
+                result["financial_sync"] = {
+                    "success": success,
+                    "message": "财务数据同步成功" if success else "财务数据同步失败"
+                }
+                logger.info(f"✅ {request.symbol} 财务数据同步完成: {success}")
+
+            except Exception as e:
+                logger.error(f"❌ {request.symbol} 财务数据同步失败: {e}")
+                result["financial_sync"] = {
+                    "success": False,
+                    "error": str(e)
+                }
 
     # 同步基础数据
     if request.sync_basic:

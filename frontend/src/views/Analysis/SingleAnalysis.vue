@@ -867,9 +867,13 @@
             <span>{{ syncStatus === 'running' ? '正在同步...' : syncStatus === 'success' ? '同步完成' : '同步失败' }}</span>
           </div>
           <div style="display: flex; gap: 12px;">
-            <el-button type="primary" :disabled="syncStatus === 'running'" @click="handleSyncMissingData">
+            <el-button
+              :type="hasValidationMissingData ? 'primary' : 'default'"
+              :disabled="syncStatus === 'running'"
+              @click="handleSyncMissingData"
+            >
               <el-icon><Refresh /></el-icon>
-              同步缺失数据
+              {{ hasValidationMissingData ? '同步缺失数据' : '重新同步数据' }}
             </el-button>
             <el-button @click="showValidationDialog = false">关闭</el-button>
           </div>
@@ -925,7 +929,7 @@ import {
   stripStockCodeSuffix
 } from '@/utils/market'
 import { goPaperOrder, goStockDetail, resolveAnalysisMarket } from '@/utils/navigation'
-import { loadManualSyncSourceState } from '@/utils/dataSource'
+import { loadManualSyncSourceState, selectMissingDataSyncSource } from '@/utils/dataSource'
 import { fetchTaskResultWithRetry, hasTaskResultContent, mergeTaskResult } from '@/utils/taskResult'
 
 // 配置marked选项
@@ -963,6 +967,11 @@ const submitting = ref(false)
 const validatingData = ref(false)
 const showValidationDialog = ref(false)
 const validationResult = ref<any>(null)
+const hasValidationMissingData = computed(() => {
+  const res = validationResult.value
+  if (!res) return false
+  return !res.is_valid || (Array.isArray(res.missing_data) && res.missing_data.length > 0)
+})
 const factorPreviewLoading = ref(false)
 const factorPreview = ref<FundamentalsResponse | null>(null)
 const syncStatus = ref<'idle' | 'running' | 'success' | 'error'>('idle')
@@ -1736,7 +1745,7 @@ const buildSingleSyncTaskMessage = (task: StockSyncTaskStatus, symbol: string): 
   if (result.historical_sync) {
     parts.push(result.historical_sync.success ? `历史数据 ${result.historical_sync.records || 0} 条` : `历史数据同步失败: ${result.historical_sync.error || '未知错误'}`)
   }
-  if (result.financial_sync) {
+  if (result.financial_sync && !(result.financial_sync as any).skipped) {
     parts.push(result.financial_sync.success ? '财务数据同步成功' : `财务数据同步失败: ${result.financial_sync.error || '未知错误'}`)
   }
   if (result.basic_sync) {
@@ -1820,37 +1829,40 @@ const handleSyncMissingData = async () => {
     if (isEtf) {
       syncTypes.push('historical', 'basic')
     } else {
-      syncTypes.push('realtime', 'historical', 'financial', 'basic')
+      syncTypes.push('historical', 'financial', 'basic')
     }
   }
+
+  const syncRealtime = !isEtf && syncTypes.includes('realtime')
+  const syncHistorical = syncTypes.includes('historical')
+  const syncFinancial = !isEtf && syncTypes.includes('financial')
+  const syncBasic = syncTypes.includes('basic')
+  const days = 365
 
   try {
     syncStatus.value = 'running'
     let preferredDataSource: 'tushare' | 'akshare' | 'qmt' = 'akshare'
     try {
       const sourceState = await loadManualSyncSourceState()
-      if (isEtf) {
-        if (sourceState.availableSources.akshare) {
-          preferredDataSource = 'akshare'
-        } else if (sourceState.availableSources.qmt) {
-          preferredDataSource = 'qmt'
-        } else if (sourceState.preferredSource && sourceState.preferredSource !== 'tushare') {
-          preferredDataSource = sourceState.preferredSource
-        }
-      } else if (sourceState.preferredSource) {
-        preferredDataSource = sourceState.preferredSource
-      }
+      preferredDataSource = selectMissingDataSyncSource(sourceState, {
+        isEtf,
+        syncRealtime,
+        syncHistorical,
+        syncFinancial,
+        syncBasic,
+        days,
+      })
     } catch {
       preferredDataSource = 'akshare'
     }
     const res = await stockSyncApi.syncSingle({
       symbol: normalizedCode,
-      sync_realtime: !isEtf && syncTypes.includes('realtime'),
-      sync_historical: syncTypes.includes('historical'),
-      sync_financial: !isEtf && syncTypes.includes('financial'),
-      sync_basic: syncTypes.includes('basic'),
+      sync_realtime: syncRealtime,
+      sync_historical: syncHistorical,
+      sync_financial: syncFinancial,
+      sync_basic: syncBasic,
       data_source: preferredDataSource,
-      days: 365
+      days
     })
 
     if (res.success) {
@@ -1919,14 +1931,24 @@ const formatValidationDetails = (details: any) => {
   // 财务数据
   if (details.financial_data !== undefined) {
     const finData = details.financial_data
-    tables.push({
-      title: '财务数据',
-      data: [
-        { label: '状态', value: finData.exists ? '✅ 存在' : '❌ 不存在' },
-        { label: '最新报告期', value: finData.latest_report_period || '-' },
-        { label: '报告类型', value: finData.report_type || '-' }
-      ]
-    })
+    if (finData?.skipped) {
+      tables.push({
+        title: '财务数据',
+        data: [
+          { label: '状态', value: '➖ 不适用' },
+          { label: '说明', value: finData.reason || 'ETF 不适用上市公司财务报表检查' }
+        ]
+      })
+    } else {
+      tables.push({
+        title: '财务数据',
+        data: [
+          { label: '状态', value: finData.exists ? '✅ 存在' : '❌ 不存在' },
+          { label: '最新报告期', value: finData.latest_report_period || '-' },
+          { label: '报告类型', value: finData.report_type || '-' }
+        ]
+      })
+    }
   }
   
   // 实时行情

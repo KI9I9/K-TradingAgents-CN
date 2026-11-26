@@ -52,6 +52,48 @@ export const loadCurrentDataSourceInfo = async (): Promise<CurrentDataSourceInfo
   return null
 }
 
+export interface MissingDataSyncScope {
+  isEtf: boolean
+  syncRealtime: boolean
+  syncHistorical: boolean
+  syncFinancial: boolean
+  syncBasic: boolean
+  days: number
+}
+
+export const selectMissingDataSyncSource = (
+  sourceState: ManualSyncSourceState,
+  scope: MissingDataSyncScope,
+): ManualSyncDataSource => {
+  const tushareScopeAllowed =
+    !scope.isEtf &&
+    scope.syncHistorical &&
+    !scope.syncRealtime &&
+    !scope.syncFinancial &&
+    !scope.syncBasic &&
+    scope.days >= 1 &&
+    scope.days <= 30
+
+  // One-click missing-data backfill always prefers unrestricted AKShare / QMT
+  // so it never hits Osaka's strict Tushare manual policy (1-5 A-shares, historical only, <=30d).
+  if (sourceState.availableSources.akshare) {
+    return 'akshare'
+  }
+  if (sourceState.availableSources.qmt) {
+    return 'qmt'
+  }
+  if (
+    sourceState.preferredSource &&
+    sourceState.preferredSource !== 'tushare'
+  ) {
+    return sourceState.preferredSource
+  }
+  if (tushareScopeAllowed && sourceState.availableSources.tushare) {
+    return 'tushare'
+  }
+  return 'akshare'
+}
+
 export const loadManualSyncSourceState = async (): Promise<ManualSyncSourceState> => {
   const availableSources: Record<ManualSyncDataSource, boolean> = {
     tushare: false,
