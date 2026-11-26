@@ -30,7 +30,7 @@ MAX_AGE_SECONDS = 90
 MAX_RESPONSE_BYTES = 8192
 MAX_REQUESTS_PER_MINUTE = 20  # per backend process; not a cluster-wide quota
 MAX_IN_FLIGHT = 2
-PERMIT_MAX_SECONDS = {1: 86400, 2: 7 * 86400}
+PERMIT_MAX_SECONDS = {1: 86400, 2: 30 * 86400}
 CALENDAR_RETRY_COOLDOWN_SECONDS = 300
 CALENDAR_MAX_ATTEMPTS_PER_DAY = 3
 EXPIRY_WARNING_HOURS = 36.0
@@ -59,7 +59,7 @@ def source_symbol(code: str) -> str:
 
 
 def permit_status(now: datetime, path: Path = PERMIT_PATH) -> tuple[Optional[dict], str]:
-    """Read-only capability: initial 24h or explicitly renewed, at most seven days.
+    """Read-only capability: initial 24h or explicitly renewed, at most thirty days.
 
     Version 1 keeps its original limit. Version 2 requires the hash of the
     replaced permit for operator traceability; reading never renews either.

@@ -1,4 +1,4 @@
-import { ApiClient } from './request'
+import { ApiClient, type RequestConfig } from './request'
 import type { FactorDiagnosticPayload, FactorWarningPayload } from './screening'
 
 export interface QuoteResponse {
@@ -7,14 +7,18 @@ export interface QuoteResponse {
   full_symbol?: string  // 完整代码（如 000001.SZ）
   name?: string
   market?: string
-  price?: number
-  change_percent?: number
+  security_type?: string
+  price?: number | null
+  change_percent?: number | null
   amount?: number
   prev_close?: number
   turnover_rate?: number
   amplitude?: number  // 振幅（替代量比）
   trade_date?: string
   updated_at?: string
+  synced?: boolean
+  data_source?: string | null
+  hint?: string
 }
 
 export interface FundamentalsResponse {
@@ -195,8 +199,8 @@ export const stocksApi = {
    * 获取股票行情
    * @param symbol 6位股票代码
    */
-  async getQuote(symbol: string) {
-    return ApiClient.get<QuoteResponse>(`/api/stocks/${symbol}/quote`)
+  async getQuote(symbol: string, config?: RequestConfig) {
+    return ApiClient.get<QuoteResponse>(`/api/stocks/${symbol}/quote`, undefined, config)
   },
 
   /**

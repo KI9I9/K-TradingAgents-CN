@@ -24,8 +24,10 @@ from app.schemas.intelligent_screening import (
     ScreeningConversationListResponse,
     ScreeningConversationSummary,
     ScreeningMessageItem,
+    ScreeningModelInfoResponse,
 )
 from app.services.intelligent_screening_service import IntelligentScreeningService
+from app.services.intelligent_screening_v2 import resolve_screening_llm_meta
 from app.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,17 @@ def get_screening_service(db: AsyncIOMotorDatabase):
 
 router = APIRouter(prefix="/api/screening/intelligent")
 user_service = UserService()
+
+
+@router.get("/model-info", response_model=ScreeningModelInfoResponse, summary="获取当前智能筛选使用的大模型信息")
+async def get_model_info(
+    user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_mongo_db),
+):
+    """返回当前智能筛选链路选中的大模型提供商、模型名与配置来源（不含密钥）。"""
+    _ = user
+    info = await resolve_screening_llm_meta(db)
+    return ScreeningModelInfoResponse(**info)
 
 
 @router.post("/chat", response_model=ScreeningChatResponse, summary="智能筛选对话")
@@ -87,6 +100,7 @@ async def websocket_chat(
 
     await websocket.accept()
     db = get_mongo_db()
+    model_info = await resolve_screening_llm_meta(db)
 
     await websocket.send_json({
         "type": "connected",
@@ -94,6 +108,9 @@ async def websocket_chat(
             "user_id": user_id,
             "timestamp": datetime.utcnow().isoformat(),
             "message": "智能筛选流式连接已建立",
+            "llm_provider": model_info.get("llm_provider"),
+            "llm_model": model_info.get("llm_model"),
+            "llm_source": model_info.get("llm_source"),
         },
     })
 
@@ -138,11 +155,15 @@ async def websocket_chat(
             async def progress_sender(event: dict):
                 await websocket.send_json({"type": "progress", "data": event})
 
+            current_model_info = await resolve_screening_llm_meta(db)
             await websocket.send_json({
                 "type": "started",
                 "data": {
                     "message": "已收到筛选请求，开始处理",
                     "timestamp": datetime.utcnow().isoformat(),
+                    "llm_provider": current_model_info.get("llm_provider"),
+                    "llm_model": current_model_info.get("llm_model"),
+                    "llm_source": current_model_info.get("llm_source"),
                 },
             })
 
@@ -186,6 +207,9 @@ async def get_conversation(
             stocks=m.get("stocks"),
             phase=m.get("phase"),
             is_fallback=m.get("is_fallback"),
+            llm_provider=m.get("llm_provider"),
+            llm_model=m.get("llm_model"),
+            llm_source=m.get("llm_source"),
         ))
     return ScreeningConversationResponse(conversation_id=resolved_conversation_id, messages=items)
 

@@ -186,15 +186,30 @@ class IntelligentScreeningService:
         self._openai_tools: Optional[list] = None
         self._result_openai_tools: Optional[list] = None
         self._tool_functions: Optional[dict] = None
+        self._llm_meta: Dict[str, Any] = {}
+
+    def _llm_fields(self) -> Dict[str, Optional[str]]:
+        return {
+            "llm_provider": self._llm_meta.get("llm_provider"),
+            "llm_model": self._llm_meta.get("llm_model"),
+            "llm_source": self._llm_meta.get("llm_source"),
+        }
 
     async def _ensure_client(self) -> bool:
         """懒加载 LLM 客户端和工具（只加载选股相关的 5 类工具）"""
+        from app.services.intelligent_screening_v2 import resolve_screening_llm_meta
+
         if self._llm_client is not None:
+            if not self._llm_meta:
+                self._llm_meta = await resolve_screening_llm_meta(self._db)
             return True
 
         llm_config = await _get_assistant_llm_config(self._db)
         if not llm_config:
+            self._llm_meta = {"configured": False, "llm_provider": None, "llm_model": None, "llm_source": None}
             return False
+
+        self._llm_meta = await resolve_screening_llm_meta(self._db, llm_config=llm_config)
 
         try:
             self._llm_client = UnifiedLLMClient.from_config(llm_config)
@@ -1172,6 +1187,7 @@ adjustment_direction: 当intent=adjustment时，指出是放宽(loosen)还是收
                 else "正在生成筛选执行计划" if phase == "planning"
                 else "正在执行批量筛选与验证"
             ),
+            **self._llm_fields(),
         )
 
         # 5. 构建消息列表（包含历史）
@@ -1277,6 +1293,7 @@ adjustment_direction: 当intent=adjustment时，指出是放宽(loosen)还是收
                 "stocks": [],
                 "phase": "result",
                 "conversation_id": resolved_conversation_id,
+                **self._llm_fields(),
             }
         except Exception as e:
             logger.exception("[智能筛选] 对话失败")
@@ -1294,6 +1311,7 @@ adjustment_direction: 当intent=adjustment时，指出是放宽(loosen)还是收
                 "stocks": [],
                 "phase": "result",
                 "conversation_id": resolved_conversation_id,
+                **self._llm_fields(),
             }
 
         # 提取股票（仅 result 阶段）
@@ -1323,6 +1341,7 @@ adjustment_direction: 当intent=adjustment时，指出是放宽(loosen)还是收
                 "phase": phase,
                 "conversation_id": resolved_conversation_id,
                 "is_fallback": False,
+                **self._llm_fields(),
             }
 
         await self._save_message(user_id, resolved_conversation_id, message, reply, tools_used, stocks, phase)
@@ -1333,6 +1352,7 @@ adjustment_direction: 当intent=adjustment时，指出是放宽(loosen)还是收
             "phase": phase,
             "conversation_id": resolved_conversation_id,
             "is_fallback": False,
+            **self._llm_fields(),
         }
 
     def _determine_phase(self, history: list, message: str, intent: Dict[str, Any] = None) -> str:
@@ -1656,6 +1676,7 @@ adjustment_direction: 当intent=adjustment时，指出是放宽(loosen)还是收
             "stocks": stocks,
             "phase": phase,
             "is_fallback": is_fallback,
+            **self._llm_fields(),
             "timestamp": now,
         }
         await self._db.screening_conversations.update_one(

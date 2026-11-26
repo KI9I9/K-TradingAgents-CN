@@ -52,12 +52,13 @@ class PermitAndParser(unittest.TestCase):
                 value.update(changes); path.write_text(json.dumps(value)); path.chmod(0o600)
                 return supply.read_permit(NOW, path)
             self.assertIsNotNone(read())
+            self.assertIsNotNone(read(expires_at=(start+timedelta(days=15)).isoformat()))
             self.assertIsNone(read(version=1))
             self.assertIsNone(read(version=3))
             self.assertIsNone(read(version=True))
             for proof in (None, '', 'a'*63, 'Z'*64, 123):
                 self.assertIsNone(read(renewal_of_sha256=proof))
-            self.assertIsNone(read(expires_at=(start+timedelta(days=7, seconds=1)).isoformat()))
+            self.assertIsNone(read(expires_at=(start+timedelta(days=30, seconds=1)).isoformat()))
             self.assertIsNone(read(expires_at=NOW.isoformat()))
             self.assertIsNone(read(not_before=(NOW+timedelta(seconds=1)).isoformat()))
             self.assertIsNone(read(scope='all'))
@@ -505,15 +506,28 @@ class SchedulePermitRecoveryTests(unittest.TestCase):
                     ])
                 self.assertEqual(str(ctx.exception), "previous_permit_changed")
 
-                # 2) Window > 7d still rejected
+                # 2) Window > 30d still rejected, while 15d recovery window succeeds
                 with self.assertRaises(SystemExit) as ctx2:
                     mod.main([
                         "--not-before", "2026-11-23T09:30:00+08:00",
-                        "--expires-at", "2026-12-01T09:30:00+08:00",
+                        "--expires-at", "2026-12-24T09:30:00+08:00",
                         "--previous-sha256", mod.digest(raw),
                         "--allow-expired-previous",
                     ])
                 self.assertEqual(str(ctx2.exception), "permit_window_invalid")
+
+                import io, contextlib
+
+                buf_15d = io.StringIO()
+                with contextlib.redirect_stdout(buf_15d):
+                    rc_15d = mod.main([
+                        "--not-before", "2026-11-23T09:30:00+08:00",
+                        "--expires-at", "2026-12-08T09:30:00+08:00",
+                        "--previous-sha256", mod.digest(raw),
+                        "--allow-expired-previous",
+                    ])
+                self.assertEqual(rc_15d, 0)
+                self.assertEqual(json.loads(buf_15d.getvalue().strip())["status"], "ready_no_replace")
 
                 # 3) Explicit manual recovery succeeds with backup and atomic replace
                 import io, contextlib

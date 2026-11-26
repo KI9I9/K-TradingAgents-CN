@@ -24,6 +24,9 @@ from app.services.screening_metric_display import resolve_metric_value, select_m
 from app.services.intelligent_assistant_service import (
     _get_assistant_llm_config,
     _get_latest_trade_date,
+    _resolve_models,
+    _select_llm_config_from_doc,
+    _selection_model_name,
     ASSISTANT_TIMEOUT_SECONDS,
 )
 from core.tools import get_tool_registry, tool_metadata_list_to_openai
@@ -39,6 +42,83 @@ SCREENING_MAX_TOOL_ROUNDS = 3
 SCREENING_RESULT_TIMEOUT_SECONDS = 300
 MAX_CONTEXT_MESSAGES = 20
 SCREENING_CONVERSATION_LIMIT = 50
+
+
+def _provider_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = value.value if hasattr(value, "value") else str(value)
+    text = str(raw).strip()
+    return text or None
+
+
+async def resolve_screening_llm_meta(
+    db: Optional[AsyncIOMotorDatabase],
+    llm_config: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """解析当前智能筛选使用的大模型元数据（不包含任何密钥或地址）。"""
+    resolved_cfg = llm_config
+    if resolved_cfg is None and db is not None:
+        try:
+            resolved_cfg = await _get_assistant_llm_config(db)
+        except Exception as exc:
+            logger.debug(f"[智能筛选] 读取当前 LLM 配置失败: {exc}")
+            resolved_cfg = None
+
+    source_label: Optional[str] = None
+    doc_provider: Optional[str] = None
+    doc_model: Optional[str] = None
+
+    if db is not None:
+        try:
+            config_doc = await db.system_configs.find_one(
+                {"is_active": True},
+                sort=[("version", -1)],
+            )
+            if config_doc:
+                quick_sel, deep_sel, _, _ = _resolve_models(config_doc)
+                if deep_sel and _selection_model_name(deep_sel):
+                    source_label = "深度分析模型"
+                    doc_model = _selection_model_name(deep_sel)
+                    doc_provider = _provider_str(deep_sel.get("provider"))
+                elif quick_sel and _selection_model_name(quick_sel):
+                    source_label = "快速分析模型"
+                    doc_model = _selection_model_name(quick_sel)
+                    doc_provider = _provider_str(quick_sel.get("provider"))
+                elif config_doc.get("default_llm"):
+                    source_label = "系统默认模型"
+                    doc_model = str(config_doc.get("default_llm")).strip() or None
+                    matched = _select_llm_config_from_doc(config_doc, model_name=doc_model)
+                    if matched:
+                        doc_provider = _provider_str(matched.get("provider"))
+                elif config_doc.get("llm_configs"):
+                    source_label = "已启用模型"
+                    for item in config_doc.get("llm_configs") or []:
+                        if item.get("enabled", True) and item.get("model_name"):
+                            doc_model = str(item.get("model_name")).strip() or None
+                            doc_provider = _provider_str(item.get("provider"))
+                            break
+        except Exception as exc:
+            logger.debug(f"[智能筛选] 读取系统配置模型来源失败: {exc}")
+
+    cfg_provider = _provider_str(getattr(resolved_cfg, "provider", None)) if resolved_cfg is not None else None
+    cfg_model = str(getattr(resolved_cfg, "model", None) or "").strip() or None if resolved_cfg is not None else None
+
+    final_model = cfg_model or doc_model
+    final_provider = (
+        doc_provider
+        if (doc_provider and (not cfg_model or not doc_model or cfg_model == doc_model))
+        else (cfg_provider or doc_provider)
+    )
+    if resolved_cfg is not None and not source_label:
+        source_label = "已启用模型"
+
+    return {
+        "configured": bool(resolved_cfg is not None or final_model),
+        "llm_provider": final_provider,
+        "llm_model": final_model,
+        "llm_source": source_label if (resolved_cfg is not None or final_model) else None,
+    }
 
 
 async def _recall_user_plans_memory(db, user_id: str, query: str) -> str:
@@ -332,15 +412,28 @@ class IntelligentScreeningServiceV2:
         self._tool_functions: Optional[dict] = None
         self._intent_classifier: Optional[IntentClassifier] = None
         self._state_machine = StateMachine()
+        self._llm_meta: Dict[str, Any] = {}
+
+    def _llm_fields(self) -> Dict[str, Optional[str]]:
+        return {
+            "llm_provider": self._llm_meta.get("llm_provider"),
+            "llm_model": self._llm_meta.get("llm_model"),
+            "llm_source": self._llm_meta.get("llm_source"),
+        }
 
     async def _ensure_client(self) -> bool:
         """懒加载 LLM 客户端和工具"""
         if self._llm_client is not None:
+            if not self._llm_meta:
+                self._llm_meta = await resolve_screening_llm_meta(self._db)
             return True
 
         llm_config = await _get_assistant_llm_config(self._db)
         if not llm_config:
+            self._llm_meta = {"configured": False, "llm_provider": None, "llm_model": None, "llm_source": None}
             return False
+
+        self._llm_meta = await resolve_screening_llm_meta(self._db, llm_config=llm_config)
 
         try:
             self._llm_client = UnifiedLLMClient.from_config(llm_config)
@@ -428,7 +521,8 @@ class IntelligentScreeningServiceV2:
                 "stocks": [],
                 "phase": "confirming",
                 "conversation_id": resolved_conversation_id,
-                "is_fallback": False
+                "is_fallback": False,
+                **self._llm_fields(),
             }
             await self._save_message(user_id, resolved_conversation_id, message, response["reply"], [], [], "confirming")
             return response
@@ -458,7 +552,13 @@ class IntelligentScreeningServiceV2:
         progress_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
     ) -> Dict[str, Any]:
         """处理确认阶段"""
-        await self._emit_progress(progress_callback, "phase_determined", phase="confirmation", message="正在分析您的筛选需求")
+        await self._emit_progress(
+            progress_callback,
+            "phase_determined",
+            phase="confirmation",
+            message="正在分析您的筛选需求",
+            **self._llm_fields(),
+        )
 
         # 召回用户交易计划/偏好记忆，注入到 prompt（多计划场景）
         memory_block = await _recall_user_plans_memory(self._db, user_id, message)
@@ -486,7 +586,8 @@ class IntelligentScreeningServiceV2:
                 "stocks": [],
                 "phase": "confirmation",
                 "conversation_id": conversation_id,
-                "is_fallback": False
+                "is_fallback": False,
+                **self._llm_fields(),
             }
         except asyncio.TimeoutError:
             return self._error_response("处理超时，请稍后重试", conversation_id)
@@ -504,7 +605,13 @@ class IntelligentScreeningServiceV2:
         progress_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
     ) -> Dict[str, Any]:
         """处理规划阶段"""
-        await self._emit_progress(progress_callback, "phase_determined", phase="planning", message="正在生成筛选执行计划")
+        await self._emit_progress(
+            progress_callback,
+            "phase_determined",
+            phase="planning",
+            message="正在生成筛选执行计划",
+            **self._llm_fields(),
+        )
 
         tool_summary = self._build_tool_summary(self._result_openai_tools)
         # 召回交易计划/偏好记忆
@@ -533,7 +640,8 @@ class IntelligentScreeningServiceV2:
                 "stocks": [],
                 "phase": "planning",
                 "conversation_id": conversation_id,
-                "is_fallback": False
+                "is_fallback": False,
+                **self._llm_fields(),
             }
         except asyncio.TimeoutError:
             return self._error_response("处理超时，请稍后重试", conversation_id)
@@ -551,7 +659,13 @@ class IntelligentScreeningServiceV2:
         progress_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
     ) -> Dict[str, Any]:
         """处理执行阶段"""
-        await self._emit_progress(progress_callback, "phase_determined", phase="result", message="正在执行批量筛选与验证")
+        await self._emit_progress(
+            progress_callback,
+            "phase_determined",
+            phase="result",
+            message="正在执行批量筛选与验证",
+            **self._llm_fields(),
+        )
 
         # 先检查是否有已批准的计划可以直接执行
         locked_plan = self._extract_locked_execution_plan(history) if intent.intent == IntentType.APPROVE else None
@@ -625,7 +739,8 @@ class IntelligentScreeningServiceV2:
                 "stocks": structured_stocks,
                 "phase": "result",
                 "conversation_id": conversation_id,
-                "is_fallback": False
+                "is_fallback": False,
+                **self._llm_fields(),
             }
         except asyncio.TimeoutError:
             reply = self._build_timeout_reply(SCREENING_RESULT_TIMEOUT_SECONDS)
@@ -636,7 +751,8 @@ class IntelligentScreeningServiceV2:
                 "stocks": [],
                 "phase": "result",
                 "conversation_id": conversation_id,
-                "is_fallback": False
+                "is_fallback": False,
+                **self._llm_fields(),
             }
         except Exception as e:
             logger.exception("[执行阶段] 处理失败")
@@ -648,7 +764,8 @@ class IntelligentScreeningServiceV2:
                 "stocks": [],
                 "phase": "result",
                 "conversation_id": conversation_id,
-                "is_fallback": False
+                "is_fallback": False,
+                **self._llm_fields(),
             }
 
     def _get_confirmation_prompt(self) -> str:
@@ -982,7 +1099,8 @@ class IntelligentScreeningServiceV2:
             "stocks": [],
             "phase": "result",
             "conversation_id": conversation_id,
-            "is_fallback": False
+            "is_fallback": False,
+            **self._llm_fields(),
         }
 
     async def _emit_progress(
@@ -1026,6 +1144,7 @@ class IntelligentScreeningServiceV2:
             "stocks": stocks,
             "phase": phase,
             "is_fallback": is_fallback,
+            **self._llm_fields(),
             "timestamp": now,
         }
 

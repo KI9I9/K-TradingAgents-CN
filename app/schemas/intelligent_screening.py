@@ -44,6 +44,9 @@ class ScreeningChatResponse(BaseModel):
     phase: str = Field("result", description="当前阶段: confirmation=需求确认, planning=执行规划, result=筛选结果")
     conversation_id: Optional[str] = Field(None, description="当前会话 ID")
     is_fallback: bool = Field(False, description="是否为降级候选结果（LLM超时后由数据库粗筛兜底）")
+    llm_provider: Optional[str] = Field(None, description="大模型提供商")
+    llm_model: Optional[str] = Field(None, description="大模型名称")
+    llm_source: Optional[str] = Field(None, description="模型配置来源")
 
 
 class ScreeningMessageItem(BaseModel):
@@ -54,6 +57,17 @@ class ScreeningMessageItem(BaseModel):
     stocks: Optional[List[StockRecommendation]] = Field(None, description="推荐股票")
     phase: Optional[str] = Field(None, description="阶段标记: confirmation / planning / result")
     is_fallback: Optional[bool] = Field(None, description="是否为降级候选结果")
+    llm_provider: Optional[str] = Field(None, description="大模型提供商")
+    llm_model: Optional[str] = Field(None, description="大模型名称")
+    llm_source: Optional[str] = Field(None, description="模型配置来源")
+
+
+class ScreeningModelInfoResponse(BaseModel):
+    """智能筛选当前激活大模型信息"""
+    configured: bool = Field(False, description="是否已配置可用大模型")
+    llm_provider: Optional[str] = Field(None, description="大模型提供商")
+    llm_model: Optional[str] = Field(None, description="大模型名称")
+    llm_source: Optional[str] = Field(None, description="模型配置来源")
 
 
 class ScreeningConversationResponse(BaseModel):

@@ -84,8 +84,17 @@
                         </div>
                       </div>
                       <div v-if="msg.content" class="message-text markdown-content" v-html="renderScreeningMarkdown(msg.content)"></div>
-                      <div v-if="msg.tools_used?.length" class="message-tools">
-                        <el-tag v-for="t in msg.tools_used" :key="t" size="small" type="info">{{ t }}</el-tag>
+                      <div v-if="msg.llm_model || msg.tools_used?.length" class="message-tools">
+                        <el-tag
+                          v-if="msg.llm_model"
+                          size="small"
+                          type="primary"
+                          effect="plain"
+                          :title="msg.llm_source ? `配置来源: ${msg.llm_source}` : undefined"
+                        >
+                          模型: {{ formatScreeningModelLabel(msg.llm_provider, msg.llm_model) }}
+                        </el-tag>
+                        <el-tag v-for="t in (msg.tools_used || [])" :key="t" size="small" type="info">{{ t }}</el-tag>
                       </div>
                       <div v-if="msg.phase === 'confirmation' && idx === aiMessages.length - 1 && !aiLoading" class="confirmation-actions">
                         <el-button type="primary" size="small" @click="sendAiMessage('按原需求筛选')">按原需求筛选</el-button>
@@ -169,7 +178,26 @@
                   <el-button type="primary" :loading="aiLoading" :disabled="!aiInput.trim()" class="send-btn" @click="handleAiSend">发送</el-button>
                 </div>
                 <div class="input-tip-row">
-                  <span class="input-tip">Ctrl+Enter 发送</span>
+                  <div class="input-tip-left">
+                    <span class="input-tip">Ctrl+Enter 发送</span>
+                    <el-tag
+                      v-if="aiModelInfo && aiModelInfo.configured && aiModelInfo.llm_model"
+                      size="small"
+                      type="primary"
+                      effect="plain"
+                    >
+                      当前模型：{{ formatScreeningModelLabel(aiModelInfo.llm_provider, aiModelInfo.llm_model) }}
+                      <span v-if="aiModelInfo.llm_source" style="opacity: 0.75;">（{{ aiModelInfo.llm_source }}）</span>
+                    </el-tag>
+                    <el-tag
+                      v-else-if="aiModelInfo && aiModelInfo.configured === false"
+                      size="small"
+                      type="warning"
+                      effect="plain"
+                    >
+                      未配置模型
+                    </el-tag>
+                  </div>
                   <el-button v-if="aiMessages.length > 0 && !aiLoading" type="default" size="small" link @click="handleClearAi">清空当前会话</el-button>
                 </div>
               </div>
@@ -807,7 +835,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Refresh, TrendCharts, Download, Star, Connection, Warning, User, Delete } from '@element-plus/icons-vue'
 import { renderMarkdown } from '@/utils/markdown'
 import type { StockInfo } from '@/types/analysis'
-import { screeningApi, type FieldConfigResponse, type FieldInfo, type ScreeningConditionItem, type ScreeningConversationSummary, type ScreeningMessageItem, type ScreeningPreset, type ScreeningWsEnvelope, type ScreeningWsProgressData, type StockRecommendation } from '@/api/screening'
+import { screeningApi, type FieldConfigResponse, type FieldInfo, type ScreeningConditionItem, type ScreeningConversationSummary, type ScreeningMessageItem, type ScreeningModelInfo, type ScreeningPreset, type ScreeningWsEnvelope, type ScreeningWsProgressData, type StockRecommendation } from '@/api/screening'
 import { analysisApi } from '@/api/analysis'
 import { favoritesApi } from '@/api/favorites'
 import { useAuthStore } from '@/stores/auth'
@@ -844,6 +872,9 @@ interface AiDisplayMessage {
   stocks?: StockRecommendation[]
   phase?: 'confirmation' | 'planning' | 'result'
   is_fallback?: boolean
+  llm_provider?: string | null
+  llm_model?: string | null
+  llm_source?: string | null
   progressSteps?: Array<{ text: string; tone?: 'info' | 'success'; meta?: string }>
 }
 const aiMessages = ref<AiDisplayMessage[]>([])
@@ -856,7 +887,39 @@ const aiSocketConnected = ref(false)
 const aiPendingAssistantIndex = ref<number | null>(null)
 const aiConversationList = ref<ScreeningConversationSummary[]>([])
 const aiCurrentConversationId = ref<string | null>(null)
+const aiModelInfo = ref<ScreeningModelInfo | null>(null)
 const authStore = useAuthStore()
+
+const formatScreeningModelLabel = (provider?: string | null, model?: string | null) => {
+  const p = String(provider || '').trim()
+  const m = String(model || '').trim()
+  if (p && m) return `${p} / ${m}`
+  return m || p
+}
+
+const applyScreeningModelMeta = (payload?: { llm_provider?: string | null; llm_model?: string | null; llm_source?: string | null } | null) => {
+  if (!payload) return
+  if (payload.llm_model || payload.llm_provider) {
+    aiModelInfo.value = {
+      configured: true,
+      llm_provider: payload.llm_provider ?? aiModelInfo.value?.llm_provider ?? null,
+      llm_model: payload.llm_model ?? aiModelInfo.value?.llm_model ?? null,
+      llm_source: payload.llm_source ?? aiModelInfo.value?.llm_source ?? null,
+    }
+  }
+}
+
+const loadAiModelInfo = async () => {
+  try {
+    const res = await screeningApi.getIntelligentModelInfo()
+    const payload = unwrapApiPayload(res as any) as ScreeningModelInfo | null
+    if (payload && typeof payload === 'object') {
+      aiModelInfo.value = payload
+    }
+  } catch {
+    // 静默兜底，不阻断页面加载
+  }
+}
 
 const scrollAiToBottom = () => {
   nextTick(() => {
@@ -933,6 +996,9 @@ const loadAiConversation = async (conversationId?: string | null) => {
         stocks: m.stocks,
         phase: m.phase,
         is_fallback: m.is_fallback,
+        llm_provider: m.llm_provider,
+        llm_model: m.llm_model,
+        llm_source: m.llm_source,
         progressSteps: undefined,
       }))
       scrollAiToBottom()
@@ -1049,18 +1115,35 @@ const appendPendingAssistantStep = (step: { text: string; tone?: 'info' | 'succe
 }
 
 const handleAiWebSocketMessage = (envelope: ScreeningWsEnvelope<any>) => {
-  if (envelope.type === 'connected' || envelope.type === 'pong') return
+  if (envelope.type === 'pong') return
+
+  if (envelope.type === 'connected') {
+    applyScreeningModelMeta(envelope.data)
+    return
+  }
 
   if (envelope.type === 'started') {
-    updatePendingAssistantMessage({ phase: 'result' })
+    applyScreeningModelMeta(envelope.data)
+    updatePendingAssistantMessage({
+      phase: 'result',
+      llm_provider: envelope.data?.llm_provider ?? aiModelInfo.value?.llm_provider ?? null,
+      llm_model: envelope.data?.llm_model ?? aiModelInfo.value?.llm_model ?? null,
+      llm_source: envelope.data?.llm_source ?? aiModelInfo.value?.llm_source ?? null,
+    })
     appendPendingAssistantLine('已收到请求，开始处理')
     return
   }
 
   if (envelope.type === 'progress') {
     const data = envelope.data as ScreeningWsProgressData
-    if (data.phase) {
-      updatePendingAssistantMessage({ phase: data.phase })
+    applyScreeningModelMeta(data)
+    if (data.phase || data.llm_model || data.llm_provider) {
+      updatePendingAssistantMessage({
+        ...(data.phase ? { phase: data.phase } : {}),
+        ...(data.llm_model ? { llm_model: data.llm_model } : {}),
+        ...(data.llm_provider ? { llm_provider: data.llm_provider } : {}),
+        ...(data.llm_source ? { llm_source: data.llm_source } : {}),
+      })
     }
 
     if (data.event === 'tool_started' && data.tool) {
@@ -1085,6 +1168,7 @@ const handleAiWebSocketMessage = (envelope: ScreeningWsEnvelope<any>) => {
 
   if (envelope.type === 'final') {
     const data = envelope.data
+    applyScreeningModelMeta(data)
     aiCurrentConversationId.value = data.conversation_id || aiCurrentConversationId.value
     updatePendingAssistantMessage({
       content: data.reply,
@@ -1092,6 +1176,9 @@ const handleAiWebSocketMessage = (envelope: ScreeningWsEnvelope<any>) => {
       stocks: data.stocks?.length ? data.stocks : undefined,
       phase: data.phase,
       is_fallback: data.is_fallback ?? false,
+      llm_provider: data.llm_provider ?? aiModelInfo.value?.llm_provider ?? null,
+      llm_model: data.llm_model ?? aiModelInfo.value?.llm_model ?? null,
+      llm_source: data.llm_source ?? aiModelInfo.value?.llm_source ?? null,
     })
     aiPendingAssistantIndex.value = null
     aiLoading.value = false
@@ -2459,7 +2546,8 @@ onMounted(() => {
   loadFavorites()
   // 加载当前数据源
   loadCurrentDataSource()
-  // 加载智能筛选会话历史
+  // 加载智能筛选当前模型与会话历史
+  void loadAiModelInfo()
   loadAiConversationList()
 })
 
@@ -3108,7 +3196,16 @@ onUnmounted(() => {
         display: flex;
         justify-content: space-between;
         align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
         margin-top: 4px;
+      }
+
+      .input-tip-left {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
       }
 
       .input-tip {

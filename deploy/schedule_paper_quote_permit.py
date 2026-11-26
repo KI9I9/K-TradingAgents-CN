@@ -23,6 +23,7 @@ CN_TZ = timezone(timedelta(hours=8))
 BACKEND = "ta-live-088a60b962bf-backend-1"
 PERMIT = "paper-quote-supply.json"
 BACKUP_PARENT = Path("/home/ubuntu/quote-guard-releases")
+MAX_V2_PERMIT_SECONDS = 30 * 86400
 
 
 def now_cn() -> datetime:
@@ -70,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("invalid_previous_sha256")
     if start <= now:
         raise SystemExit("not_before_must_be_future")
-    if end <= start or (end - start).total_seconds() > 7 * 86400:
+    if end <= start or (end - start).total_seconds() > MAX_V2_PERMIT_SECONDS:
         raise SystemExit("permit_window_invalid")
     if start.weekday() >= 5:
         raise SystemExit("not_before_must_be_weekday")

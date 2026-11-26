@@ -417,6 +417,13 @@ export interface StockRecommendation {
   reason: string
 }
 
+export interface ScreeningModelInfo {
+  configured: boolean
+  llm_provider?: string | null
+  llm_model?: string | null
+  llm_source?: string | null
+}
+
 export interface ScreeningChatResponse {
   reply: string
   tools_used: string[]
@@ -424,6 +431,9 @@ export interface ScreeningChatResponse {
   phase: 'confirmation' | 'planning' | 'result'
   conversation_id?: string
   is_fallback?: boolean
+  llm_provider?: string | null
+  llm_model?: string | null
+  llm_source?: string | null
 }
 
 export interface ScreeningMessageItem {
@@ -433,6 +443,9 @@ export interface ScreeningMessageItem {
   stocks?: StockRecommendation[]
   phase?: 'confirmation' | 'planning' | 'result'
   is_fallback?: boolean
+  llm_provider?: string | null
+  llm_model?: string | null
+  llm_source?: string | null
 }
 
 export interface ScreeningConversationResponse {
@@ -486,6 +499,9 @@ export interface ScreeningWsProgressData {
   stocks?: StockRecommendation[]
   preview?: string
   summary?: Record<string, number>
+  llm_provider?: string | null
+  llm_model?: string | null
+  llm_source?: string | null
   timestamp?: string
 }
 
@@ -507,6 +523,8 @@ export const screeningApi = {
   getIndustries: () => ApiClient.get<IndustriesResponse>('/api/screening/industries'),
 
   // 智能筛选
+  getIntelligentModelInfo: () =>
+    ApiClient.get<ScreeningModelInfo>('/api/screening/intelligent/model-info'),
   intelligentChat: (message: string, conversation_id?: string) =>
     ApiClient.post<ScreeningChatResponse>('/api/screening/intelligent/chat', { message, conversation_id }, { timeout: 180000 }),
   getIntelligentChatWsUrl: (token?: string) => {

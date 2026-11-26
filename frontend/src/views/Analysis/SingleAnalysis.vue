@@ -1588,7 +1588,7 @@ const fetchStockInfo = async (targetCode?: string) => {
   if (!code || !/^\d{6}$/.test(code)) return
 
   try {
-    const response = await stocksApi.getQuote(code)
+    const response = await stocksApi.getQuote(code, { skipErrorHandler: true })
     if (isComponentUnmounted || stripStockCodeSuffix(analysisForm.stockCode) !== code) return
     const data = (response as any)?.data
     if (data && (data.name || data.price != null || data.current_price != null)) {

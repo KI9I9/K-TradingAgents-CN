@@ -223,6 +223,9 @@ def _zfill_code(code: str) -> str:
 
 
 ETF_CODE_PREFIXES = ("50", "51", "52", "56", "58", "15", "16", "18")
+_ETF_SH_PREFIXES = ("50", "51", "52", "56", "58")
+_ETF_SZ_PREFIXES = ("15", "16", "18")
+_PUBLIC_ETF_ENDPOINT = "https://hq.sinajs.cn/list="
 
 
 def _is_cn_etf_code(code: str) -> bool:
@@ -232,6 +235,88 @@ def _is_cn_etf_code(code: str) -> bool:
 
 def _get_etf_market_label(code: str) -> str:
     return "ETF"
+
+
+def _etf_sina_symbol(code6: str) -> Optional[str]:
+    if not _is_cn_etf_code(code6):
+        return None
+    if code6.startswith(_ETF_SH_PREFIXES):
+        return f"sh{code6}"
+    if code6.startswith(_ETF_SZ_PREFIXES):
+        return f"sz{code6}"
+    return None
+
+
+async def _fetch_public_etf_display_quote(code6: str) -> Optional[Dict[str, Any]]:
+    """Lightweight, read-only public Sina L1 display fallback for unsynced SH/SZ ETFs.
+
+    Does not write to MongoDB and does not call Tushare. Returns None on any error.
+    """
+    sina_symbol = _etf_sina_symbol(code6)
+    if not sina_symbol:
+        return None
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=4, follow_redirects=False, trust_env=False) as client:
+            response = await client.get(
+                f"{_PUBLIC_ETF_ENDPOINT}{sina_symbol}",
+                headers={
+                    "Referer": "https://finance.sina.com.cn/",
+                    "User-Agent": "TradingAgentsQuoteDisplay/1.0",
+                },
+            )
+            response.raise_for_status()
+            raw = response.content
+        if not raw or len(raw) > 8192:
+            return None
+        text = raw.decode("gb18030", errors="strict")
+        match = re.fullmatch(r'\s*var\s+hq_str_' + sina_symbol + r'="([^"\r\n]*)";?\s*', text)
+        if not match:
+            return None
+        fields = match.group(1).split(",")
+        if len(fields) < 32:
+            return None
+
+        def _fnum(idx: int) -> Optional[float]:
+            try:
+                val = float(fields[idx])
+                return val if val >= 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        name = fields[0].strip()
+        if not name:
+            return None
+        pre_close = _fnum(2)
+        close = _fnum(3)
+        if (close is None or close == 0) and pre_close and pre_close > 0:
+            close = pre_close
+        pct_chg = None
+        if close is not None and pre_close is not None and pre_close > 0:
+            pct_chg = round((close - pre_close) / pre_close * 100, 2)
+
+        trade_date = fields[30].strip() if len(fields) > 30 else ""
+        quote_clock = fields[31].strip() if len(fields) > 31 else ""
+        updated_at = f"{trade_date}T{quote_clock}+08:00" if (trade_date and quote_clock) else None
+
+        return {
+            "code": code6,
+            "name": name,
+            "open": _fnum(1),
+            "pre_close": pre_close,
+            "close": close,
+            "high": _fnum(4),
+            "low": _fnum(5),
+            "volume": _fnum(8),
+            "amount": _fnum(9),
+            "pct_chg": pct_chg,
+            "trade_date": trade_date or None,
+            "updated_at": updated_at,
+        }
+    except Exception as exc:
+        logger.debug(f"公开 ETF 行情兜底失败 code={code6}: {exc}")
+        return None
 
 
 def _parse_trade_date(value: Any) -> Optional[date]:
@@ -439,6 +524,8 @@ async def get_quote(
 
     q = None
     b = None
+    synced = True
+    data_source: Optional[str] = None
 
     if is_etf:
         # ETF：直接查 etf_daily_quotes + etf_basic_info（ETF 不存在于 market_quotes）
@@ -449,6 +536,28 @@ async def get_quote(
             q = etf_q
         b = await db["etf_basic_info"].find_one({"code": code6}, {"_id": 0})
         logger.debug(f"🔍 ETF 查询: code={code6}, quote={'✅' if q else '❌'}, basic={'✅' if b else '❌'}")
+        if not q and not b:
+            fallback = await _fetch_public_etf_display_quote(code6)
+            synced = False
+            if fallback:
+                q = fallback
+                b = {"name": fallback.get("name"), "market": "ETF"}
+                data_source = "sina_l1_fallback"
+            else:
+                return ok(
+                    {
+                        "code": code6,
+                        "name": None,
+                        "market": "ETF",
+                        "security_type": "ETF",
+                        "price": None,
+                        "change_percent": None,
+                        "synced": False,
+                        "data_source": None,
+                        "hint": "该 ETF 尚未同步本地行情数据，仍可直接发起分析",
+                    },
+                    message="该 ETF 尚未同步本地行情数据",
+                )
     else:
         # 股票：查 market_quotes
         q = await db["market_quotes"].find_one({"code": code6}, {"_id": 0})
@@ -549,7 +658,12 @@ async def get_quote(
         "amplitude_date": amplitude_date,  # 🔥 新增：振幅数据日期
         "trade_date": (q or {}).get("trade_date"),
         "updated_at": (q or {}).get("updated_at"),
+        "synced": synced,
     }
+    if is_etf:
+        data["security_type"] = "ETF"
+    if data_source:
+        data["data_source"] = data_source
 
     return ok(data)
 
