@@ -425,7 +425,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, type TabPaneName } from 'element-plus'
 import { TrendCharts, Refresh, Search, RefreshRight, Goods, Wallet } from '@element-plus/icons-vue'
 import { reviewApi, type ReviewListItem, type TradingStatistics, type ReviewableStock, type ReviewType, type PeriodicReviewListItem } from '@/api/review'
@@ -441,9 +442,23 @@ import PositionReviewHistoryTable from './components/PositionReviewHistoryTable.
 import PositionReviewDialog from './components/PositionReviewDialog.vue'
 import SaveAsCaseDialog from './components/SaveAsCaseDialog.vue'
 
+const route = useRoute()
+
 // 复盘来源类型
 type ReviewSourceType = 'paper' | 'position'
 const reviewSource = ref<ReviewSourceType>('position')  // 默认显示持仓操作复盘
+
+const firstQueryString = (raw: unknown): string => {
+  const val = Array.isArray(raw) ? raw[0] : raw
+  return String(val ?? '').trim()
+}
+
+const resolveSourceFromQuery = (rawSource: unknown): ReviewSourceType | null => {
+  const normalized = firstQueryString(rawSource).toLowerCase()
+  if (normalized === 'paper') return 'paper'
+  if (normalized === 'real' || normalized === 'position') return 'position'
+  return null
+}
 
 
 
@@ -1229,9 +1244,55 @@ const handlePositionCasesPageChange = (page: number) => {
 
 
 
+// 监听路由 query 变化（如从模拟交易跳转 /review?source=paper）
+watch(
+  () => [route.query.source, route.query.code],
+  ([rawSource, rawCode]) => {
+    const nextSource = resolveSourceFromQuery(rawSource)
+    const nextCode = firstQueryString(rawCode)
+    let codeChanged = false
+
+    if (nextCode) {
+      if (filterForm.value.code !== nextCode) {
+        filterForm.value.code = nextCode
+        codeChanged = true
+      }
+      if (positionReviewCodeFilter.value !== nextCode) {
+        positionReviewCodeFilter.value = nextCode
+        codeChanged = true
+      }
+    }
+
+    if (nextSource && reviewSource.value !== nextSource) {
+      reviewSource.value = nextSource
+      handleSourceChange(nextSource)
+      return
+    }
+
+    if (codeChanged) {
+      if (reviewSource.value === 'paper') {
+        applyFilter()
+      } else {
+        positionReviewPage.value = 1
+        loadPositionReviewHistory()
+      }
+    }
+  }
+)
+
 // 初始化
 onMounted(async () => {
-  // 根据默认的 reviewSource 加载对应的数据
+  const initialSource = resolveSourceFromQuery(route.query.source)
+  if (initialSource) {
+    reviewSource.value = initialSource
+  }
+  const initialCode = firstQueryString(route.query.code)
+  if (initialCode) {
+    filterForm.value.code = initialCode
+    positionReviewCodeFilter.value = initialCode
+  }
+
+  // 根据最终的 reviewSource 加载对应的数据
   if (reviewSource.value === 'paper') {
     refreshData()
     loadPeriodicReviews()

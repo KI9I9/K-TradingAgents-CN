@@ -22,6 +22,34 @@ from app.services.enhanced_screening.utils import (
 from app.core.database import get_mongo_db
 
 
+class ScreeningExecutionError(RuntimeError):
+    """选股筛选底层执行异常（不得静默伪装成空列表 total=0）。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "SCREENING_QUERY_FAILED",
+        detail: Optional[str] = None,
+        status_code: int = 503,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.detail = detail or message
+        self.status_code = status_code
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "detail": self.detail,
+        }
+
+
+ScreeningQueryError = ScreeningExecutionError
+
+
 class EnhancedScreeningService:
     """增强的股票筛选服务"""
 
@@ -91,32 +119,20 @@ class EnhancedScreeningService:
             items = result[0] if isinstance(result, tuple) else result.get("items", [])
             total = result[1] if isinstance(result, tuple) else result.get("total", 0)
 
-            # 若使用数据库优化路径，则从数据库行情表进行富集（避免请求时外部调用）
+            # 若使用数据库优化路径，仅在行情字段仍有缺口时补一次数据库行情（含 stock_daily_quotes 日线回退）
             if source == "mongodb" and items:
-                try:
-                    db = get_mongo_db()
-                    coll = db["market_quotes"]
-                    codes = [str(it.get("code")).zfill(6) for it in items if it.get("code")]
-                    if codes:
-                        cursor = coll.find(
-                            {"code": {"$in": codes}},
-                            projection={"_id": 0, "code": 1, "close": 1, "pct_chg": 1, "amount": 1},
+                missing_quote_codes = [
+                    str(it.get("code")).zfill(6)
+                    for it in items
+                    if it.get("code") and (it.get("close") is None or it.get("pct_chg") is None)
+                ]
+                if missing_quote_codes:
+                    try:
+                        await self.db_service._enrich_with_quote_data(
+                            items, missing_quote_codes, raise_on_error=False
                         )
-                        quotes_list = await cursor.to_list(length=len(codes))
-                        quotes_map = {str(d.get("code")).zfill(6): d for d in quotes_list}
-                        for it in items:
-                            key = str(it.get("code")).zfill(6)
-                            q = quotes_map.get(key)
-                            if not q:
-                                continue
-                            if q.get("close") is not None:
-                                it["close"] = q.get("close")
-                            if q.get("pct_chg") is not None:
-                                it["pct_chg"] = q.get("pct_chg")
-                            if q.get("amount") is not None:
-                                it["amount"] = q.get("amount")
-                except Exception as enrich_err:
-                    logger.warning(f"实时行情富集失败（已忽略）: {enrich_err}")
+                    except Exception as enrich_err:
+                        logger.warning(f"行情富集失败（已忽略）: {enrich_err}")
 
             # 为筛选结果添加实时PE/PB
             if items:
@@ -141,18 +157,11 @@ class EnhancedScreeningService:
                 }
             }
 
+        except ScreeningExecutionError:
+            raise
         except Exception as e:
             logger.error(f"❌ 股票筛选失败: {e}")
-            took_ms = int((time.time() - start_time) * 1000)
-
-            return {
-                "total": 0,
-                "items": [],
-                "took_ms": took_ms,
-                "optimization_used": "none",
-                "source": "error",
-                "error": str(e)
-            }
+            raise ScreeningExecutionError(f"选股筛选查询失败：{str(e)}") from e
 
     def _analyze_conditions(self, conditions: List[ScreeningCondition]) -> Dict[str, Any]:
         """Delegate condition analysis to utils."""

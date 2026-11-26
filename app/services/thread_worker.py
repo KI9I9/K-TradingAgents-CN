@@ -194,12 +194,16 @@ class ThreadWorker:
             task_data: 任务数据
         """
         task_id = task_data.get("id")
-        stock_code = task_data.get("symbol")
+        raw_stock_code = task_data.get("symbol")
+        stock_code = StockUtils.normalize_symbol(raw_stock_code) or raw_stock_code
         user_id = task_data.get("user")
 
         logger.info(f"🔧 开始处理任务: {task_id} - {stock_code}")
 
         success = False
+        already_cancelled = False
+        existing_task = None
+        engine_type = "v2"
 
         try:
             # 解析任务参数
@@ -211,6 +215,8 @@ class ThreadWorker:
                 if isinstance(parameters_dict, str):
                     import json
                     parameters_dict = json.loads(parameters_dict)
+            if not isinstance(parameters_dict, dict):
+                parameters_dict = {}
 
             # 🔍 调试：打印参数内容
             logger.info(f"🔍 [DEBUG] 任务参数: {parameters_dict}")
@@ -218,10 +224,19 @@ class ThreadWorker:
             # 检查引擎类型（默认使用 v2 引擎）
             engine_type = parameters_dict.get("engine", "v2")
 
-            existing_task = None
             if engine_type == "v2":
                 existing_task = await self.task_service.get_task(task_id)
                 if existing_task:
+                    # 如果任务在排队期间已被取消，直接跳过执行，避免继续消耗资源
+                    if existing_task.status == AnalysisStatus.CANCELLED:
+                        logger.info(f"🚫 [ThreadWorker] 任务在执行前已被取消，跳过: {task_id}")
+                        already_cancelled = True
+                        try:
+                            await self.queue_service.cancel_task(task_id)
+                        except Exception as cancel_err:
+                            logger.warning(f"⚠️ [ThreadWorker] 清理已取消任务队列状态失败: {task_id} - {cancel_err}")
+                        return
+
                     from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
                     from app.utils.timezone import now_tz
 
@@ -257,7 +272,12 @@ class ThreadWorker:
             # 📡 JIT 数据同步：分析前主动拉取最新行情，确保不使用陈旧数据
             try:
                 from app.worker.analysis_worker import jit_sync_stock_data
-                jit_result = await jit_sync_stock_data(stock_code, parameters_dict)
+                jit_params = dict(parameters_dict)
+                if existing_task and getattr(existing_task, "task_type", None) == AnalysisTaskType.ETF_ANALYSIS:
+                    jit_params["is_etf"] = True
+                    jit_params["task_type"] = AnalysisTaskType.ETF_ANALYSIS.value
+                    jit_params["market_type"] = "ETF"
+                jit_result = await jit_sync_stock_data(stock_code, jit_params)
                 if not jit_result.is_valid:
                     logger.error(f"❌ [ThreadWorker] JIT 数据同步失败: {jit_result.message}")
                     raise ValueError(f"数据准备失败: {jit_result.message}")
@@ -271,25 +291,34 @@ class ThreadWorker:
 
             if engine_type == "v2":
                 # 使用 v2.0 统一任务引擎
-                from bson import ObjectId
-
                 if existing_task:
                     # 任务已存在，直接执行
                     logger.info(f"📋 任务已存在，直接执行: {task_id} (task_type={existing_task.task_type})")
-                    await self.task_service.execute_task(existing_task)
+                    executed_task = await self.task_service.execute_task(existing_task)
                 else:
                     # 任务不存在，创建并执行
+                    from bson import ObjectId
                     sec_type = StockUtils.identify_security_type(stock_code)
                     requested_market = parameters_dict.get("market_type")
-                    if requested_market == "ETF" or sec_type == SecurityType.FUND:
+                    task_type_hint = str(parameters_dict.get("task_type") or "").strip().lower()
+                    is_etf = (
+                        bool(parameters_dict.get("is_etf"))
+                        or str(requested_market or "").strip().upper() == "ETF"
+                        or task_type_hint == "etf_analysis"
+                        or sec_type == SecurityType.FUND
+                    )
+                    if is_etf:
                         inferred_task_type = AnalysisTaskType.ETF_ANALYSIS
+                        parameters_dict["market_type"] = "ETF"
+                        parameters_dict["is_etf"] = True
+                        parameters_dict["task_type"] = AnalysisTaskType.ETF_ANALYSIS.value
                         parameters_dict.setdefault("selected_analysts", ["etf", "market", "news"])
                         logger.info(f"📋 任务不存在，按 ETF 流程重建任务: {task_id}")
                     else:
                         inferred_task_type = AnalysisTaskType.STOCK_ANALYSIS
                         logger.info(f"📋 任务不存在，按股票流程重建任务: {task_id}")
 
-                    await self.task_service.create_and_execute_task(
+                    executed_task = await self.task_service.create_and_execute_task(
                         user_id=ObjectId(user_id) if user_id else ObjectId(),
                         task_type=inferred_task_type,
                         task_params={
@@ -300,6 +329,18 @@ class ThreadWorker:
                         engine_type="v2",
                         task_id=task_id  # 🔥 直接传递 task_id 参数
                     )
+
+                final_task = executed_task or existing_task
+                final_status = getattr(final_task, "status", None) if final_task is not None else None
+                final_status_val = final_status.value if hasattr(final_status, "value") else str(final_status or "")
+                if final_status_val == AnalysisStatus.CANCELLED.value:
+                    already_cancelled = True
+                    try:
+                        await self.queue_service.cancel_task(task_id)
+                    except Exception as cancel_err:
+                        logger.warning(f"⚠️ [ThreadWorker] 同步已取消任务队列状态失败: {task_id} - {cancel_err}")
+                    logger.info(f"🚫 [v2引擎] 任务执行期间已取消: {task_id}")
+                    return
 
                 logger.info(f"✅ [v2引擎] 任务完成: {task_id}")
 
@@ -354,14 +395,120 @@ class ThreadWorker:
         except Exception as e:
             logger.error(f"❌ 任务执行失败: {task_id} - {e}", exc_info=True)
             success = False
+            if e.__class__.__name__ == "TaskCancelledException":
+                already_cancelled = True
+                try:
+                    await self.queue_service.cancel_task(task_id)
+                except Exception:
+                    pass
+            await self._mark_task_failed_fallback(
+                task_id=task_id,
+                error=e,
+                existing_task=existing_task,
+            )
 
         finally:
-            # 确认任务完成（无论成功或失败）
-            try:
-                await self.queue_service.ack_task(task_id, success)
-                logger.info(f"✅ 任务已确认: {task_id} (成功: {success})")
-            except Exception as e:
-                logger.error(f"❌ 确认任务失败: {task_id} - {e}")
+            # 确认任务完成（已取消的任务保持 cancelled，避免被 ack 覆写为 failed）
+            if not already_cancelled:
+                try:
+                    await self.queue_service.ack_task(task_id, success)
+                    logger.info(f"✅ 任务已确认: {task_id} (成功: {success})")
+                except Exception as e:
+                    logger.error(f"❌ 确认任务失败: {task_id} - {e}")
+
+    async def _mark_task_failed_fallback(
+        self,
+        task_id: Optional[str],
+        error: Exception,
+        existing_task: Optional[UnifiedAnalysisTask] = None,
+    ) -> None:
+        """异常兜底：同步将 unified_analysis_tasks 与 memory_manager 置为 FAILED（或保留 CANCELLED），防止永久僵尸。"""
+        if not task_id:
+            return
+
+        is_cancelled = error.__class__.__name__ == "TaskCancelledException"
+        try:
+            from app.utils.error_formatter import ErrorFormatter
+            friendly_message = ErrorFormatter.format_user_message(str(error)) or str(error)
+        except Exception:
+            friendly_message = str(error) or "任务执行失败"
+
+        try:
+            from app.utils.timezone import now_tz
+            completed_at = now_tz()
+        except Exception:
+            completed_at = datetime.utcnow()
+
+        # 1) 同步更新 unified_analysis_tasks
+        try:
+            target_task = None
+            if self.task_service is not None:
+                try:
+                    target_task = await self.task_service.get_task(task_id)
+                except Exception:
+                    target_task = existing_task
+            if target_task is None:
+                target_task = existing_task
+
+            if target_task is not None and self.task_service is not None:
+                current_status = target_task.status
+                status_str = current_status.value if hasattr(current_status, "value") else str(current_status)
+                if status_str not in ("completed", "cancelled", "failed"):
+                    if is_cancelled:
+                        target_task.status = AnalysisStatus.CANCELLED
+                        target_task.message = "任务已取消"
+                    else:
+                        target_task.status = AnalysisStatus.FAILED
+                        target_task.error_message = friendly_message
+                        target_task.message = friendly_message
+                    target_task.completed_at = completed_at
+                    await self.task_service._update_task(target_task)
+            else:
+                db = get_mongo_db()
+                target_status = AnalysisStatus.CANCELLED.value if is_cancelled else AnalysisStatus.FAILED.value
+                update_fields: Dict[str, Any] = {
+                    "status": target_status,
+                    "completed_at": completed_at,
+                    "updated_at": completed_at,
+                    "message": "任务已取消" if is_cancelled else friendly_message,
+                }
+                if not is_cancelled:
+                    update_fields["error_message"] = friendly_message
+                await db.unified_analysis_tasks.update_one(
+                    {
+                        "task_id": task_id,
+                        "status": {"$nin": ["completed", "cancelled", "failed"]},
+                    },
+                    {"$set": update_fields},
+                )
+        except Exception as db_err:
+            logger.error(f"❌ [ThreadWorker] 回写 unified_analysis_tasks 失败状态异常: {task_id} - {db_err}")
+
+        # 2) 同步更新 memory_manager
+        try:
+            from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
+            memory_manager = get_memory_state_manager()
+            memory_task = await memory_manager.get_task(task_id)
+            mem_status = None
+            if memory_task is not None:
+                raw_st = getattr(memory_task, "status", None) if not isinstance(memory_task, dict) else memory_task.get("status")
+                mem_status = raw_st.value if hasattr(raw_st, "value") else str(raw_st or "")
+            if mem_status not in ("completed", "cancelled", "failed"):
+                if is_cancelled:
+                    await memory_manager.update_task_status(
+                        task_id=task_id,
+                        status=TaskStatus.CANCELLED,
+                        message="任务已取消",
+                    )
+                else:
+                    await memory_manager.update_task_status(
+                        task_id=task_id,
+                        status=TaskStatus.FAILED,
+                        message=friendly_message,
+                        error_message=friendly_message,
+                    )
+        except Exception as mem_err:
+            logger.error(f"❌ [ThreadWorker] 回写 memory_manager 失败状态异常: {task_id} - {mem_err}")
 
 
 # 全局 ThreadWorker 实例

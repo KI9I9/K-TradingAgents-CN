@@ -29,6 +29,110 @@ from app.core.jdyun import is_jdyun_mode, get_jdyun_worker_max_concurrent, get_j
 
 logger = logging.getLogger(__name__)
 
+# 回退自然工作日陈旧阈值（模块级常量，供 _is_data_fresh 与兜底提示共同引用，避免 NameError）
+MAX_STALE_DAYS = 3
+
+
+async def _jit_sync_etf_data(stock_code: str, sec_type: Any) -> Any:
+    """ETF 专用 JIT 数据同步：优先按单标的触发 ETF 同步，失败时回退校验本地 etf_daily_quotes。"""
+    from app.services.data_validation_service import DataValidationResult
+    from app.core.database import get_mongo_db
+
+    sec_type_val = sec_type.value if hasattr(sec_type, "value") else str(sec_type)
+    sync_error = ""
+
+    # 1. 尝试走 ETF 专用同步服务按需拉取（不走个股 stock_daily_quotes 通道）
+    try:
+        from app.worker.etf_sync_service import get_etf_sync_service
+
+        etf_service = await get_etf_sync_service()
+        sync_result = await etf_service.sync_symbols(
+            symbols=[stock_code],
+            force_update=False,
+            days=60,
+        )
+        if isinstance(sync_result, dict) and (
+            int(sync_result.get("success_count") or 0) > 0
+            or int(sync_result.get("records_inserted") or 0) > 0
+        ):
+            source_used = sync_result.get("data_source_used") or "etf_sync"
+            records_inserted = int(sync_result.get("records_inserted") or 0)
+            logger.info(
+                f"✅ [ETF JIT] {stock_code} 已通过 {source_used} 完成 ETF 数据同步（写入 {records_inserted} 条日线）"
+            )
+            return DataValidationResult(
+                is_valid=True,
+                message=f"ETF 数据准备成功，已通过 {source_used} 同步 {stock_code} 最新行情",
+                missing_data=[],
+                details={
+                    "symbol": stock_code,
+                    "market_type": "ETF",
+                    "is_etf": True,
+                    "security_type": sec_type_val,
+                    "jit_mode": "etf",
+                    "source": source_used,
+                    "records_inserted": records_inserted,
+                },
+            )
+        errors = (sync_result or {}).get("errors") if isinstance(sync_result, dict) else None
+        if errors:
+            sync_error = str(errors[0])
+    except Exception as exc:
+        sync_error = str(exc)
+        logger.warning(f"⚠️ [ETF JIT] {stock_code} 在线同步异常，检查本地已入库 ETF 行情: {exc}")
+
+    # 2. 在线拉取失败或无新增时，回退检查本地 etf_daily_quotes 是否已有可用日线
+    try:
+        db = get_mongo_db()
+        etf_coll = db["etf_daily_quotes"]
+        latest_docs = (
+            await etf_coll.find(
+                {"$or": [{"code": stock_code}, {"symbol": stock_code}]},
+                {"trade_date": 1, "close": 1, "_id": 0},
+            )
+            .sort("trade_date", -1)
+            .limit(1)
+            .to_list(length=1)
+        )
+        if latest_docs:
+            latest_date = str(latest_docs[0].get("trade_date") or "unknown")
+            logger.info(
+                f"✅ [ETF JIT] {stock_code} 回退使用本地已入库 etf_daily_quotes（最新日期: {latest_date}）"
+            )
+            return DataValidationResult(
+                is_valid=True,
+                message=f"ETF 数据准备完成（使用本地已入库行情，最新日期: {latest_date}）",
+                missing_data=[],
+                details={
+                    "symbol": stock_code,
+                    "market_type": "ETF",
+                    "is_etf": True,
+                    "security_type": sec_type_val,
+                    "jit_mode": "etf_local_fallback",
+                    "latest_date": latest_date,
+                    "sync_error": sync_error or None,
+                },
+            )
+    except Exception as db_exc:
+        logger.warning(f"⚠️ [ETF JIT] 检查本地 etf_daily_quotes 失败: {db_exc}")
+        if not sync_error:
+            sync_error = str(db_exc)
+
+    logger.error(f"❌ [ETF JIT] {stock_code} 在线同步失败且本地 etf_daily_quotes 无可用数据: {sync_error}")
+    return DataValidationResult(
+        is_valid=False,
+        message=f"ETF {stock_code} 数据准备失败：无法通过 ETF 数据源获取行情且本地无已入库日线（{sync_error or '无可用数据源'}）",
+        missing_data=["etf_daily_quotes"],
+        details={
+            "symbol": stock_code,
+            "market_type": "ETF",
+            "is_etf": True,
+            "security_type": sec_type_val,
+            "jit_mode": "etf",
+            "last_error": sync_error,
+        },
+    )
+
 
 async def jit_sync_stock_data(stock_code: str, parameters_dict: Dict[str, Any]) -> Any:
     """JIT 数据同步：在分析前主动拉取最新行情，并保存到 MongoDB。
@@ -58,30 +162,32 @@ async def jit_sync_stock_data(stock_code: str, parameters_dict: Dict[str, Any]) 
             details={"error": "股票代码缺失"}
         )
 
+    stock_code = StockUtils.normalize_symbol(stock_code) or str(stock_code).strip()
+    parameters_dict = parameters_dict or {}
+
     # 从参数中提取市场类型
-    market_type = parameters_dict.get("market_type", "cn")
+    raw_market_type = parameters_dict.get("market_type", "cn")
+    raw_market_key = str(raw_market_type or "cn").strip()
     market_type_map = {
         "A股": "cn", "港股": "hk", "美股": "us",
-        "cn": "cn", "hk": "hk", "us": "us"
+        "cn": "cn", "hk": "hk", "us": "us",
+        "CN": "cn", "HK": "hk", "US": "us",
+        "ETF": "etf", "etf": "etf",
     }
-    market_type = market_type_map.get(market_type, "cn")
+    market_type = market_type_map.get(raw_market_key, market_type_map.get(raw_market_key.lower(), "cn"))
 
-    # ETF/FUND 使用独立的数据链路，不应套用个股行情 JIT 硬校验
+    # ETF/FUND 使用独立的 ETF JIT 同步链路，绝不误走个股 stock_daily_quotes 通道
     sec_type = StockUtils.identify_security_type(stock_code)
-    if parameters_dict.get("market_type") == "ETF" or sec_type == SecurityType.FUND:
-        logger.info(f"ℹ️ {stock_code} 识别为 ETF/FUND，跳过股票行情 JIT 校验，使用 ETF 专用数据链路")
-        return DataValidationResult(
-            is_valid=True,
-            message="ETF/FUND 证券，跳过股票行情 JIT 校验，使用 ETF 专用数据链路",
-            missing_data=[],
-            details={
-                "symbol": stock_code,
-                "market_type": parameters_dict.get("market_type", market_type),
-                "security_type": sec_type.value if hasattr(sec_type, "value") else str(sec_type),
-                "skipped": True,
-                "reason": "etf_specialized_data_path"
-            }
-        )
+    task_type_val = str(parameters_dict.get("task_type") or "").strip().lower()
+    is_etf = (
+        bool(parameters_dict.get("is_etf"))
+        or market_type == "etf"
+        or task_type_val == "etf_analysis"
+        or sec_type == SecurityType.FUND
+    )
+    if is_etf:
+        logger.info(f"ℹ️ {stock_code} 识别为 ETF/FUND，走 ETF 专用 JIT 同步链路")
+        return await _jit_sync_etf_data(stock_code, sec_type)
 
     # 目前只对 A 股做主动拉取（HK/US 可后续扩展）
     if market_type != "cn":
@@ -135,6 +241,9 @@ async def jit_sync_stock_data(stock_code: str, parameters_dict: Dict[str, Any]) 
     except Exception as _cal_err:
         logger.warning(f"⚠️ [JIT] 无法获取交易日历，将使用宽松校验（回退3工作日规则）: {_cal_err}")
 
+    # 回退自然工作日陈旧阈值（提升至外层，供 _is_data_fresh 与兜底消息共同引用）
+    MAX_STALE_DAYS = 3
+
     def _is_data_fresh(df: "pd.DataFrame") -> tuple:
         """检查 DataFrame 的最新 trade_date 是否已覆盖最近交易日。
         Returns: (is_fresh: bool, latest_date_str: str)
@@ -169,7 +278,6 @@ async def jit_sync_stock_data(stock_code: str, parameters_dict: Dict[str, Any]) 
                 return is_fresh, latest_str
 
             # 回退：简单自然工作日计数（不考虑节假日）
-            MAX_STALE_DAYS = 3
             today = datetime.now().date()
             missed = 0
             cur = latest_dt
@@ -719,14 +827,21 @@ class AnalysisWorker:
     
     async def _process_task(self, task_data: Dict[str, Any]):
         """处理单个任务"""
+        from tradingagents.utils.stock_utils import StockUtils
+        from app.models.analysis import AnalysisTaskType
+
         task_id = task_data.get("id")
-        stock_code = task_data.get("symbol")
+        raw_stock_code = task_data.get("symbol")
+        stock_code = StockUtils.normalize_symbol(raw_stock_code) or raw_stock_code
         user_id = task_data.get("user")
 
         logger.info(f"📊 开始处理任务: {task_id} - {stock_code} (当前并发: {len(self.running_tasks)}/{self.max_concurrent_tasks})")
 
         self.current_task = task_id
         success = False
+        already_cancelled = False
+        task_service = None
+        task = None
 
         # 🔥 更新 Worker 状态：开始处理任务
         _update_worker_state(
@@ -741,12 +856,11 @@ class AnalysisWorker:
             if isinstance(parameters_dict, str):
                 import json
                 parameters_dict = json.loads(parameters_dict)
+            if not isinstance(parameters_dict, dict):
+                parameters_dict = {}
 
             # 检查引擎类型（默认使用 v2 引擎）
             engine_type = parameters_dict.get("engine", "v2")
-
-            task_service = None
-            task = None
 
             # v2 任务在数据准备前先推进状态，避免前端长时间停留在 pending/初始化
             if engine_type == "v2":
@@ -758,6 +872,16 @@ class AnalysisWorker:
                 task = await task_service.get_task(task_id)
                 if not task:
                     raise ValueError(f"任务不存在: {task_id}")
+
+                if task.status == AnalysisStatus.CANCELLED:
+                    logger.info(f"🚫 [Worker] 任务在执行前已被取消，跳过: {task_id}")
+                    already_cancelled = True
+                    try:
+                        if self.queue_service:
+                            await self.queue_service.cancel_task(task_id)
+                    except Exception:
+                        pass
+                    return
 
                 memory_manager = get_memory_state_manager()
                 memory_task = await memory_manager.get_task(task_id)
@@ -791,24 +915,39 @@ class AnalysisWorker:
                 )
             
             # 数据校验：检查股票数据是否存在且新鲜（防止用陈旧数据分析）
-            validation_result = await self._validate_task_data(stock_code, parameters_dict)
+            jit_params = dict(parameters_dict or {})
+            if task and getattr(task, "task_type", None) == AnalysisTaskType.ETF_ANALYSIS:
+                jit_params["is_etf"] = True
+                jit_params["task_type"] = AnalysisTaskType.ETF_ANALYSIS.value
+                jit_params["market_type"] = "ETF"
+
+            validation_result = await self._validate_task_data(stock_code, jit_params)
             if not validation_result.is_valid:
                 error_message = validation_result.message
                 logger.warning(f"⚠️ 任务 {task_id} 数据校验失败: {error_message}")
 
-                # 更新任务状态为失败
+                # 更新任务状态为失败（同时更新 unified_analysis_tasks 与 memory_manager）
                 engine_type_check = parameters_dict.get("engine", "v2")
                 if engine_type_check in ("v2", "unified"):
                     try:
                         from app.services.task_analysis_service import get_task_analysis_service
+                        from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
                         from app.utils.timezone import now_tz
                         task_service_tmp = get_task_analysis_service()
                         task_tmp = await task_service_tmp.get_task(task_id)
                         if task_tmp:
                             task_tmp.status = AnalysisStatus.FAILED
                             task_tmp.error_message = error_message
+                            task_tmp.message = error_message
                             task_tmp.completed_at = now_tz()
                             await task_service_tmp._update_task(task_tmp)
+                            task = task_tmp
+                        await get_memory_state_manager().update_task_status(
+                            task_id=task_id,
+                            status=TaskStatus.FAILED,
+                            message=error_message,
+                            error_message=error_message,
+                        )
                     except Exception as upd_err:
                         logger.error(f"❌ 数据校验失败后更新任务状态出错: {upd_err}")
 
@@ -839,7 +978,19 @@ class AnalysisWorker:
                     logger.warning(f"⚠️ [Worker] 检查/创建内存任务失败: {e}，继续执行")
                 
                 # 执行任务
-                await task_service.execute_task(task, progress_callback=self._progress_callback)
+                executed_task = await task_service.execute_task(task, progress_callback=self._progress_callback)
+                final_task = executed_task or task
+                final_status = getattr(final_task, "status", None) if final_task is not None else None
+                final_status_val = final_status.value if hasattr(final_status, "value") else str(final_status or "")
+                if final_status_val == AnalysisStatus.CANCELLED.value:
+                    already_cancelled = True
+                    try:
+                        if self.queue_service:
+                            await self.queue_service.cancel_task(task_id)
+                    except Exception:
+                        pass
+                    logger.info(f"🚫 [v2引擎] 任务执行期间已取消: {task_id}")
+                    return
                 success = True
                 logger.info(f"✅ [v2引擎] 任务完成: {task_id}")
                 
@@ -894,6 +1045,44 @@ class AnalysisWorker:
             logger.error(f"❌ 任务执行失败: {task_id} - {e}")
             logger.error(traceback.format_exc())
 
+            # 兜底同步 DB 与内存失败状态，避免任务永久停留在 processing
+            try:
+                from app.utils.error_formatter import ErrorFormatter
+                from app.utils.timezone import now_tz
+                from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
+                friendly_error = ErrorFormatter.format_user_message(str(e)) or str(e)
+                is_cancelled = e.__class__.__name__ == "TaskCancelledException"
+                if is_cancelled:
+                    already_cancelled = True
+                    try:
+                        if self.queue_service:
+                            await self.queue_service.cancel_task(task_id)
+                    except Exception:
+                        pass
+                if task_service is not None and task is not None:
+                    current_status = task.status.value if hasattr(task.status, "value") else str(task.status)
+                    if current_status not in ("completed", "cancelled", "failed"):
+                        task.status = AnalysisStatus.CANCELLED if is_cancelled else AnalysisStatus.FAILED
+                        task.error_message = None if is_cancelled else friendly_error
+                        task.message = "任务已取消" if is_cancelled else friendly_error
+                        task.completed_at = now_tz()
+                        await task_service._update_task(task)
+                memory_manager = get_memory_state_manager()
+                memory_task = await memory_manager.get_task(task_id)
+                mem_status = None
+                if memory_task is not None:
+                    raw_st = getattr(memory_task, "status", None) if not isinstance(memory_task, dict) else memory_task.get("status")
+                    mem_status = raw_st.value if hasattr(raw_st, "value") else str(raw_st or "")
+                if mem_status not in ("completed", "cancelled", "failed"):
+                    await memory_manager.update_task_status(
+                        task_id=task_id,
+                        status=TaskStatus.CANCELLED if is_cancelled else TaskStatus.FAILED,
+                        message="任务已取消" if is_cancelled else friendly_error,
+                        error_message=None if is_cancelled else friendly_error,
+                    )
+            except Exception as fallback_err:
+                logger.error(f"❌ [Worker] 异常兜底回写任务状态失败: {task_id} - {fallback_err}")
+
             # 🔥 更新 Worker 状态：任务失败
             try:
                 from app.worker.__main__ import get_worker_state
@@ -907,10 +1096,11 @@ class AnalysisWorker:
 
         finally:
             # 确认任务完成
-            try:
-                await self.queue_service.ack_task(task_id, success)
-            except Exception as e:
-                logger.error(f"确认任务失败: {task_id} - {e}")
+            if not already_cancelled:
+                try:
+                    await self.queue_service.ack_task(task_id, success)
+                except Exception as e:
+                    logger.error(f"确认任务失败: {task_id} - {e}")
 
             # 🔥 更新 Worker 状态：任务完成
             try:

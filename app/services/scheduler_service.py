@@ -1492,25 +1492,34 @@ class SchedulerService:
             logger.error(f"❌ 检测僵尸任务失败: {e}")
 
     def _on_job_executed(self, event: JobExecutionEvent):
-        """任务执行成功回调"""
-        if (event.job_id == 'tushare_historical_sync' and isinstance(event.retval, dict)
+        """任务执行完成回调（统一经 scheduler_runtime.outcome 落态）"""
+        if (isinstance(event.retval, dict)
                 and event.retval.get('_execution_recorded') is True):
             # The awaited batch already persisted its success/skip/failure.
-            # A second generic success would hide the actual batch outcome.
+            # A second generic record would hide the actual batch outcome.
             return
+        from app.services.scheduler_runtime import outcome as resolve_execution_outcome
+
+        resolved_status, resolved_message = resolve_execution_outcome(result=event.retval)
+
         # 计算执行时间（处理时区问题）
         execution_time = None
         if event.scheduled_run_time:
             now = datetime.now(event.scheduled_run_time.tzinfo)
             execution_time = (now - event.scheduled_run_time).total_seconds()
 
+        progress = 100 if resolved_status in ("success", "skipped") else None
+        error_message = resolved_message if resolved_status == "failed" else None
+
         asyncio.create_task(self._record_job_execution(
             job_id=event.job_id,
-            status="success",
+            status=resolved_status,
             scheduled_time=event.scheduled_run_time,
             execution_time=execution_time,
-            return_value=str(event.retval) if event.retval else None,
-            progress=100  # 任务完成，进度100%
+            return_value=str(event.retval) if event.retval is not None else None,
+            error_message=error_message,
+            progress=progress,
+            progress_message=resolved_message,
         ))
 
     def _on_job_error(self, event: JobExecutionEvent):
@@ -1550,14 +1559,15 @@ class SchedulerService:
         error_message: str = None,
         traceback: str = None,
         progress: int = None,
-        is_manual: bool = False
+        is_manual: bool = False,
+        progress_message: str = None,
     ):
         """
         记录任务执行历史
 
         Args:
             job_id: 任务ID
-            status: 状态 (running/success/failed/missed)
+            status: 状态 (running/success/partial/failed/skipped/cancelled/missed)
             scheduled_time: 计划执行时间
             execution_time: 实际执行时长（秒）
             return_value: 返回值
@@ -1565,47 +1575,75 @@ class SchedulerService:
             traceback: 错误堆栈
             progress: 执行进度（0-100）
             is_manual: 是否手动触发
+            progress_message: 执行结果摘要
         """
         try:
             db = self._get_db()
+            terminal_statuses = ("success", "partial", "failed", "skipped", "cancelled")
+
+            # scheduled_time 可能是 aware datetime（来自 APScheduler），统一转换为 UTC+8 naive datetime
+            scheduled_time_naive = None
+            if scheduled_time:
+                if scheduled_time.tzinfo is not None:
+                    scheduled_time_naive = scheduled_time.astimezone(UTC_8).replace(tzinfo=None)
+                else:
+                    scheduled_time_naive = scheduled_time
 
             # 获取任务名称和kwargs
-            job = self.scheduler.get_job(job_id)
+            job = self.scheduler.get_job(job_id) if self.scheduler else None
             job_name = job.name if job else job_id
             job_kwargs = job.kwargs.copy() if job and job.kwargs else {}
+            duration_label = f"{execution_time:.2f}秒" if execution_time is not None else "未知"
 
-            # 如果是完成状态（success/failed），先查找是否有对应的 running 记录
-            if status in ["success", "failed"]:
+            # 如果是终态（success/partial/failed/skipped/cancelled），先查找活动中的 running/cancelling 记录
+            if status in terminal_statuses:
+                active_query = build_active_running_query({"job_id": job_id})
+                active_query["status"] = {"$in": ["running", "cancelling"]}
                 existing_record = await db.scheduler_executions.find_one(
-                    build_active_running_query({"job_id": job_id}),
+                    active_query,
                     sort=[("timestamp", -1)]
                 )
 
                 if existing_record:
-                    # 更新现有记录
+                    now_local = get_utc8_now()
                     update_data = {
                         "status": status,
                         "execution_time": execution_time,
-                        "updated_at": get_utc8_now()
+                        "updated_at": now_local,
+                        "finished_at": now_local,
                     }
 
-                    if return_value:
+                    if return_value is not None:
                         update_data["return_value"] = return_value
+                    if progress_message:
+                        update_data["progress_message"] = progress_message
                     if error_message:
                         update_data["error_message"] = error_message
                     if traceback:
                         update_data["traceback"] = traceback
                     if progress is not None:
                         update_data["progress"] = progress
+                    if status == "skipped":
+                        update_data["skipped"] = True
 
-                    await db.scheduler_executions.update_one(
-                        {"_id": existing_record["_id"]},
+                    # 原子守卫：仅更新仍处于非终态的记录，绝不覆盖 worker 已写入的终态（如 partial/failed/cancelled）
+                    update_res = await db.scheduler_executions.update_one(
+                        {"_id": existing_record["_id"], "status": {"$in": ["running", "cancelling"]}},
                         {"$set": update_data}
                     )
+                    if getattr(update_res, "matched_count", 1) == 0:
+                        logger.info(
+                            f"⏭️ [任务执行] {job_name} 记录 {existing_record['_id']} 已被 worker 置为终态，跳过重复覆写 ({status})"
+                        )
+                        return
 
                     # 记录日志
                     if status == "success":
-                        logger.info(f"✅ [任务执行] {job_name} 执行成功，耗时: {execution_time:.2f}秒")
+                        logger.info(f"✅ [任务执行] {job_name} 执行成功，耗时: {duration_label}")
+                    elif status == "skipped":
+                        logger.info(f"⏭️ [任务执行] {job_name} 已跳过: {progress_message or return_value}")
+                    elif status == "cancelled":
+                        logger.warning(f"🛑 [任务执行] {job_name} 已取消: {progress_message or ''}")
                     elif status == "failed":
                         logger.error(f"❌ [任务执行] {job_name} 执行失败: {error_message}")
 
@@ -1621,29 +1659,52 @@ class SchedulerService:
 
                     return
 
-            # 如果没有找到 running 记录，或者是 running/missed 状态，插入新记录
-            # scheduled_time 可能是 aware datetime（来自 APScheduler），需要转换为 naive datetime
-            scheduled_time_naive = None
-            if scheduled_time:
-                if scheduled_time.tzinfo is not None:
-                    # 转换为本地时区，然后移除时区信息
-                    scheduled_time_naive = scheduled_time.astimezone(UTC_8).replace(tzinfo=None)
-                else:
-                    scheduled_time_naive = scheduled_time
+                # 未找到 running 记录时，检查本轮是否已由 worker（如 mark_job_completed）写入终态；
+                # 若已落终态则不重复插入或覆写。
+                run_start_bound = (
+                    scheduled_time_naive - timedelta(seconds=1)
+                    if scheduled_time_naive is not None
+                    else get_utc8_now() - timedelta(seconds=max(float(execution_time or 0), 5.0))
+                )
+                already_finalized = await db.scheduler_executions.find_one(
+                    {
+                        "job_id": job_id,
+                        "status": {"$in": list(terminal_statuses)},
+                        "$or": [
+                            {"finished_at": {"$gte": run_start_bound}},
+                            {"updated_at": {"$gte": run_start_bound}},
+                        ],
+                    },
+                    sort=[("timestamp", -1)]
+                )
+                if already_finalized:
+                    logger.info(
+                        f"⏭️ [任务执行] {job_name} 本轮已记录终态 ({already_finalized.get('status')})，"
+                        f"跳过回调重复写入 ({status})"
+                    )
+                    return
 
+            now_local = get_utc8_now()
             execution_record = {
                 "job_id": job_id,
                 "job_name": job_name,
                 "status": status,
                 "scheduled_time": scheduled_time_naive,
                 "execution_time": execution_time,
-                "timestamp": get_utc8_now(),
+                "timestamp": now_local,
+                "updated_at": now_local,
                 "is_manual": is_manual,
                 "job_kwargs": job_kwargs  # 🔥 保存任务的kwargs，用于恢复时传递参数
             }
+            if status in terminal_statuses:
+                execution_record["finished_at"] = now_local
+            if status == "skipped":
+                execution_record["skipped"] = True
 
-            if return_value:
+            if return_value is not None:
                 execution_record["return_value"] = return_value
+            if progress_message:
+                execution_record["progress_message"] = progress_message
             if error_message:
                 execution_record["error_message"] = error_message
             if traceback:
@@ -1655,7 +1716,11 @@ class SchedulerService:
 
             # 记录日志
             if status == "success":
-                logger.info(f"✅ [任务执行] {job_name} 执行成功，耗时: {execution_time:.2f}秒")
+                logger.info(f"✅ [任务执行] {job_name} 执行成功，耗时: {duration_label}")
+            elif status == "skipped":
+                logger.info(f"⏭️ [任务执行] {job_name} 已跳过: {progress_message or return_value}")
+            elif status == "cancelled":
+                logger.warning(f"🛑 [任务执行] {job_name} 已取消: {progress_message or ''}")
             elif status == "failed":
                 logger.error(f"❌ [任务执行] {job_name} 执行失败: {error_message}")
             elif status == "missed":
@@ -2061,14 +2126,14 @@ async def update_job_progress(
             # 🔥 如果失败/取消记录超过1小时，可能是旧记录，允许创建新记录
             is_old_record = time_diff and time_diff > 3600  # 1小时
             
-            if current_status in ["failed", "cancelled"] and not is_old_record:
+            terminal_statuses = ("success", "partial", "failed", "skipped", "cancelled")
+            if current_status in terminal_statuses and not is_old_record:
                 logger.warning(f"⚠️ 任务 {job_id} 状态为 {current_status}，不更新状态为running，保持 {current_status} 状态")
-                # 只更新进度，不更新状态
+                # 只更新进度与心跳，绝不覆写终态
                 update_data = {
                     "progress": progress,
                     "updated_at": get_utc8_now()
                 }
-                # 🔥 即使状态是failed/cancelled，也要更新进度相关字段
                 if current_item:
                     update_data["current_item"] = current_item
                 if total_items is not None:
@@ -2090,19 +2155,13 @@ async def update_job_progress(
                 if processed_items is not None:
                     update_data["processed_items"] = processed_items
             else:
-                # 🔥 更新现有记录
-                # 如果进度是100%，状态应该是success；否则保持running
-                status = "success" if progress >= 100 else "running"
+                # 🔥 仅更新进度与心跳，不因 progress >= 100 提前置 success（终态统一由 mark_job_completed / _on_job_executed 判定）
                 update_data = {
                     "progress": progress,
-                    "status": status,
                     "updated_at": get_utc8_now()
                 }
-                
-                # 🔥 如果任务完成，记录完成时间
-                if progress >= 100:
-                    update_data["finished_at"] = get_utc8_now()
-                    logger.info(f"✅ 任务 {job_id} 已完成，状态更新为success")
+                if current_status == "suspended":
+                    update_data["status"] = "running"
 
             if message:
                 update_data["progress_message"] = message
@@ -2188,6 +2247,7 @@ async def update_job_progress(
                 "progress": progress,
                 "scheduled_time": execution_timestamp,
                 "timestamp": execution_timestamp,
+                "updated_at": execution_timestamp,
                 "is_manual": is_manual,  # 🔥 根据 _manual_trigger 标记设置 is_manual
                 "cancel_requested": False,  # 🔥 新任务默认没有取消标记
                 "job_kwargs": job_kwargs  # 🔥 保存任务的kwargs，用于恢复时传递参数
@@ -2263,14 +2323,18 @@ async def update_job_progress(
             else:
                 started_at_str = str(started_at)
             
-            # 🔥 根据进度确定状态：如果进度是100%，状态应该是success；否则保持running
-            # 注意：这里使用与MongoDB相同的逻辑，确保一致性
-            redis_status = "success" if progress >= 100 else "running"
+            # 🔥 update_job_progress 只刷新进度与心跳，不提前把状态置为 success
+            existing_status = latest_execution.get("status") if latest_execution else None
+            redis_status = (
+                existing_status
+                if existing_status in ("success", "partial", "failed", "skipped", "cancelled")
+                else "running"
+            )
             
             progress_data = {
                 "job_id": job_id,
                 "progress": progress,
-                "status": redis_status,  # 🔥 使用计算出的状态，而不是硬编码为running
+                "status": redis_status,
                 "started_at": started_at_str,
                 "updated_at": get_utc8_now().isoformat()
             }
@@ -2288,10 +2352,6 @@ async def update_job_progress(
                 progress_data["total_items"] = total_items
             if processed_items is not None:
                 progress_data["processed_items"] = processed_items
-            
-            # 🔥 如果进度是100%，添加完成时间
-            if progress >= 100:
-                progress_data["finished_at"] = get_utc8_now().isoformat()
             
             # 存储到Redis，设置24小时过期（任务完成后会清理）
             progress_key = RedisKeys.SCHEDULER_JOB_PROGRESS.format(job_id=job_id)

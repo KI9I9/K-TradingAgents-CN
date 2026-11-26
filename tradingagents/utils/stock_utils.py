@@ -12,6 +12,13 @@ from tradingagents.utils.logging_init import get_logger
 logger = get_logger("default")
 
 
+ETF_SH_PREFIXES: Tuple[str, ...] = ("50", "51", "52", "56", "58")
+ETF_SZ_PREFIXES: Tuple[str, ...] = ("15", "16", "18")
+ETF_PREFIXES: Tuple[str, ...] = ETF_SH_PREFIXES + ETF_SZ_PREFIXES
+_CN_EXCHANGE_SUFFIX_RE = re.compile(r"^(\d{6})\.(SZ|SH|BJ|SS|XSHE|XSHG)$")
+_US_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+
+
 class StockMarket(Enum):
     """股票市场枚举"""
     CHINA_A = "china_a"      # 中国A股
@@ -31,7 +38,25 @@ class SecurityType(Enum):
 
 class StockUtils:
     """股票工具类"""
-    
+
+    ETF_PREFIXES: Tuple[str, ...] = ETF_PREFIXES
+
+    @staticmethod
+    def normalize_symbol(ticker: Optional[str]) -> str:
+        """
+        标准化证券代码：
+        - 去除首尾空白并转大写
+        - 剥离 A 股/北交所交易所后缀（.SH/.SZ/.BJ/.SS/.XSHG/.XSHE）
+        - 保留带点或连字符的美股代码（如 BRK.B / BF-B）以及 .HK 代码
+        """
+        if not ticker:
+            return ""
+        cleaned = str(ticker).strip().upper()
+        match = _CN_EXCHANGE_SUFFIX_RE.match(cleaned)
+        if match:
+            return match.group(1)
+        return cleaned
+
     @staticmethod
     def identify_stock_market(ticker: str) -> StockMarket:
         """
@@ -48,19 +73,18 @@ class StockUtils:
 
         ticker = str(ticker).strip().upper()
 
-        # 中国A股：纯6位数字，或带交易所后缀（000001.SZ、600519.SH、600519.SS 等）
+        # 中国A股（含北交所/ETF）：纯6位数字，或带交易所后缀（.SZ/.SH/.BJ/.SS/.XSHE/.XSHG）
         if re.match(r'^\d{6}$', ticker):
             return StockMarket.CHINA_A
-        # 兼容 Tushare/Yahoo 等格式：002594.SZ、000001.SZ、600519.SH、600519.SS、600519.XSHG、000001.XSHE
-        if re.match(r'^\d{6}\.(SZ|SH|SS|XSHE|XSHG)$', ticker):
+        if _CN_EXCHANGE_SUFFIX_RE.match(ticker):
             return StockMarket.CHINA_A
 
         # 港股：4-5位数字.HK 或 纯4-5位数字（支持0700.HK、09988.HK、00700、9988格式）
         if re.match(r'^\d{4,5}\.HK$', ticker) or re.match(r'^\d{4,5}$', ticker):
             return StockMarket.HONG_KONG
 
-        # 美股：1-5位字母
-        if re.match(r'^[A-Z]{1,5}$', ticker):
+        # 美股：1-5位字母，兼容 BRK.B / BF-B 等带点或连字符代码
+        if _US_TICKER_RE.match(ticker):
             return StockMarket.US
 
         return StockMarket.UNKNOWN
@@ -79,9 +103,8 @@ class StockUtils:
           - 深圳创业板：300xxx, 301xxx
           - 北交所：8xxxxx, 4xxxxx, 92xxxx（920 为 2025-10 起统一号段）
         - 基金/ETF：
-          - 上海交易所：5xxxxx (如 510050 上证50ETF)
-          - 深圳交易所：1xxxxx (如 159919 沪深300ETF)
-          - LOF基金：16xxxx
+          - 上海交易所：50xxxx, 51xxxx, 52xxxx, 56xxxx, 58xxxx (如 510050, 560010, 588000)
+          - 深圳交易所：15xxxx, 16xxxx, 18xxxx (如 159919, 16xxxx, 180101)
         - 债券：
           - 国债：01xxxx
           - 企业债：12xxxx, 11xxxx
@@ -100,8 +123,7 @@ class StockUtils:
             return SecurityType.UNKNOWN
 
         # 去掉后缀，只保留数字部分
-        ticker = str(ticker).strip().upper()
-        code = re.sub(r'\.(SZ|SH|BJ)$', '', ticker)
+        code = StockUtils.normalize_symbol(ticker)
 
         if not code.isdigit() or len(code) != 6:
             return SecurityType.UNKNOWN
@@ -109,12 +131,8 @@ class StockUtils:
         prefix = code[:2]
         prefix3 = code[:3]
 
-        # 基金/ETF 识别（优先判断，因为基金代码范围更明确）
-        # 上海交易所基金：5xxxxx
-        if prefix == '51' or prefix == '50' or prefix == '52':
-            return SecurityType.FUND
-        # 深圳交易所基金：1xxxxx (15xxxx, 16xxxx)
-        if prefix == '15' or prefix == '16':
+        # 基金/ETF 识别（优先判断，统一使用 ETF_PREFIXES 单一事实来源）
+        if prefix in ETF_PREFIXES:
             return SecurityType.FUND
 
         # 指数识别
@@ -338,6 +356,16 @@ def is_hk_stock(ticker: str) -> bool:
 def is_us_stock(ticker: str) -> bool:
     """判断是否为美股"""
     return StockUtils.is_us_stock(ticker)
+
+
+def normalize_symbol(ticker: Optional[str]) -> str:
+    """标准化证券代码（剥离 A 股/ETF 交易所后缀，保留美股点/连字符代码与 .HK）"""
+    return StockUtils.normalize_symbol(ticker)
+
+
+def is_etf_symbol(ticker: Optional[str]) -> bool:
+    """判断是否为国内场内 ETF/LOF 基金代码（使用统一 ETF_PREFIXES）"""
+    return bool(ticker) and StockUtils.identify_security_type(ticker) == SecurityType.FUND
 
 
 def get_stock_market_info(ticker: str) -> Dict:

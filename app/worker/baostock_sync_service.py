@@ -381,6 +381,13 @@ class BaoStockSyncService:
 
     async def _update_stock_quotes(self, quotes: Dict[str, Any]):
         """更新股票日K线到数据库"""
+        from app.services.quote_contract import quotes_write_enabled
+        if not quotes_write_enabled():
+            logger.debug(
+                "⏸️ market_quotes 写入总闸已关闭，跳过 BaoStock _update_stock_quotes(%s)",
+                quotes.get("code", ""),
+            )
+            return
         try:
             collection = self.db.market_quotes
 
@@ -879,7 +886,7 @@ class BaoStockSyncService:
 
     async def _should_stop(self, job_id: str) -> bool:
         """
-        检查任务是否应该停止
+        检查任务是否应该停止（复用全局同步 Mongo 连接，按 updated_at 心跳判活）。
 
         Args:
             job_id: 任务ID
@@ -888,12 +895,22 @@ class BaoStockSyncService:
             是否应该停止
         """
         try:
-            # 🔥 查询执行记录，检查 cancel_requested 标记和任务状态
-            # 不仅检查 running 状态，也检查 failed/cancelled/suspended 状态
-            execution = await self.db.scheduler_executions.find_one(
-                {"job_id": job_id},
+            from app.core.database import get_mongo_db_sync
+            from app.services.scheduler_service import build_active_running_query
+
+            sync_db = get_mongo_db_sync()
+
+            active_query = build_active_running_query({"job_id": job_id})
+            active_query["status"] = {"$in": ["running", "cancelling"]}
+            execution = sync_db.scheduler_executions.find_one(
+                active_query,
                 sort=[("timestamp", -1)]
             )
+            if execution is None:
+                execution = sync_db.scheduler_executions.find_one(
+                    {"job_id": job_id},
+                    sort=[("timestamp", -1)]
+                )
 
             if not execution:
                 return False
@@ -903,9 +920,9 @@ class BaoStockSyncService:
                 logger.info(f"🛑 任务 {job_id} 收到取消请求，应停止执行")
                 return True
 
-            # 🔥 检查任务状态：如果任务已被标记为失败、取消或挂起，也应该停止
+            # 🔥 检查任务状态：如果任务已被标记为取消中、失败、取消或挂起，也应该停止
             status = execution.get("status")
-            if status in ["failed", "cancelled", "suspended"]:
+            if status in ["cancelling", "failed", "cancelled", "suspended"]:
                 logger.info(f"🛑 任务 {job_id} 状态为 {status}，应停止执行")
                 return True
 
@@ -943,8 +960,9 @@ class BaoStockSyncService:
             )
             logger.info(f"✅ [BaoStock] {code} 数据保存完成: {saved_count} 条记录")
 
-            # 同时更新market_quotes集合的元信息（保持兼容性）
-            if self.db is not None:
+            # 同时更新market_quotes集合的元信息（仅在行情写入总闸开启时允许）
+            from app.services.quote_contract import quotes_write_enabled
+            if self.db is not None and quotes_write_enabled():
                 collection = self.db.market_quotes
                 latest_record = hist_data.iloc[-1] if not hist_data.empty else None
 
@@ -1089,64 +1107,63 @@ class BaoStockSyncService:
 # APScheduler兼容的任务函数
 async def _check_task_running(job_id: str) -> Tuple[bool, Optional[str]]:
     """
-    检查任务是否已有实例在运行
-    
+    检查任务是否已有实例在运行（复用全局同步 Mongo 连接，按 updated_at 心跳判活）。
+
     Args:
         job_id: 任务ID
-        
+
     Returns:
         (is_running, running_instance_id): 是否在运行，运行实例的ID
     """
     try:
-        from pymongo import MongoClient
-        from app.core.config import settings
-        from datetime import timedelta
-        from app.services.scheduler_service import get_utc8_now
-        
-        sync_client = MongoClient(settings.MONGO_URI)
-        sync_db = sync_client[settings.MONGODB_DATABASE]
-        
-        # 🔥 查找是否有正在运行的实例（排除超时的任务）
-        # 如果任务运行超过30分钟，认为是僵尸任务，不阻止新任务执行
-        threshold_time = get_utc8_now() - timedelta(minutes=30)
-        
+        from app.core.database import get_mongo_db_sync
+        from app.services.scheduler_service import (
+            ACTIVE_EXECUTION_WINDOW_MINUTES,
+            build_active_running_query,
+            get_utc8_now,
+        )
+
+        sync_db = get_mongo_db_sync()
+        threshold_time = get_utc8_now() - timedelta(minutes=ACTIVE_EXECUTION_WINDOW_MINUTES)
+
         running_instance = sync_db.scheduler_executions.find_one(
-            {
-                "job_id": job_id, 
-                "status": "running",
-                "timestamp": {"$gte": threshold_time}  # 只考虑最近30分钟内的running任务
-            },
+            build_active_running_query({"job_id": job_id}),
             sort=[("timestamp", -1)]
         )
-        
-        # 🔥 如果找到超时的running任务，自动标记为失败
+
+        # 仅当无活动心跳任务时，将超过 30 分钟无 updated_at 心跳的僵尸任务标记失败
         if not running_instance:
-            # 检查是否有超时的running任务
             zombie_instance = sync_db.scheduler_executions.find_one(
                 {
                     "job_id": job_id,
                     "status": "running",
-                    "timestamp": {"$lt": threshold_time}
+                    "$or": [
+                        {"updated_at": {"$lt": threshold_time}},
+                        {
+                            "updated_at": {"$exists": False},
+                            "timestamp": {"$lt": threshold_time},
+                        },
+                    ],
                 },
                 sort=[("timestamp", -1)]
             )
-            
+
             if zombie_instance:
-                # 自动标记为失败
                 sync_db.scheduler_executions.update_one(
                     {"_id": zombie_instance["_id"]},
                     {
                         "$set": {
                             "status": "failed",
-                            "error_message": "任务执行超时或进程异常终止（自动检测）",
+                            "error_message": "任务执行超时或进程异常终止（超过30分钟无进度更新）",
                             "updated_at": get_utc8_now()
                         }
                     }
                 )
-                logger.warning(f"⚠️ 检测到超时任务并自动标记为失败: {job_id} (开始时间: {zombie_instance.get('timestamp')})")
-        
-        sync_client.close()
-        
+                logger.warning(
+                    f"⚠️ 检测到超时任务并自动标记为失败: {job_id} "
+                    f"(开始时间: {zombie_instance.get('timestamp')}, 最后心跳: {zombie_instance.get('updated_at')})"
+                )
+
         if running_instance:
             return True, str(running_instance["_id"])
         return False, None

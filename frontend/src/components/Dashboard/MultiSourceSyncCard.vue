@@ -26,11 +26,11 @@
         <div class="sync-status-section">
           <div class="status-display">
             <el-tag 
-              :type="getStatusType(syncStatus?.status)"
+              :type="getSyncStatusTagType(syncStatus?.status, syncStatus?.degraded)"
               size="large"
               class="status-tag"
             >
-              {{ getStatusText(syncStatus?.status) }}
+              {{ getSyncStatusLabel(syncStatus?.status, syncStatus?.degraded) }}
             </el-tag>
             
             <div v-if="syncStatus?.status === 'running'" class="progress-display">
@@ -131,6 +131,10 @@ import {
   type SyncStatus, 
   type DataSourceStatus 
 } from '@/api/sync'
+import {
+  getSyncStatusLabel,
+  getSyncStatusTagType
+} from '@/utils/syncPresentation'
 
 // 路由
 const router = useRouter()
@@ -233,34 +237,6 @@ const stopStatusPolling = () => {
     clearInterval(refreshTimer.value)
     refreshTimer.value = null
   }
-}
-
-// 获取状态类型
-const getStatusType = (status?: SyncStatus['status'] | string): 'success' | 'info' | 'warning' | 'danger' => {
-  const typeMap: Record<string, 'success' | 'info' | 'warning' | 'danger'> = {
-    idle: 'info',
-    queued: 'warning',
-    running: 'warning',
-    success: 'success',
-    success_with_errors: 'warning',
-    failed: 'danger',
-    never_run: 'info'
-  }
-  return typeMap[status ?? 'never_run'] ?? 'info'
-}
-
-// 获取状态文本
-const getStatusText = (status?: SyncStatus['status'] | string) => {
-  const textMap: Record<string, string> = {
-    idle: '空闲',
-    queued: '后台启动中',
-    running: '运行中',
-    success: '成功',
-    success_with_errors: '部分成功',
-    failed: '失败',
-    never_run: '未运行'
-  }
-  return textMap[status ?? 'never_run'] ?? '未知'
 }
 
 // 获取进度百分比

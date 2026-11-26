@@ -1218,6 +1218,12 @@ class AKShareSyncService:
             # 4. 批量处理
             processed_count = start_index  # 🔥 从恢复位置开始计数
             was_cancelled = False  # 🔥 标记是否因取消而停止
+            # 单次同步会话共享东财历史熔断状态（UTC epoch + 剩余 TTL），跨批次透传避免反复交熔断学费。
+            session_circuit: Dict[str, Any] = {
+                "failures": 0,
+                "remaining_seconds": 0.0,
+                "retry_after_epoch": 0.0,
+            }
             
             for i in range(0, len(symbols), self.batch_size):
                 # 🔥 检查任务是否应该停止
@@ -1246,7 +1252,8 @@ class AKShareSyncService:
                 batch_stats = await self._process_historical_batch(
                     batch, start_date, end_date, period, incremental, job_id,
                     processed_count=processed_count,  # 🔥 传递当前已处理数量
-                    original_total_symbols=original_total_symbols  # 🔥 传递总数量
+                    original_total_symbols=original_total_symbols,  # 🔥 传递总数量
+                    circuit_state=session_circuit,
                 )
 
                 # 更新统计
@@ -1528,7 +1535,8 @@ class AKShareSyncService:
         incremental: bool = False,
         job_id: str = None,
         processed_count: int = 0,  # 🔥 当前已处理数量
-        original_total_symbols: int = 0  # 🔥 总股票数量
+        original_total_symbols: int = 0,  # 🔥 总股票数量
+        circuit_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """处理历史数据批次"""
         batch_stats = {
@@ -1582,7 +1590,19 @@ class AKShareSyncService:
                 self.historical_service.collection = self.db.stock_daily_quotes
                 await self.historical_service._ensure_indexes()
 
-            from tradingagents.utils.bounded_data_fetch import fetch_async
+            from tradingagents.utils.bounded_data_fetch import (
+                DataFetchNetworkError,
+                fetch_async,
+                merge_circuit_state,
+            )
+            import time as _time
+
+            if circuit_state is None:
+                circuit_state = {
+                    "failures": 0,
+                    "remaining_seconds": 0.0,
+                    "retry_after_epoch": 0.0,
+                }
 
             codes = [item[0] for item in targets]
             start_map = dict(targets)
@@ -1599,18 +1619,32 @@ class AKShareSyncService:
 
             async def _fetch_codes(sub_codes, timeout_seconds):
                 sub_start = min(start_map[c] for c in sub_codes)
+                now_wall = _time.time()
+                retry_after_epoch = float(circuit_state.get("retry_after_epoch", 0.0) or 0.0)
+                circuit_payload = {
+                    "failures": int(circuit_state.get("failures", 0) or 0),
+                    "retry_after_epoch": retry_after_epoch,
+                    "remaining_seconds": max(0.0, retry_after_epoch - now_wall) if retry_after_epoch > now_wall else 0.0,
+                }
                 try:
-                    sub_frames, fetch_errors, _circuit = await fetch_async(
+                    sub_frames, fetch_errors, returned_circuit = await fetch_async(
                         "akshare_history_batch",
                         {
                             "codes": sub_codes,
                             "start_date": sub_start,
                             "end_date": end_date,
                             "period": period,
+                            "circuit": circuit_payload,
                         },
                         timeout=timeout_seconds,
                     )
+                    if isinstance(returned_circuit, dict):
+                        circuit_state.update(merge_circuit_state(circuit_state, returned_circuit))
                     return sub_frames or {}, fetch_errors or {}, None
+                except DataFetchNetworkError as exc:
+                    if isinstance(getattr(exc, "circuit", None), dict):
+                        circuit_state.update(merge_circuit_state(circuit_state, exc.circuit))
+                    return {}, {}, exc
                 except Exception as exc:
                     return {}, {}, exc
 
@@ -1686,7 +1720,9 @@ class AKShareSyncService:
                 batch_stats["errors"].append({
                     "code": symbol,
                     "error": reason,
-                    "context": "_process_historical_batch"
+                    "error_category": "retryable_error",
+                    "is_retryable": True,
+                    "context": "_process_historical_batch",
                 })
 
             for symbol in codes:
@@ -1710,7 +1746,9 @@ class AKShareSyncService:
                         batch_stats["errors"].append({
                             "code": symbol,
                             "error": f"落库失败: {type(exc).__name__}: {exc}",
-                            "context": "_process_historical_batch"
+                            "error_category": "retryable_error",
+                            "is_retryable": True,
+                            "context": "_process_historical_batch",
                         })
                 else:
                     # 接口正常返回空，与网络失败分开统计
@@ -2309,7 +2347,7 @@ class AKShareSyncService:
 
     async def _should_stop(self, job_id: str) -> bool:
         """
-        检查任务是否应该停止
+        检查任务是否应该停止（复用全局同步 Mongo 连接，避免每批新建 MongoClient）。
 
         Args:
             job_id: 任务ID
@@ -2318,43 +2356,43 @@ class AKShareSyncService:
             是否应该停止
         """
         try:
-            # 🔥 使用同步 MongoDB 客户端查询（避免事件循环关闭后的错误）
-            from pymongo import MongoClient
-            from app.core.config import settings
+            from app.core.database import get_mongo_db_sync
+            from app.services.scheduler_service import build_active_running_query
 
-            sync_client = MongoClient(settings.MONGO_URI)
-            sync_db = sync_client[settings.MONGODB_DATABASE]
+            sync_db = get_mongo_db_sync()
 
-            try:
-                # 🔥 查询执行记录，检查 cancel_requested 标记和任务状态
-                # 不仅检查 running 状态，也检查 failed/cancelled/suspended 状态
-                # 优先检查活动执行，避免较新的跳过记录遮蔽旧任务的取消请求。
+            # 优先按 updated_at 心跳检查活动执行，避免较新的跳过记录遮蔽旧任务的取消请求。
+            active_query = build_active_running_query({"job_id": job_id})
+            active_query["status"] = {"$in": ["running", "cancelling"]}
+            execution = sync_db.scheduler_executions.find_one(
+                active_query,
+                sort=[("timestamp", -1)]
+            )
+            if execution is None:
                 execution = sync_db.scheduler_executions.find_one(
                     {"job_id": job_id, "status": {"$in": ["running", "cancelling"]}},
                     sort=[("timestamp", -1)]
                 )
-                if execution is None:
-                    execution = sync_db.scheduler_executions.find_one(
-                        {"job_id": job_id}, sort=[("timestamp", -1)]
-                    )
+            if execution is None:
+                execution = sync_db.scheduler_executions.find_one(
+                    {"job_id": job_id}, sort=[("timestamp", -1)]
+                )
 
-                if not execution:
-                    return False
-
-                # 检查取消请求标记
-                if execution.get("cancel_requested"):
-                    logger.info(f"🛑 任务 {job_id} 收到取消请求，应停止执行")
-                    return True
-
-                # 🔥 检查任务状态：如果任务已被标记为失败、取消或挂起，也应该停止
-                status = execution.get("status")
-                if status in ["failed", "cancelled", "suspended"]:
-                    logger.info(f"🛑 任务 {job_id} 状态为 {status}，应停止执行")
-                    return True
-
+            if not execution:
                 return False
-            finally:
-                sync_client.close()
+
+            # 检查取消请求标记
+            if execution.get("cancel_requested"):
+                logger.info(f"🛑 任务 {job_id} 收到取消请求，应停止执行")
+                return True
+
+            # 🔥 检查任务状态：如果任务已被标记为取消中、失败、取消或挂起，也应该停止
+            status = execution.get("status")
+            if status in ["cancelling", "failed", "cancelled", "suspended"]:
+                logger.info(f"🛑 任务 {job_id} 状态为 {status}，应停止执行")
+                return True
+
+            return False
 
         except Exception as e:
             logger.error(f"❌ 检查任务停止标记失败: {e}")
@@ -2453,64 +2491,64 @@ async def get_akshare_sync_service() -> AKShareSyncService:
 
 async def _check_task_running(job_id: str) -> Tuple[bool, Optional[str]]:
     """
-    检查任务是否已有实例在运行
-    
+    检查任务是否已有实例在运行（复用全局同步 Mongo 连接，按 updated_at 心跳判活）。
+
     Args:
         job_id: 任务ID
-        
+
     Returns:
         (is_running, running_instance_id): 是否在运行，运行实例的ID
     """
     try:
-        from pymongo import MongoClient
-        from app.core.config import settings
+        from app.core.database import get_mongo_db_sync
         from datetime import timedelta
-        from app.services.scheduler_service import get_utc8_now
-        
-        sync_client = MongoClient(settings.MONGO_URI)
-        sync_db = sync_client[settings.MONGODB_DATABASE]
-        
-        # 🔥 查找是否有正在运行的实例（排除超时的任务）
-        # 如果任务运行超过30分钟，认为是僵尸任务，不阻止新任务执行
-        threshold_time = get_utc8_now() - timedelta(minutes=30)
-        
+        from app.services.scheduler_service import (
+            ACTIVE_EXECUTION_WINDOW_MINUTES,
+            build_active_running_query,
+            get_utc8_now,
+        )
+
+        sync_db = get_mongo_db_sync()
+        threshold_time = get_utc8_now() - timedelta(minutes=ACTIVE_EXECUTION_WINDOW_MINUTES)
+
         running_instance = sync_db.scheduler_executions.find_one(
-            {
-                "job_id": job_id, 
-                "status": "running",
-                "timestamp": {"$gte": threshold_time}  # 只考虑最近30分钟内的running任务
-            },
+            build_active_running_query({"job_id": job_id}),
             sort=[("timestamp", -1)]
         )
-        
-        # 🔥 如果找到超时的running任务，自动标记为失败
+
+        # 仅当无活动心跳实例时，将超过 30 分钟无 updated_at 心跳的僵尸任务标记为失败
         if not running_instance:
-            # 检查是否有超时的running任务
             zombie_instance = sync_db.scheduler_executions.find_one(
                 {
                     "job_id": job_id,
                     "status": "running",
-                    "timestamp": {"$lt": threshold_time}
+                    "$or": [
+                        {"updated_at": {"$lt": threshold_time}},
+                        {
+                            "updated_at": {"$exists": False},
+                            "timestamp": {"$lt": threshold_time},
+                        },
+                    ],
                 },
                 sort=[("timestamp", -1)]
             )
-            
+
             if zombie_instance:
-                # 自动标记为失败
                 sync_db.scheduler_executions.update_one(
                     {"_id": zombie_instance["_id"]},
                     {
                         "$set": {
                             "status": "failed",
-                            "error_message": "任务执行超时或进程异常终止（自动检测）",
+                            "error_message": "任务执行超时或进程异常终止（超过30分钟无进度更新）",
                             "updated_at": get_utc8_now()
                         }
                     }
                 )
-                logger.warning(f"⚠️ 检测到超时任务并自动标记为失败: {job_id} (开始时间: {zombie_instance.get('timestamp')})")
-        
-        sync_client.close()
-        
+                logger.warning(
+                    f"⚠️ 检测到超时任务并自动标记为失败: {job_id} "
+                    f"(开始时间: {zombie_instance.get('timestamp')}, 最后心跳: {zombie_instance.get('updated_at')})"
+                )
+
         if running_instance:
             return True, str(running_instance["_id"])
         return False, None

@@ -437,50 +437,50 @@ class UnifiedThreadPoolSyncService:
     
     async def _should_stop(self, job_id: str) -> bool:
         """
-        检查任务是否应该停止
-        
+        检查任务是否应该停止（复用全局同步 Mongo 连接，按 updated_at 心跳判活）。
+
         Args:
             job_id: 任务ID
-            
+
         Returns:
             是否应该停止
         """
         try:
             from app.core.database import get_mongo_db_sync
-            from app.core.config import settings
-            from pymongo import MongoClient
-            
-            # 🔥 使用同步客户端查询（避免事件循环冲突）
-            sync_client = MongoClient(settings.MONGO_URI)
-            sync_db = sync_client[settings.MONGODB_DATABASE]
-            
-            try:
-                # 只检查当前运行中的执行记录，避免历史 suspended 记录误伤新任务。
+            from app.services.scheduler_service import build_active_running_query
+
+            sync_db = get_mongo_db_sync()
+
+            active_query = build_active_running_query({"job_id": job_id})
+            active_query["status"] = {"$in": ["running", "cancelling"]}
+            execution = sync_db.scheduler_executions.find_one(
+                active_query,
+                sort=[("timestamp", -1)]
+            )
+            if not execution:
                 execution = sync_db.scheduler_executions.find_one(
-                    {"job_id": job_id, "status": "running"},
+                    {"job_id": job_id, "status": {"$in": ["running", "cancelling"]}},
                     sort=[("timestamp", -1)]
                 )
 
-                if not execution:
-                    return False
-
-                if execution.get("cancel_requested"):
-                    logger.info(f"🛑 任务 {job_id} 收到取消请求，应停止执行")
-                    return True
-
-                status = execution.get("status")
-                if status in ["failed", "cancelled"]:
-                    logger.info(f"🛑 任务 {job_id} 状态为 {status}，应停止执行")
-                    return True
-
+            if not execution:
                 return False
-            finally:
-                sync_client.close()
-                
+
+            if execution.get("cancel_requested"):
+                logger.info(f"🛑 任务 {job_id} 收到取消请求，应停止执行")
+                return True
+
+            status = execution.get("status")
+            if status in ["cancelling", "failed", "cancelled", "suspended"]:
+                logger.info(f"🛑 任务 {job_id} 状态为 {status}，应停止执行")
+                return True
+
+            return False
+
         except Exception as e:
             logger.error(f"❌ 检查任务停止标记失败: {e}")
             return False
-    
+
     def shutdown(self, timeout: float = 30.0):
         """
         优雅关闭线程池
@@ -496,22 +496,25 @@ class UnifiedThreadPoolSyncService:
         # 🔥 将所有活跃任务在数据库中标记为 suspended（挂起）
         # 注意：标记为 suspended 而不是 cancelled，这样重启后可以恢复执行
         try:
-            from pymongo import MongoClient
-            from app.core.config import settings
-            from app.services.scheduler_service import get_utc8_now
+            from app.core.database import get_mongo_db_sync
+            from app.services.scheduler_service import build_active_running_query, get_utc8_now
 
             if self._active_tasks:
                 logger.info(f"🔄 将 {len(self._active_tasks)} 个活跃任务标记为 suspended（挂起）...")
-                sync_client = MongoClient(settings.MONGO_URI)
-                sync_db = sync_client[settings.MONGODB_DATABASE]
+                sync_db = get_mongo_db_sync()
 
                 for job_id in self._active_tasks.keys():
                     try:
-                        # 🔥 先查询当前任务的进度信息
+                        # 🔥 先查询当前活跃任务的进度信息
                         current_task = sync_db.scheduler_executions.find_one(
-                            {"job_id": job_id, "status": "running"},
+                            build_active_running_query({"job_id": job_id}),
                             sort=[("timestamp", -1)]
                         )
+                        if not current_task:
+                            current_task = sync_db.scheduler_executions.find_one(
+                                {"job_id": job_id, "status": "running"},
+                                sort=[("timestamp", -1)]
+                            )
 
                         if current_task:
                             # 🔥 更新任务状态为 suspended（挂起），保留进度信息
@@ -560,8 +563,6 @@ class UnifiedThreadPoolSyncService:
 
                     except Exception as e:
                         logger.warning(f"⚠️ 标记任务 {job_id} 为 suspended 失败: {e}")
-
-                sync_client.close()
         except Exception as e:
             logger.warning(f"⚠️ 标记活跃任务为 suspended 失败: {e}")
 

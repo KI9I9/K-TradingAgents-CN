@@ -30,6 +30,7 @@
         <el-col :span="4">
           <el-select v-model="marketFilter" placeholder="市场筛选" clearable @change="handleMarketChange">
             <el-option label="A股" value="A股" />
+            <el-option label="ETF" value="ETF" />
           </el-select>
         </el-col>
         
@@ -83,17 +84,43 @@
       >
         <el-table-column type="selection" width="55" :selectable="isRowSelectable" />
         
-        <el-table-column prop="title" label="报告标题" min-width="200">
+        <el-table-column prop="title" label="报告标题" min-width="190">
           <template #default="{ row }">
             <div class="report-title">
               <el-link type="primary" @click="viewReport(row)">
-                {{ row.stock_code }} - {{ row.stock_name }}
+                {{ row.stock_code }} - {{ row.stock_name || row.stock_code }}
               </el-link>
             </div>
           </template>
         </el-table-column>
+
+        <el-table-column label="市场" width="84" align="center">
+          <template #default="{ row }">
+            <el-tag
+              :type="getDisplayMarket(row) === 'ETF' ? 'warning' : 'primary'"
+              size="small"
+              effect="plain"
+            >
+              {{ getDisplayMarket(row) }}
+            </el-tag>
+          </template>
+        </el-table-column>
+
+        <el-table-column prop="summary" label="核心结论" min-width="220">
+          <template #default="{ row }">
+            <el-tooltip
+              v-if="row.summary"
+              :content="row.summary"
+              placement="top"
+              :show-after="250"
+            >
+              <div class="summary-ellipsis">{{ row.summary }}</div>
+            </el-tooltip>
+            <span v-else class="text-gray">-</span>
+          </template>
+        </el-table-column>
         
-        <el-table-column prop="type" label="报告类型" width="120">
+        <el-table-column prop="type" label="报告类型" width="110">
           <template #default="{ row }">
             <el-tag :type="getTypeColor(row.type)">
               {{ getTypeText(row.type) }}
@@ -101,7 +128,7 @@
           </template>
         </el-table-column>
         
-        <el-table-column prop="format" label="格式" width="100">
+        <el-table-column prop="format" label="格式" width="90">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">
               {{ row.format.toUpperCase() }}
@@ -109,7 +136,7 @@
           </template>
         </el-table-column>
         
-        <el-table-column prop="status" label="状态" width="100">
+        <el-table-column prop="status" label="状态" width="96">
           <template #default="{ row }">
             <el-tag :type="getStatusType(row.status)">
               {{ getStatusText(row.status) }}
@@ -117,7 +144,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="model_info" label="分析模型" width="180">
+        <el-table-column prop="model_info" label="分析模型" width="160">
           <template #default="{ row }">
             <el-tag v-if="row.model_info && row.model_info !== 'Unknown'" type="info" size="small">
               {{ row.model_info }}
@@ -126,7 +153,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="research_depth" label="分析深度" width="100" align="center">
+        <el-table-column prop="research_depth" label="分析深度" width="96" align="center">
           <template #default="{ row }">
             <el-tooltip v-if="row.research_depth" :content="getResearchDepthDescription(row.research_depth)" placement="top">
               <el-tag type="warning" size="small" style="cursor: help;">
@@ -137,23 +164,29 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="created_at" label="创建时间" width="180">
+        <el-table-column prop="created_at" label="创建时间" width="168">
           <template #default="{ row }">
             {{ formatTime(row.created_at) }}
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="250" fixed="right">
+        <el-table-column label="操作" width="330" fixed="right">
           <template #default="{ row }">
-            <el-button type="text" size="small" @click="viewReport(row)">
+            <el-button type="primary" link size="small" @click="viewReport(row)">
               查看
+            </el-button>
+            <el-button type="success" link size="small" @click="orderFromReport(row)">
+              模拟下单
+            </el-button>
+            <el-button type="primary" link size="small" @click="reanalyzeReport(row)">
+              重新分析
             </el-button>
             <el-dropdown
               v-if="row.status === 'completed'"
               trigger="click"
-              @command="(format) => downloadReport(row, format)"
+              @command="(format: string) => downloadReport(row, format)"
             >
-              <el-button type="text" size="small">
+              <el-button type="primary" link size="small">
                 下载 <el-icon class="el-icon--right"><arrow-down /></el-icon>
               </el-button>
               <template #dropdown>
@@ -174,10 +207,10 @@
               </template>
             </el-dropdown>
             <el-button
-              type="text"
+              type="danger"
+              link
               size="small"
               @click="deleteReport(row)"
-              style="color: var(--el-color-danger)"
             >
               删除
             </el-button>
@@ -221,14 +254,19 @@ import {
   ArrowDown
 } from '@element-plus/icons-vue'
 import { ApiClient } from '@/api/request'
+import { goPaperOrder, goSingleAnalysis, resolveAnalysisMarket } from '@/utils/navigation'
 
 type ElTagType = 'primary' | 'success' | 'info' | 'warning' | 'danger'
 
 interface ReportListItem {
   id: string | number
+  analysis_id?: string | number
+  task_id?: string
   title?: string
   stock_code: string
   stock_name?: string
+  market_type?: string
+  summary?: string
   analysis_date?: string
   type: string
   format: string
@@ -283,7 +321,7 @@ const fetchReports = async () => {
 
     if (result.success) {
       reports.value = Array.isArray(result.data?.reports) ? result.data.reports as ReportListItem[] : []
-      totalReports.value = result.data.total
+      totalReports.value = Number(result.data?.total ?? 0)
     } else {
       throw new Error(result.message || '获取报告列表失败')
     }
@@ -344,6 +382,29 @@ const tableRef = ref<{
 const viewReport = (report: ReportListItem) => {
   // 跳转到报告详情页面
   router.push(`/reports/view/${report.id}`)
+}
+
+const getDisplayMarket = (report: ReportListItem) => {
+  return resolveAnalysisMarket(report.stock_code, report.market_type)
+}
+
+const orderFromReport = (report: ReportListItem) => {
+  const analysisId = [report.analysis_id, report.task_id, report.id]
+    .map((v) => String(v ?? '').trim())
+    .find((v) => v && v.toLowerCase() !== 'unknown') || ''
+  goPaperOrder(router, {
+    code: report.stock_code,
+    market: getDisplayMarket(report),
+    analysisId,
+    side: 'buy'
+  })
+}
+
+const reanalyzeReport = (report: ReportListItem) => {
+  goSingleAnalysis(router, {
+    code: report.stock_code,
+    market: getDisplayMarket(report)
+  })
 }
 
 const downloadReport = async (report: ReportListItem, format: string = 'markdown') => {
@@ -429,7 +490,7 @@ const getFileExtension = (format: string): string => {
 const deleteReport = async (report: ReportListItem) => {
   try {
     await ElMessageBox.confirm(
-      `确定要删除报告 "${report.title}" 吗？`,
+      `确定要删除报告 "${report.title || report.stock_code}" 吗？`,
       '确认删除',
       {
         confirmButtonText: '确定',
@@ -448,7 +509,7 @@ const deleteReport = async (report: ReportListItem) => {
       throw new Error(result.message || '删除失败')
     }
   } catch (error: unknown) {
-    if (!(error instanceof Error && error.message === 'cancel')) {
+    if (error !== 'cancel' && error !== 'close' && !(error instanceof Error && error.message === 'cancel')) {
       console.error('删除报告失败:', error)
       ElMessage.error('删除报告失败')
     }
@@ -613,6 +674,18 @@ onMounted(() => {
         color: var(--el-text-color-placeholder);
         margin-top: 2px;
       }
+    }
+
+    .summary-ellipsis {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.45;
+      font-size: 13px;
+      color: var(--el-text-color-regular);
+      cursor: help;
     }
 
     .pagination-wrapper {

@@ -2,6 +2,7 @@
 股票关注列表服务
 """
 
+import asyncio
 import logging
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -9,11 +10,76 @@ from bson import ObjectId
 
 from app.core.database import get_mongo_db
 from app.models.user import FavoriteStock
+from tradingagents.utils.stock_utils import (
+    StockUtils,
+    StockMarket,
+    SecurityType,
+    ETF_SH_PREFIXES,
+    ETF_SZ_PREFIXES,
+)
 # 已移除在线行情补齐功能，只从数据库读取数据
 # 用户可以通过"同步实时行情"按钮来更新数据
 # from app.services.quotes_service import get_quotes_service
 
 logger = logging.getLogger("webapi")
+
+
+def _normalize_quote_date(value: Any) -> Optional[str]:
+    """将 trade_date / updated_at 标准化为 YYYY-MM-DD 字符串。"""
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if len(text) >= 10:
+        return text[:10].replace("/", "-")
+    return text
+
+
+def _resolve_etf_exchange(code: str) -> str:
+    """根据统一 ETF 前缀识别交易所（含 56/58 上交所、18 深交所）。"""
+    norm = StockUtils.normalize_symbol(code)
+    if norm.startswith(ETF_SH_PREFIXES):
+        return "上海证券交易所"
+    if norm.startswith(ETF_SZ_PREFIXES):
+        return "深圳证券交易所"
+    if norm.startswith(("89",)):
+        return "北京证券交易所"
+    return "-"
+
+
+def _extract_quote_metrics(latest_doc: Dict[str, Any], prev_doc: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """从行情/日线文档中提取现价、涨跌幅、成交量与行情日期。"""
+    close_val = latest_doc.get("close")
+    if close_val is None:
+        close_val = latest_doc.get("price")
+
+    pct_val = latest_doc.get("pct_chg")
+    if pct_val is None:
+        pct_val = latest_doc.get("change_percent")
+    if pct_val is None and close_val is not None:
+        pre_close = latest_doc.get("pre_close")
+        if pre_close is None and prev_doc is not None:
+            pre_close = prev_doc.get("close")
+        try:
+            if pre_close is not None and float(pre_close) > 0:
+                pct_val = round((float(close_val) - float(pre_close)) / float(pre_close) * 100, 2)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pct_val = None
+
+    quote_date = _normalize_quote_date(
+        latest_doc.get("trade_date") or latest_doc.get("quote_date") or latest_doc.get("updated_at")
+    )
+    return {
+        "current_price": close_val,
+        "change_percent": pct_val,
+        "volume": latest_doc.get("volume"),
+        "quote_date": quote_date,
+    }
 
 
 class FavoritesService:
@@ -79,10 +145,17 @@ class FavoritesService:
         added_at = favorite.get("added_at")
         if isinstance(added_at, datetime):
             added_at = added_at.isoformat()
+        raw_code = favorite.get("stock_code")
+        norm_code = StockUtils.normalize_symbol(raw_code) if raw_code else ""
+        is_etf = (
+            str(favorite.get("market") or "").strip().upper() == "ETF"
+            or StockUtils.identify_security_type(norm_code) == SecurityType.FUND
+        )
         return {
-            "stock_code": favorite.get("stock_code"),
+            "stock_code": raw_code,
             "stock_name": favorite.get("stock_name"),
             "market": favorite.get("market", "A股"),
+            "security_type": "ETF" if is_etf else "STOCK",
             "added_at": added_at,
             "tags": favorite.get("tags", []),
             "notes": favorite.get("notes", ""),
@@ -93,7 +166,66 @@ class FavoritesService:
             "current_price": None,
             "change_percent": None,
             "volume": None,
+            "quote_date": None,
         }
+
+    async def _fetch_latest_daily_quotes(
+        self,
+        db: Any,
+        collection_name: str,
+        codes: List[str],
+        *,
+        daily_period_only: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+        """按标的从日线集合批量拉取最新一条日线（必要时读前一日收盘价计算涨跌幅）。"""
+        unique_codes = list(dict.fromkeys([c for c in codes if c]))
+        if not unique_codes:
+            return {}
+
+        coll = db[collection_name]
+
+        async def _load_one(norm_code: str) -> tuple[str, Optional[Dict[str, Any]]]:
+            query: Dict[str, Any] = {"$or": [{"code": norm_code}, {"symbol": norm_code}]}
+            if daily_period_only:
+                query = {
+                    "$and": [
+                        query,
+                        {"$or": [{"period": "daily"}, {"period": {"$exists": False}}, {"period": None}]},
+                    ]
+                }
+            projection = {
+                "code": 1,
+                "symbol": 1,
+                "close": 1,
+                "pre_close": 1,
+                "pct_chg": 1,
+                "change_percent": 1,
+                "volume": 1,
+                "amount": 1,
+                "trade_date": 1,
+                "updated_at": 1,
+                "_id": 0,
+            }
+            try:
+                cursor = coll.find(query, projection).sort("trade_date", -1).limit(5)
+                docs = await cursor.to_list(length=5)
+                if not docs:
+                    return norm_code, None
+                latest = docs[0]
+                latest_date = _normalize_quote_date(latest.get("trade_date"))
+                prev = None
+                for candidate in docs[1:]:
+                    cand_date = _normalize_quote_date(candidate.get("trade_date"))
+                    if not latest_date or cand_date != latest_date:
+                        prev = candidate
+                        break
+                return norm_code, _extract_quote_metrics(latest, prev)
+            except Exception as exc:
+                logger.warning(f"⚠️ 从 {collection_name} 读取 {norm_code} 最新日线失败: {exc}")
+                return norm_code, None
+
+        pairs = await asyncio.gather(*(_load_one(code) for code in unique_codes))
+        return {code: metrics for code, metrics in pairs if metrics is not None}
     async def update_alert_gain_price(self, user_id: str, stock_code: str, gain_price: Optional[float]) -> bool:
         """设置或清除止盈提醒价格"""
         db = await self._get_db()
@@ -166,155 +298,338 @@ class FavoritesService:
         # 先格式化基础字段
         items = [self._format_favorite(fav) for fav in favorites]
 
-        # 批量获取股票基础信息（板块等）
+        # 批量获取股票基础信息（板块、交易所等；支持多源降级与 ETF 识别）
         codes = [it.get("stock_code") for it in items if it.get("stock_code")]
-        if codes:
+        norm_codes = list(
+            dict.fromkeys(
+                [StockUtils.normalize_symbol(c) or str(c).strip() for c in codes if c]
+            )
+        )
+        if norm_codes:
             try:
                 # 🔥 获取数据源优先级配置
-                from app.core.unified_config import UnifiedConfigManager
-                config = UnifiedConfigManager()
-                data_source_configs = await config.get_data_source_configs_async()
+                enabled_sources: List[str] = []
+                try:
+                    from app.core.unified_config import UnifiedConfigManager
+                    config = UnifiedConfigManager()
+                    data_source_configs = await config.get_data_source_configs_async()
+                    enabled_sources = [
+                        ds.type.lower() for ds in data_source_configs
+                        if ds.enabled and ds.type.lower() in ["tushare", "multi_source", "akshare", "baostock"]
+                    ]
+                except Exception:
+                    enabled_sources = []
 
-                # 提取启用的数据源，按优先级排序
-                enabled_sources = [
-                    ds.type.lower() for ds in data_source_configs
-                    if ds.enabled and ds.type.lower() in ['tushare', 'akshare', 'baostock']
-                ]
+                source_priority: List[str] = []
+                for src in [*enabled_sources, "tushare", "multi_source", "akshare", "baostock"]:
+                    if src not in source_priority:
+                        source_priority.append(src)
+                priority_rank = {src: idx for idx, src in enumerate(source_priority)}
 
-                if not enabled_sources:
-                    enabled_sources = ['tushare', 'akshare', 'baostock']
-
-                preferred_source = enabled_sources[0] if enabled_sources else 'tushare'
-
-                # 从 stock_basic_info 获取板块信息（只查询优先级最高的数据源）
+                # 从 stock_basic_info 批量获取基础信息（按优先级降级，不再锁死单一 preferred_source）
                 basic_info_coll = db["stock_basic_info"]
+                basic_limit = max(len(norm_codes) * 5, 50)
                 cursor = basic_info_coll.find(
-                    {"code": {"$in": codes}, "source": preferred_source},  # 🔥 添加数据源筛选
-                    {"code": 1, "sse": 1, "market": 1, "_id": 0}
-                )
-                basic_docs = await cursor.to_list(length=None)
-                basic_map = {str(d.get("code")).zfill(6): d for d in (basic_docs or [])}
+                    {"$or": [{"code": {"$in": norm_codes}}, {"symbol": {"$in": norm_codes}}]},
+                    {"code": 1, "symbol": 1, "name": 1, "sse": 1, "market": 1, "source": 1, "_id": 0}
+                ).limit(basic_limit)
+                basic_docs = await cursor.to_list(length=basic_limit)
 
-                # 收集 stock_basic_info 中未命中的代码，稍后查 etf_basic_info
-                missing_codes = []
+                basic_ranked: Dict[str, tuple[int, Dict[str, Any]]] = {}
+                for doc in (basic_docs or []):
+                    raw_c = doc.get("code") or doc.get("symbol")
+                    if not raw_c:
+                        continue
+                    c_norm = StockUtils.normalize_symbol(str(raw_c)) or str(raw_c).strip()
+                    rank = priority_rank.get(str(doc.get("source") or "").strip().lower(), len(priority_rank) + 1)
+                    if c_norm not in basic_ranked or rank < basic_ranked[c_norm][0]:
+                        basic_ranked[c_norm] = (rank, doc)
+                basic_map = {k: v[1] for k, v in basic_ranked.items()}
+
+                # 收集 stock_basic_info 未命中或本身属于 ETF 的代码，查询 etf_basic_info
+                etf_lookup_codes: List[str] = []
                 for it in items:
-                    code = it.get("stock_code")
-                    basic = basic_map.get(code)
-                    if basic:
+                    c_norm = StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code") or "").strip()
+                    is_etf_code = (
+                        it.get("security_type") == "ETF"
+                        or StockUtils.identify_security_type(c_norm) == SecurityType.FUND
+                    )
+                    if is_etf_code or c_norm not in basic_map:
+                        etf_lookup_codes.append(c_norm)
+                etf_lookup_codes = list(dict.fromkeys([c for c in etf_lookup_codes if c]))
+
+                etf_set = set()
+                etf_name_map: Dict[str, Optional[str]] = {}
+                if etf_lookup_codes:
+                    etf_coll = db["etf_basic_info"]
+                    etf_limit = max(len(etf_lookup_codes) * 3, 30)
+                    etf_cursor = etf_coll.find(
+                        {"$or": [{"code": {"$in": etf_lookup_codes}}, {"symbol": {"$in": etf_lookup_codes}}]},
+                        {"code": 1, "symbol": 1, "name": 1, "fund_name": 1, "etf_name": 1, "_id": 0}
+                    ).limit(etf_limit)
+                    etf_docs = await etf_cursor.to_list(length=etf_limit)
+                    for d in (etf_docs or []):
+                        c_norm = StockUtils.normalize_symbol(d.get("code") or d.get("symbol"))
+                        if not c_norm:
+                            continue
+                        etf_set.add(c_norm)
+                        etf_name = d.get("name") or d.get("fund_name") or d.get("etf_name")
+                        if etf_name and c_norm not in etf_name_map:
+                            etf_name_map[c_norm] = etf_name
+
+                for it in items:
+                    raw_code = it.get("stock_code")
+                    c_norm = StockUtils.normalize_symbol(raw_code) or str(raw_code or "").strip()
+                    is_etf = (
+                        c_norm in etf_set
+                        or str(it.get("market") or "").strip().upper() == "ETF"
+                        or StockUtils.identify_security_type(c_norm) == SecurityType.FUND
+                    )
+                    if is_etf:
+                        it["security_type"] = "ETF"
+                        it["board"] = "ETF"
+                        it["exchange"] = _resolve_etf_exchange(c_norm)
+                        if not it.get("stock_name") or it["stock_name"] == raw_code:
+                            it["stock_name"] = etf_name_map.get(c_norm) or it.get("stock_name") or raw_code
+                    elif c_norm in basic_map:
+                        basic = basic_map[c_norm]
                         it["board"] = basic.get("market", "-")
                         it["exchange"] = basic.get("sse", "-")
+                        if (not it.get("stock_name") or it["stock_name"] == raw_code) and basic.get("name"):
+                            it["stock_name"] = basic.get("name")
                     else:
-                        missing_codes.append(code)
-
-                # 从 etf_basic_info 补充 ETF 的板块/交易所信息
-                if missing_codes:
-                    etf_coll = db["etf_basic_info"]
-                    etf_cursor = etf_coll.find(
-                        {"code": {"$in": missing_codes}},
-                        {"code": 1, "name": 1, "_id": 0}
-                    )
-                    etf_docs = await etf_cursor.to_list(length=None)
-                    etf_set = {str(d.get("code")).zfill(6) for d in (etf_docs or [])}
-                    etf_name_map = {
-                        str(d.get("code")).zfill(6): d.get("name")
-                        for d in (etf_docs or [])
-                    }
-
-                    for it in items:
-                        code = it.get("stock_code")
-                        if code in basic_map:
-                            continue
-                        if code in etf_set:
-                            it["board"] = "ETF"
-                            if code.startswith(("50", "51", "52")):
-                                it["exchange"] = "上海证券交易所"
-                            elif code.startswith(("15", "16")):
-                                it["exchange"] = "深圳证券交易所"
-                            else:
-                                it["exchange"] = "-"
-                            if not it.get("stock_name") or it["stock_name"] == code:
-                                it["stock_name"] = etf_name_map.get(code) or it.get("stock_name", code)
-                        else:
-                            it["board"] = "-"
-                            it["exchange"] = "-"
+                        it["board"] = "-"
+                        it["exchange"] = "-"
             except Exception as e:
-                # 查询失败时设置默认值
+                logger.warning(f"⚠️ 批量获取基础信息失败: {e}")
+                # 查询失败时设置默认值（仍尽量按前缀识别 ETF 交易所）
                 for it in items:
-                    it["board"] = "-"
-                    it["exchange"] = "-"
+                    c_norm = StockUtils.normalize_symbol(it.get("stock_code"))
+                    if StockUtils.identify_security_type(c_norm) == SecurityType.FUND:
+                        it["security_type"] = "ETF"
+                        it["board"] = "ETF"
+                        it["exchange"] = _resolve_etf_exchange(c_norm)
+                    else:
+                        it["board"] = "-"
+                        it["exchange"] = "-"
 
-        # 批量获取行情（按市场类型分别处理，避免不必要的接口调用）
+        # 批量获取行情（按市场/证券类型分别处理，ETF 查 etf_daily_quotes，A股 market_quotes → stock_daily_quotes 回退）
         if codes:
             try:
-                # 🔥 按市场类型分组
-                a_share_items = []  # A股
-                hk_items = []       # 港股
-                us_items = []       # 美股
+                etf_items: List[Dict[str, Any]] = []
+                a_share_items: List[Dict[str, Any]] = []
+                hk_items: List[Dict[str, Any]] = []
+                us_items: List[Dict[str, Any]] = []
                 
                 for it in items:
-                    market = it.get("market", "A股")
-                    if market == "港股":
+                    market = str(it.get("market") or "A股").strip()
+                    raw_code = it.get("stock_code") or ""
+                    c_norm = StockUtils.normalize_symbol(raw_code) or str(raw_code).strip()
+                    detected_market = StockUtils.identify_stock_market(raw_code)
+                    if market in ("港股", "HK") or detected_market == StockMarket.HONG_KONG:
                         hk_items.append(it)
-                    elif market == "美股":
+                    elif market in ("美股", "US") or detected_market == StockMarket.US:
                         us_items.append(it)
+                    elif (
+                        market.upper() == "ETF"
+                        or it.get("security_type") == "ETF"
+                        or it.get("board") == "ETF"
+                        or StockUtils.identify_security_type(c_norm) == SecurityType.FUND
+                    ):
+                        etf_items.append(it)
                     else:
                         a_share_items.append(it)
-                
-                # 1. 处理A股：优先使用入库的 market_quotes，30秒更新
+
+                # 1. 处理 ETF：从 etf_daily_quotes 最新日线回填现价/涨跌幅/quote_date（缺失时兼容回查 market_quotes）
+                if etf_items:
+                    etf_codes = [
+                        StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code")).strip()
+                        for it in etf_items
+                        if it.get("stock_code")
+                    ]
+                    if etf_codes:
+                        etf_quotes_map = await self._fetch_latest_daily_quotes(
+                            db, "etf_daily_quotes", etf_codes, daily_period_only=False
+                        )
+                        missing_etf_codes: List[str] = []
+                        for it in etf_items:
+                            c_norm = StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code") or "").strip()
+                            metrics = etf_quotes_map.get(c_norm)
+                            if metrics:
+                                it["current_price"] = metrics["current_price"]
+                                it["change_percent"] = metrics["change_percent"]
+                                if metrics["volume"] is not None:
+                                    it["volume"] = metrics["volume"]
+                                it["quote_date"] = metrics["quote_date"]
+                            else:
+                                missing_etf_codes.append(c_norm)
+
+                        if missing_etf_codes:
+                            try:
+                                mq_coll = db["market_quotes"]
+                                mq_limit = max(len(missing_etf_codes) * 2, 20)
+                                mq_docs = await mq_coll.find(
+                                    {"$or": [{"code": {"$in": missing_etf_codes}}, {"symbol": {"$in": missing_etf_codes}}]},
+                                    {"code": 1, "symbol": 1, "close": 1, "price": 1, "pct_chg": 1, "change_percent": 1, "volume": 1, "trade_date": 1, "updated_at": 1, "_id": 0}
+                                ).limit(mq_limit).to_list(length=mq_limit)
+                                mq_map = {
+                                    (StockUtils.normalize_symbol(d.get("code") or d.get("symbol")) or ""): _extract_quote_metrics(d)
+                                    for d in (mq_docs or [])
+                                }
+                                for it in etf_items:
+                                    if it.get("current_price") is not None:
+                                        continue
+                                    c_norm = StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code") or "").strip()
+                                    metrics = mq_map.get(c_norm)
+                                    if metrics:
+                                        it["current_price"] = metrics["current_price"]
+                                        it["change_percent"] = metrics["change_percent"]
+                                        if metrics["volume"] is not None:
+                                            it["volume"] = metrics["volume"]
+                                        it["quote_date"] = metrics["quote_date"]
+                            except Exception as e:
+                                logger.warning(f"⚠️ ETF 回查 market_quotes 失败: {e}")
+
+                # 2. 处理 A 股：优先 market_quotes，缺失或无价格时自动回退 stock_daily_quotes 最新日线
                 if a_share_items:
-                    a_share_codes = [it.get("stock_code") for it in a_share_items if it.get("stock_code")]
+                    a_share_codes = [
+                        StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code")).strip()
+                        for it in a_share_items
+                        if it.get("stock_code")
+                    ]
                     if a_share_codes:
+                        quotes_map: Dict[str, Dict[str, Any]] = {}
                         try:
                             coll = db["market_quotes"]
-                            cursor = coll.find({"code": {"$in": a_share_codes}}, {"code": 1, "close": 1, "pct_chg": 1, "amount": 1})
-                            docs = await cursor.to_list(length=None)
-                            quotes_map = {str(d.get("code")).zfill(6): d for d in (docs or [])}
-                            for it in a_share_items:
-                                code = it.get("stock_code")
-                                q = quotes_map.get(code)
-                                if q:
-                                    it["current_price"] = q.get("close")
-                                    it["change_percent"] = q.get("pct_chg")
-                                # 如果数据库中没有数据，保持 None（不调用在线 API）
-                                # 用户可以通过点击"同步实时行情"按钮来更新数据
+                            mq_limit = max(len(a_share_codes) * 2, 20)
+                            cursor = coll.find(
+                                {"$or": [{"code": {"$in": a_share_codes}}, {"symbol": {"$in": a_share_codes}}]},
+                                {"code": 1, "symbol": 1, "close": 1, "price": 1, "pct_chg": 1, "change_percent": 1, "volume": 1, "amount": 1, "trade_date": 1, "updated_at": 1, "_id": 0}
+                            ).limit(mq_limit)
+                            docs = await cursor.to_list(length=mq_limit)
+                            for d in (docs or []):
+                                c_norm = StockUtils.normalize_symbol(d.get("code") or d.get("symbol"))
+                                if c_norm:
+                                    quotes_map[c_norm] = _extract_quote_metrics(d)
                         except Exception as e:
-                            logger.warning(f"⚠️ 查询A股行情失败: {e}")
+                            logger.warning(f"⚠️ 查询A股 market_quotes 失败: {e}")
+
+                        fallback_codes: List[str] = []
+                        for it in a_share_items:
+                            c_norm = StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code") or "").strip()
+                            metrics = quotes_map.get(c_norm)
+                            if metrics and metrics.get("current_price") is not None:
+                                it["current_price"] = metrics["current_price"]
+                                it["change_percent"] = metrics["change_percent"]
+                                if metrics["volume"] is not None:
+                                    it["volume"] = metrics["volume"]
+                                it["quote_date"] = metrics["quote_date"]
+                            else:
+                                fallback_codes.append(c_norm)
+
+                        if fallback_codes:
+                            daily_map = await self._fetch_latest_daily_quotes(
+                                db, "stock_daily_quotes", fallback_codes, daily_period_only=True
+                            )
+                            for it in a_share_items:
+                                if it.get("current_price") is not None:
+                                    continue
+                                c_norm = StockUtils.normalize_symbol(it.get("stock_code")) or str(it.get("stock_code") or "").strip()
+                                metrics = daily_map.get(c_norm)
+                                if metrics:
+                                    it["current_price"] = metrics["current_price"]
+                                    it["change_percent"] = metrics["change_percent"]
+                                    if metrics["volume"] is not None:
+                                        it["volume"] = metrics["volume"]
+                                    it["quote_date"] = metrics["quote_date"]
                 
-                # 2. 处理港股：从 market_quotes_hk 查询
+                # 3. 处理港股：优先 market_quotes_hk，缺失回退 stock_daily_quotes_hk
                 if hk_items:
-                    hk_codes = [it.get("stock_code") for it in hk_items if it.get("stock_code")]
+                    hk_codes = [str(it.get("stock_code")).strip() for it in hk_items if it.get("stock_code")]
                     if hk_codes:
+                        hk_missing: List[str] = []
                         try:
                             coll = db["market_quotes_hk"]
-                            cursor = coll.find({"code": {"$in": hk_codes}}, {"code": 1, "close": 1, "pct_chg": 1, "amount": 1})
-                            docs = await cursor.to_list(length=None)
-                            quotes_map = {str(d.get("code")): d for d in (docs or [])}
+                            hk_limit = max(len(hk_codes) * 2, 20)
+                            cursor = coll.find(
+                                {"$or": [{"code": {"$in": hk_codes}}, {"symbol": {"$in": hk_codes}}]},
+                                {"code": 1, "symbol": 1, "close": 1, "price": 1, "pct_chg": 1, "change_percent": 1, "volume": 1, "amount": 1, "trade_date": 1, "updated_at": 1, "_id": 0}
+                            ).limit(hk_limit)
+                            docs = await cursor.to_list(length=hk_limit)
+                            quotes_map = {str(d.get("code") or d.get("symbol")): _extract_quote_metrics(d) for d in (docs or [])}
                             for it in hk_items:
-                                code = it.get("stock_code")
-                                q = quotes_map.get(code)
-                                if q:
-                                    it["current_price"] = q.get("close")
-                                    it["change_percent"] = q.get("pct_chg")
+                                code = str(it.get("stock_code")).strip()
+                                metrics = quotes_map.get(code)
+                                if metrics and metrics.get("current_price") is not None:
+                                    it["current_price"] = metrics["current_price"]
+                                    it["change_percent"] = metrics["change_percent"]
+                                    if metrics["volume"] is not None:
+                                        it["volume"] = metrics["volume"]
+                                    it["quote_date"] = metrics["quote_date"]
+                                else:
+                                    hk_missing.append(code)
                         except Exception as e:
                             logger.warning(f"⚠️ 查询港股行情失败: {e}")
+                            hk_missing = list(hk_codes)
+                        if hk_missing:
+                            hk_daily_map = await self._fetch_latest_daily_quotes(
+                                db, "stock_daily_quotes_hk", hk_missing, daily_period_only=False
+                            )
+                            for it in hk_items:
+                                if it.get("current_price") is not None:
+                                    continue
+                                code = str(it.get("stock_code")).strip()
+                                metrics = hk_daily_map.get(code)
+                                if metrics:
+                                    it["current_price"] = metrics["current_price"]
+                                    it["change_percent"] = metrics["change_percent"]
+                                    if metrics["volume"] is not None:
+                                        it["volume"] = metrics["volume"]
+                                    it["quote_date"] = metrics["quote_date"]
                 
-                # 3. 处理美股：从 market_quotes_us 查询
+                # 4. 处理美股：优先 market_quotes_us，缺失回退 stock_daily_quotes_us
                 if us_items:
-                    us_codes = [it.get("stock_code") for it in us_items if it.get("stock_code")]
+                    us_codes = [str(it.get("stock_code")).strip().upper() for it in us_items if it.get("stock_code")]
                     if us_codes:
+                        us_missing: List[str] = []
                         try:
                             coll = db["market_quotes_us"]
-                            cursor = coll.find({"code": {"$in": us_codes}}, {"code": 1, "close": 1, "pct_chg": 1, "amount": 1})
-                            docs = await cursor.to_list(length=None)
-                            quotes_map = {str(d.get("code")): d for d in (docs or [])}
+                            us_limit = max(len(us_codes) * 2, 20)
+                            cursor = coll.find(
+                                {"$or": [{"code": {"$in": us_codes}}, {"symbol": {"$in": us_codes}}]},
+                                {"code": 1, "symbol": 1, "close": 1, "price": 1, "pct_chg": 1, "change_percent": 1, "volume": 1, "amount": 1, "trade_date": 1, "updated_at": 1, "_id": 0}
+                            ).limit(us_limit)
+                            docs = await cursor.to_list(length=us_limit)
+                            quotes_map = {str(d.get("code") or d.get("symbol")).upper(): _extract_quote_metrics(d) for d in (docs or [])}
                             for it in us_items:
-                                code = it.get("stock_code")
-                                q = quotes_map.get(code)
-                                if q:
-                                    it["current_price"] = q.get("close")
-                                    it["change_percent"] = q.get("pct_chg")
+                                code = str(it.get("stock_code")).strip().upper()
+                                metrics = quotes_map.get(code)
+                                if metrics and metrics.get("current_price") is not None:
+                                    it["current_price"] = metrics["current_price"]
+                                    it["change_percent"] = metrics["change_percent"]
+                                    if metrics["volume"] is not None:
+                                        it["volume"] = metrics["volume"]
+                                    it["quote_date"] = metrics["quote_date"]
+                                else:
+                                    us_missing.append(code)
                         except Exception as e:
                             logger.warning(f"⚠️ 查询美股行情失败: {e}")
+                            us_missing = list(us_codes)
+                        if us_missing:
+                            us_daily_map = await self._fetch_latest_daily_quotes(
+                                db, "stock_daily_quotes_us", us_missing, daily_period_only=False
+                            )
+                            for it in us_items:
+                                if it.get("current_price") is not None:
+                                    continue
+                                code = str(it.get("stock_code")).strip().upper()
+                                metrics = us_daily_map.get(code)
+                                if metrics:
+                                    it["current_price"] = metrics["current_price"]
+                                    it["change_percent"] = metrics["change_percent"]
+                                    if metrics["volume"] is not None:
+                                        it["volume"] = metrics["volume"]
+                                    it["quote_date"] = metrics["quote_date"]
                             
             except Exception as e:
                 logger.warning(f"⚠️ 批量获取行情失败: {e}")

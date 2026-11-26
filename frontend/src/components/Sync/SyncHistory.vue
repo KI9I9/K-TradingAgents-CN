@@ -33,18 +33,18 @@
               v-for="(item, index) in historyList"
               :key="index"
               :timestamp="formatTime(item.finished_at || item.started_at)"
-              :type="getTimelineType(item.status)"
-              :icon="getTimelineIcon(item.status)"
+              :type="getTimelineType(item.status, item.degraded)"
+              :icon="getTimelineIcon(item.status, item.degraded)"
               placement="top"
             >
               <div class="history-item">
                 <div class="item-header">
                   <el-tag 
-                    :type="getStatusType(item.status)"
+                    :type="getSyncStatusTagType(item.status, item.degraded)"
                     size="small"
                     class="status-tag"
                   >
-                    {{ getStatusText(item.status) }}
+                    {{ getSyncStatusLabel(item.status, item.degraded) }}
                   </el-tag>
                   <span class="job-name">{{ item.job }}</span>
                 </div>
@@ -66,7 +66,7 @@
                       type="info"
                       class="source-tag"
                     >
-                      {{ source }}
+                      {{ formatSyncSourceLabel(source) }}
                     </el-tag>
                   </div>
                   
@@ -120,6 +120,11 @@ import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Clock, Refresh, SuccessFilled, CircleCloseFilled, Warning } from '@element-plus/icons-vue'
 import { getSyncHistory, type SyncStatus } from '@/api/sync'
+import {
+  formatSyncSourceLabel,
+  getSyncStatusLabel,
+  getSyncStatusTagType
+} from '@/utils/syncPresentation'
 
 // 响应式数据
 const loading = ref(false)
@@ -198,34 +203,9 @@ const refreshHistory = async () => {
   ElMessage.success('同步历史已刷新')
 }
 
-// 获取状态类型
-const getStatusType = (status: string): 'success' | 'warning' | 'info' | 'danger' => {
-  const typeMap: Record<string, 'success' | 'warning' | 'info' | 'danger'> = {
-    idle: 'info',
-    running: 'warning',
-    success: 'success',
-    success_with_errors: 'warning',
-    failed: 'danger',
-    never_run: 'info'
-  }
-  return typeMap[status] || 'info'
-}
-
-// 获取状态文本
-const getStatusText = (status: string) => {
-  const textMap: Record<string, string> = {
-    idle: '空闲',
-    running: '运行中',
-    success: '成功',
-    success_with_errors: '部分成功',
-    failed: '失败',
-    never_run: '未运行'
-  }
-  return textMap[status] || '未知'
-}
-
 // 获取时间线类型
-const getTimelineType = (status: string): 'primary' | 'success' | 'warning' | 'danger' | 'info' => {
+const getTimelineType = (status: string, degraded?: boolean): 'primary' | 'success' | 'warning' | 'danger' | 'info' => {
+  if (degraded && status !== 'failed') return 'warning'
   const typeMap: Record<string, 'primary' | 'success' | 'warning' | 'danger' | 'info'> = {
     success: 'success',
     success_with_errors: 'warning',
@@ -236,7 +216,8 @@ const getTimelineType = (status: string): 'primary' | 'success' | 'warning' | 'd
 }
 
 // 获取时间线图标
-const getTimelineIcon = (status: string) => {
+const getTimelineIcon = (status: string, degraded?: boolean) => {
+  if (degraded && status !== 'failed') return Warning
   const iconMap: Record<string, any> = {
     success: SuccessFilled,
     success_with_errors: Warning,
@@ -294,6 +275,11 @@ const getDuration = (startTime?: string, endTime?: string) => {
 // 组件挂载时获取数据
 onMounted(() => {
   fetchHistory()
+})
+
+defineExpose({
+  refreshHistory,
+  fetchHistory
 })
 </script>
 

@@ -43,6 +43,23 @@
           </div>
           
           <div class="action-section">
+            <el-button type="success" @click="orderFromReport">
+              <el-icon><TrendCharts /></el-icon>
+              基于本报告模拟下单
+            </el-button>
+            <el-button @click="openStockDetail">
+              <el-icon><View /></el-icon>
+              股票详情
+            </el-button>
+            <el-button
+              :type="isFavorite ? 'warning' : 'default'"
+              plain
+              :loading="favoriteLoading"
+              @click="toggleFavorite"
+            >
+              <el-icon><StarFilled v-if="isFavorite" /><Star v-else /></el-icon>
+              {{ isFavorite ? '已关注' : '加入关注' }}
+            </el-button>
             <el-dropdown trigger="click" @command="downloadReport">
               <el-button type="primary">
                 <el-icon><Download /></el-icon>
@@ -74,31 +91,31 @@
         </div>
       </el-card>
 
-      <!-- 风险提示 -->
-      <div class="risk-disclaimer">
-        <el-alert
-          type="warning"
-          :closable="false"
-          show-icon
-        >
-          <template #title>
-            <div class="disclaimer-content">
-              <el-icon class="disclaimer-icon"><WarningFilled /></el-icon>
-              <div class="disclaimer-text">
-                <p style="margin: 0 0 8px 0;"><strong>⚠️ 重要风险提示与免责声明</strong></p>
-                <ul style="margin: 0; padding-left: 20px; line-height: 1.8;">
-                  <li><strong>平台性质：</strong>本平台为AI辅助分析技术学习平台，专注于AI技术在证券与ETF分析领域的应用验证和技术学习。</li>
-                  <li><strong>分析目的：</strong>所有分析结论仅用于学习和验证AI辅助分析技术，不作为真实交易操盘指导或投资依据。</li>
-                  <li><strong>非投资建议：</strong>所有分析结果、评分、建议仅为技术验证参考，不构成任何买卖建议或投资决策依据。</li>
-                  <li><strong>数据局限性：</strong>分析基于历史数据和公开信息，可能存在延迟、不完整或不准确的情况，无法预测未来市场走势。</li>
-                  <li><strong>投资风险：</strong>股票与ETF投资均存在市场风险、流动性风险、政策风险等多种风险，可能导致本金损失。</li>
-                  <li><strong>独立决策：</strong>投资者应基于自身风险承受能力、投资目标和财务状况独立做出投资决策。</li>
-                  <li><strong>责任声明：</strong>使用本平台产生的任何投资决策及其后果由使用者自行承担，本平台不承担任何责任。</li>
-                </ul>
-              </div>
-            </div>
-          </template>
-        </el-alert>
+      <!-- 风险提示（紧凑单行可折叠） -->
+      <div class="risk-disclaimer-compact">
+        <div class="disclaimer-bar">
+          <div class="disclaimer-bar-left">
+            <el-icon class="disclaimer-icon"><WarningFilled /></el-icon>
+            <span>风险提示：本报告仅用于 AI 技术研究与学习验证，不构成任何投资建议或买卖依据，投资决策与风险请独立承担。</span>
+          </div>
+          <el-button
+            type="warning"
+            link
+            size="small"
+            @click="disclaimerExpanded = !disclaimerExpanded"
+          >
+            {{ disclaimerExpanded ? '收起详情' : '查看完整免责声明' }}
+          </el-button>
+        </div>
+        <ul v-if="disclaimerExpanded" class="disclaimer-detail-list">
+          <li><strong>平台性质：</strong>本平台为AI辅助分析技术学习平台，专注于AI技术在证券与ETF分析领域的应用验证和技术学习。</li>
+          <li><strong>分析目的：</strong>所有分析结论仅用于学习和验证AI辅助分析技术，不作为真实交易操盘指导或投资依据。</li>
+          <li><strong>非投资建议：</strong>所有分析结果、评分、建议仅为技术验证参考，不构成任何买卖建议或投资决策依据。</li>
+          <li><strong>数据局限性：</strong>分析基于历史数据和公开信息，可能存在延迟、不完整或不准确的情况，无法预测未来市场走势。</li>
+          <li><strong>投资风险：</strong>股票与ETF投资均存在市场风险、流动性风险、政策风险等多种风险，可能导致本金损失。</li>
+          <li><strong>独立决策：</strong>投资者应基于自身风险承受能力、投资目标和财务状况独立做出投资决策。</li>
+          <li><strong>责任声明：</strong>使用本平台产生的任何投资决策及其后果由使用者自行承担，本平台不承担任何责任。</li>
+        </ul>
       </div>
 
       <!-- 研究简报 -->
@@ -179,9 +196,16 @@ import {
   WarningFilled,
   DataAnalysis,
   Cpu,
-  ArrowDown
+  ArrowDown,
+  TrendCharts,
+  View,
+  Star,
+  StarFilled
 } from '@element-plus/icons-vue'
 import { ApiClient } from '@/api/request'
+import { favoritesApi } from '@/api/favorites'
+import { goPaperOrder, goStockDetail, resolveAnalysisMarket } from '@/utils/navigation'
+import { stripStockCodeSuffix } from '@/utils/market'
 import { marked } from 'marked'
 
 interface ReportDecision {
@@ -195,6 +219,7 @@ interface ReportDetailData {
   task_id?: string
   stock_symbol: string
   stock_name?: string
+  market_type?: string
   status: string
   created_at: string
   analysts: string[]
@@ -229,6 +254,9 @@ const loading = ref(true)
 const report = ref<ReportDetailData | null>(null)
 const activeModule = ref('')
 const llmConfigs = ref<LLMConfig[]>([]) // 存储所有模型配置
+const disclaimerExpanded = ref(false)
+const isFavorite = ref(false)
+const favoriteLoading = ref(false)
 const growthTaskId = computed(() => report.value?.task_id || null)
 
 const analystNameMap: Record<string, string> = {
@@ -368,6 +396,7 @@ const fetchReportDetail = async () => {
 
     if (result.success) {
       report.value = result.data
+      void checkFavoriteStatus(result.data?.stock_symbol)
 
       // 设置默认激活的模块（跳过研究简报，优先定位到第一份详细研究报告）
       const reports = result.data.reports || {}
@@ -497,9 +526,81 @@ const getFileExtension = (format: string): string => {
   return extensions[format] || 'txt'
 }
 
-// 返回列表
+// 检查关注状态
+const checkFavoriteStatus = async (stockCode?: string) => {
+  const code = stripStockCodeSuffix(stockCode)
+  if (!code) {
+    isFavorite.value = false
+    return
+  }
+  try {
+    const res = await favoritesApi.check(code)
+    isFavorite.value = Boolean((res as any)?.data?.is_favorite ?? (res as any)?.is_favorite)
+  } catch (error) {
+    console.warn('检查关注状态失败:', error)
+  }
+}
+
+// 切换关注状态
+const toggleFavorite = async () => {
+  if (!report.value?.stock_symbol) return
+  const code = stripStockCodeSuffix(report.value.stock_symbol)
+  if (!code) return
+  const name = report.value.stock_name || code
+  const market = resolveAnalysisMarket(code, report.value.market_type)
+
+  favoriteLoading.value = true
+  try {
+    if (isFavorite.value) {
+      const res = await favoritesApi.remove(code)
+      if ((res as any)?.success === false) throw new Error((res as any)?.message || '取消关注失败')
+      isFavorite.value = false
+      ElMessage.success(`已取消关注：${name}`)
+    } else {
+      const res = await favoritesApi.add({
+        symbol: code,
+        stock_code: code,
+        stock_name: name,
+        market
+      })
+      if ((res as any)?.success === false) throw new Error((res as any)?.message || '加入关注失败')
+      isFavorite.value = true
+      ElMessage.success(`已加入关注列表：${name}`)
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || '更新关注状态失败')
+  } finally {
+    favoriteLoading.value = false
+  }
+}
+
+// 基于本报告发起模拟下单
+const orderFromReport = () => {
+  if (!report.value?.stock_symbol) return
+  const analysisId = [report.value.analysis_id, report.value.task_id, report.value.id, route.params.id]
+    .map((v) => String(v ?? '').trim())
+    .find((v) => v && v.toLowerCase() !== 'unknown') || ''
+  goPaperOrder(router, {
+    code: report.value.stock_symbol,
+    market: report.value.market_type,
+    analysisId,
+    side: 'buy'
+  })
+}
+
+// 查看标的详情
+const openStockDetail = () => {
+  if (!report.value?.stock_symbol) return
+  goStockDetail(router, report.value.stock_symbol, report.value.market_type)
+}
+
+// 返回上一页或报告列表
 const goBack = () => {
-  router.push('/reports')
+  if (window.history.length > 1) {
+    router.back()
+  } else {
+    router.push('/reports')
+  }
 }
 
 // 工具函数
@@ -943,6 +1044,47 @@ onMounted(() => {
   }
 
   .report-content {
+    .risk-disclaimer-compact {
+      margin-bottom: 16px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--el-color-warning-light-5);
+      background: var(--el-color-warning-light-9);
+
+      .disclaimer-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      .disclaimer-bar-left {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--el-color-warning-dark-2);
+        line-height: 1.5;
+      }
+
+      .disclaimer-icon {
+        font-size: 16px;
+        color: var(--el-color-warning);
+        flex-shrink: 0;
+      }
+
+      .disclaimer-detail-list {
+        margin: 10px 0 0 0;
+        padding-left: 20px;
+        font-size: 12px;
+        line-height: 1.7;
+        color: var(--el-text-color-regular);
+        border-top: 1px dashed var(--el-color-warning-light-5);
+        padding-top: 8px;
+      }
+    }
+
     .report-header {
       margin-bottom: 24px;
 
@@ -980,6 +1122,8 @@ onMounted(() => {
 
         .action-section {
           display: flex;
+          flex-wrap: wrap;
+          justify-content: flex-end;
           gap: 8px;
         }
       }

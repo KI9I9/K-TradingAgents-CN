@@ -13,15 +13,15 @@
         <div class="sync-status-section">
           <h4 class="section-title">当前状态</h4>
           <div class="status-display">
-            <el-tag 
-              :type="getStatusType(syncStatus?.status)"
+            <el-tag
+              :type="getSyncStatusTagType(syncStatus?.status, syncStatus?.degraded)"
               size="large"
               class="status-tag"
             >
-              {{ getStatusText(syncStatus?.status) }}
+              {{ getSyncStatusLabel(syncStatus?.status, syncStatus?.degraded) }}
             </el-tag>
             <div v-if="syncStatus?.status === 'running'" class="progress-info">
-              <el-progress 
+              <el-progress
                 :percentage="getProgress()"
                 :status="syncStatus.errors > 0 ? 'warning' : 'success'"
                 :stroke-width="8"
@@ -34,6 +34,31 @@
               同步任务已提交，后台正在启动，请稍候自动开始。
             </div>
           </div>
+
+          <!-- 轮询超时恢复提示 -->
+          <el-alert
+            v-if="pollTimedOut"
+            type="warning"
+            :closable="false"
+            show-icon
+            class="poll-timeout-alert"
+          >
+            <template #title>
+              状态自动轮询已超时暂停（后台任务可能仍在运行）
+            </template>
+            <div class="poll-timeout-body">
+              <span>已停止自动轮询以避免页面长时间卡死，您可手动刷新最新同步状态。</span>
+              <el-button
+                type="warning"
+                plain
+                size="small"
+                :loading="refreshing"
+                @click="refreshStatus"
+              >
+                刷新状态并继续追踪
+              </el-button>
+            </div>
+          </el-alert>
         </div>
 
         <div v-if="syncStatus" class="sync-inventory-section">
@@ -63,7 +88,7 @@
               <div class="stat-label">错误</div>
             </div>
           </div>
-          
+
           <!-- 使用的数据源 -->
           <div v-if="syncStatus.data_sources_used?.length" class="sources-used">
             <div class="sources-label">使用的数据源:</div>
@@ -74,7 +99,7 @@
                 size="small"
                 type="info"
               >
-                {{ sourceLabel(source) }}
+                {{ formatSyncSourceLabel(source) }}
               </el-tag>
             </div>
           </div>
@@ -84,9 +109,6 @@
             <div class="time-label">任务结束时间:</div>
             <div class="time-value">{{ formatTime(syncStatus.finished_at) }}</div>
           </div>
-          <p v-if="(syncStatus.status === 'failed' || syncStatus.degraded)" class="inventory-note">
-            {{ syncStatus.message || '本次任务失败；处理数量不代表数据库已有数量。' }}
-          </p>
         </div>
 
         <div v-if="syncStatus" class="sync-inventory-section">
@@ -101,7 +123,7 @@
         <!-- 同步控制 -->
         <div class="sync-controls-section">
           <h4 class="section-title">同步操作</h4>
-          
+
           <!-- 数据源选择 -->
           <div class="source-selection">
             <el-form :model="syncForm" label-width="120px" size="default">
@@ -127,7 +149,7 @@
                   </el-option>
                 </el-select>
               </el-form-item>
-              
+
               <el-form-item label="强制同步:">
                 <el-switch
                   v-model="syncForm.force"
@@ -135,7 +157,7 @@
                   inactive-text="否"
                 />
                 <div class="form-help">
-                  强制同步将忽略正在运行的同步任务
+                  强制同步将忽略正在运行的同步任务，开启后点击「开始同步」需二次确认
                 </div>
               </el-form-item>
             </el-form>
@@ -146,14 +168,14 @@
             <el-button
               type="primary"
               size="large"
-              :loading="syncing || isSyncInProgress(syncStatus?.status)"
-              :disabled="isSyncInProgress(syncStatus?.status) && !syncForm.force"
+              :loading="syncing || (isSyncInProgress(syncStatus?.status) && !pollTimedOut)"
+              :disabled="isSyncInProgress(syncStatus?.status) && !syncForm.force && !pollTimedOut"
               @click="startSync"
             >
               <el-icon><Refresh /></el-icon>
               {{ getSyncButtonText() }}
             </el-button>
-            
+
             <el-button
               size="large"
               :loading="refreshing"
@@ -162,7 +184,7 @@
               <el-icon><RefreshRight /></el-icon>
               刷新状态
             </el-button>
-            
+
             <el-button
               size="large"
               type="warning"
@@ -172,26 +194,43 @@
               <el-icon><Delete /></el-icon>
               清空缓存
             </el-button>
-
-            <!-- 临时测试按钮 -->
-
-
-            <el-button
-              size="large"
-              type="success"
-              :loading="syncing"
-              @click="forceSync"
-            >
-              🔄 强制重新同步
-            </el-button>
           </div>
         </div>
 
-        <!-- 错误信息 -->
-        <div v-if="syncStatus?.message && (syncStatus.status === 'failed' || syncStatus.degraded)" class="error-section">
+        <!-- 降级结构化引导 / 失败错误信息（统一去重展示） -->
+        <div v-if="syncStatus?.degraded && syncStatus.status !== 'failed'" class="error-section">
           <el-alert
-            :title="syncStatus.message"
-            :type="syncStatus.degraded ? 'warning' : 'error'"
+            type="warning"
+            :closable="false"
+            show-icon
+          >
+            <template #title>
+              基本信息更新不完整（已沿用本地库存资料）
+            </template>
+            <div class="degraded-guidance">
+              <p v-if="syncStatus?.message" class="degraded-detail">
+                {{ syncStatus?.message }}
+              </p>
+              <p class="degraded-reassurance">
+                已保留本地
+                <strong>{{ existingRecordsText }}</strong>
+                基础信息，不影响每日 18:30 历史日线同步与正常个股/ETF 研究分析。
+              </p>
+              <div class="degraded-actions">
+                <el-button size="small" type="warning" plain @click="handleTestSources">
+                  测试数据源连通性
+                </el-button>
+                <el-button size="small" type="primary" link @click="goToDataSourceConfig">
+                  前往数据源配置
+                </el-button>
+              </div>
+            </div>
+          </el-alert>
+        </div>
+        <div v-else-if="syncStatus?.status === 'failed'" class="error-section">
+          <el-alert
+            :title="syncStatus?.message || '本次同步任务失败；处理数量不代表数据库已有数量。'"
+            type="error"
             :closable="false"
             show-icon
           />
@@ -202,7 +241,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, RefreshRight, Delete } from '@element-plus/icons-vue'
 import {
@@ -214,6 +254,11 @@ import {
   type DataSourceStatus
 } from '@/api/sync'
 import { isJdyunMode } from '@/utils/config'
+import {
+  formatSyncSourceLabel,
+  getSyncStatusLabel,
+  getSyncStatusTagType
+} from '@/utils/syncPresentation'
 
 // Props
 interface Props {
@@ -229,15 +274,19 @@ const props = withDefaults(defineProps<Props>(), {
 // Emits
 const emit = defineEmits<{
   syncCompleted: [status: string]
+  testSources: []
 }>()
+
+const router = useRouter()
 
 // 响应式数据
 const syncing = ref(false)
 const refreshing = ref(false)
 const clearingCache = ref(false)
+const pollTimedOut = ref(false)
 const syncStatus = ref<SyncStatus | null>(null)
 const availableSources = ref<DataSourceStatus[]>([])
-const refreshTimer = ref<NodeJS.Timeout | null>(null)
+const refreshTimer = ref<ReturnType<typeof setInterval> | null>(null)
 
 // 表单数据
 const syncForm = reactive({
@@ -246,6 +295,12 @@ const syncForm = reactive({
 })
 
 const isSyncInProgress = (status?: string) => ['queued', 'running'].includes(status || '')
+
+const existingRecordsText = computed(() =>
+  syncStatus.value?.existing_records != null
+    ? `${syncStatus.value.existing_records.toLocaleString()} 条`
+    : '已有'
+)
 
 // 获取同步状态
 const fetchSyncStatus = async () => {
@@ -268,30 +323,59 @@ const fetchDataSources = async () => {
   try {
     const response = await getDataSourcesStatus()
     if (response.success) {
-      // 过滤掉 local 数据源（本地数据源不参与同步操作）
-      // 京东云版只展示 Tushare 和 AKShare
       availableSources.value = response.data
         .filter(source => source.name !== 'local')
         .filter(source => !isJdyunMode() || isJdyunAllowedSource(source.name))
-        .sort((a, b) => b.priority - a.priority) // 倒序：优先级高的在前
+        .sort((a, b) => b.priority - a.priority)
     }
   } catch (err: any) {
     console.error('获取数据源状态失败:', err)
   }
 }
 
+// 触发全面测试数据源连通性
+const handleTestSources = () => {
+  emit('testSources')
+}
+
+// 跳转数据源配置页
+const goToDataSourceConfig = () => {
+  if (isJdyunMode()) {
+    router.push('/settings/jdyun-config')
+  } else {
+    router.push({ path: '/settings/config', query: { tab: 'datasource' } })
+  }
+}
+
 // 开始同步
 const startSync = async () => {
+  if (syncForm.force) {
+    try {
+      await ElMessageBox.confirm(
+        '开启「强制同步」会忽略正在运行或锁定的同步任务并重新触发外部拉取，可能引起重复请求或数据源限流。\n\n确认要强制开始同步吗？',
+        '确认强制同步',
+        {
+          confirmButtonText: '确认强制同步',
+          cancelButtonText: '取消',
+          type: 'warning'
+        }
+      )
+    } catch {
+      return
+    }
+  }
+
   try {
     syncing.value = true
-    
+    pollTimedOut.value = false
+
     const params = {
       force: syncForm.force,
-      preferred_sources: syncForm.preferred_sources.length > 0 
-        ? syncForm.preferred_sources.join(',') 
+      preferred_sources: syncForm.preferred_sources.length > 0
+        ? syncForm.preferred_sources.join(',')
         : undefined
     }
-    
+
     const response = await runStockBasicsSync(params)
     if (response.success) {
       const responseStatus = response.data.status
@@ -302,19 +386,13 @@ const startSync = async () => {
       if (responseStatus === 'queued') {
         ElMessage.success(response.data.message || '同步任务已提交，后台正在启动，请稍候')
         startStatusPolling()
-        console.log('⏳ 同步任务已提交到后台，开始轮询状态')
       } else if (responseStatus === 'running') {
         ElMessage.success('同步任务已启动')
-        // 开始轮询状态
         startStatusPolling()
-        console.log('🔄 状态轮询已启动，间隔:', props.refreshInterval, 'ms')
       } else if (responseStatus === 'success' || responseStatus === 'success_with_errors' || responseStatus === 'failed') {
-        // 同步已经完成，直接显示结果
-        ElMessage.success('同步任务已完成')
-        console.log('✅ 同步已完成，直接显示通知')
         showSyncCompletionNotification(responseStatus)
       } else {
-        ElMessage.info(response.data.message || `同步状态：${getStatusText(responseStatus)}`)
+        ElMessage.info(response.data.message || `同步状态：${getSyncStatusLabel(responseStatus, response.data.degraded)}`)
       }
     } else {
       ElMessage.error(`同步启动失败: ${response.message}`)
@@ -327,12 +405,28 @@ const startSync = async () => {
   }
 }
 
-// 刷新状态
+// 刷新状态（支持在轮询超时后手动恢复追踪或通知完成）
 const refreshStatus = async () => {
+  const wasTimedOut = pollTimedOut.value
+  const prevStatus = syncStatus.value?.status
   refreshing.value = true
-  await fetchSyncStatus()
-  refreshing.value = false
-  ElMessage.success('状态已刷新')
+  try {
+    await fetchSyncStatus()
+    pollTimedOut.value = false
+    const currentStatus = syncStatus.value?.status
+    if (isSyncInProgress(currentStatus)) {
+      if (!refreshTimer.value) {
+        startStatusPolling()
+      }
+      ElMessage.info(wasTimedOut ? '同步仍在后台执行，已恢复状态轮询' : '状态已刷新（任务进行中）')
+    } else if (wasTimedOut && isSyncInProgress(prevStatus) && currentStatus) {
+      showSyncCompletionNotification(currentStatus)
+    } else {
+      ElMessage.success('状态已刷新')
+    }
+  } finally {
+    refreshing.value = false
+  }
 }
 
 // 清空缓存
@@ -347,7 +441,7 @@ const clearCache = async () => {
         type: 'warning'
       }
     )
-    
+
     clearingCache.value = true
     const response = await clearSyncCache()
     if (response.success) {
@@ -371,10 +465,12 @@ const startStatusPolling = () => {
     clearInterval(refreshTimer.value)
   }
 
+  pollTimedOut.value = false
+
   if (props.autoRefresh) {
     let previousStatus = syncStatus.value?.status
     let pollCount = 0
-    const maxPolls = 60 // 最多轮询60次（5分钟）
+    const maxPolls = 60 // 最多轮询60次（约5分钟）
 
     console.log('🔄 开始状态轮询，初始状态:', previousStatus)
 
@@ -385,29 +481,24 @@ const startStatusPolling = () => {
       const currentStatus = syncStatus.value?.status
       console.log(`🔍 轮询 #${pollCount}: ${previousStatus} -> ${currentStatus}`)
 
-      // 检查状态变化，提供用户反馈
       if (['queued', 'running'].includes(previousStatus || '') && currentStatus && !['queued', 'running'].includes(currentStatus)) {
-        // 同步完成，显示结果通知
-        console.log('🎉 检测到同步完成，状态从', previousStatus, '变为', currentStatus)
         showSyncCompletionNotification(currentStatus)
         stopStatusPolling()
         return
       }
 
-      // 更新前一个状态
       previousStatus = currentStatus
 
-      // 如果同步完成但没有状态变化检测到，也停止轮询
       if (currentStatus && !['queued', 'running'].includes(currentStatus)) {
-        console.log('🛑 检测到非运行状态，停止轮询:', currentStatus)
         stopStatusPolling()
         return
       }
 
-      // 防止无限轮询
       if (pollCount >= maxPolls) {
-        console.log('⏰ 轮询次数达到上限，停止轮询')
+        console.warn('⏰ 轮询次数达到上限，暂停自动轮询并提示用户手动刷新')
         stopStatusPolling()
+        pollTimedOut.value = true
+        ElMessage.warning('同步任务仍在后台执行，状态自动轮询已暂停，请点击「刷新状态」继续查看。')
       }
     }, props.refreshInterval)
   }
@@ -423,8 +514,6 @@ const stopStatusPolling = () => {
 
 // 显示同步完成通知
 const showSyncCompletionNotification = (status: string) => {
-  console.log('📢 显示同步完成通知，状态:', status)
-
   const stats = syncStatus.value
   if (!stats) {
     console.warn('⚠️ 无法获取同步统计信息')
@@ -436,13 +525,11 @@ const showSyncCompletionNotification = (status: string) => {
   const updated = stats.updated || 0
   const errors = stats.errors || 0
 
-  console.log('📊 同步统计:', { total, inserted, updated, errors })
-
   let title = ''
   let message = ''
   let type: 'success' | 'warning' | 'error' = 'success'
 
-  if (stats.degraded) {
+  if (stats.degraded && status !== 'failed') {
     title = '基本信息更新不完整'
     message = stats.message || '沿用本地已有资料，未完成外部更新'
     type = 'warning'
@@ -460,7 +547,6 @@ const showSyncCompletionNotification = (status: string) => {
     type = 'error'
   }
 
-  // 显示页面通知
   ElMessage({
     message: `${title} ${message}`,
     type,
@@ -468,61 +554,19 @@ const showSyncCompletionNotification = (status: string) => {
     showClose: true
   })
 
-  // 发射同步完成事件，通知父组件
+  // 发射同步完成事件，通知父组件联动刷新历史与数据源状态
   emit('syncCompleted', status)
 
-  // 如果有使用的数据源信息，也显示出来
   if (stats.data_sources_used && stats.data_sources_used.length > 0) {
     setTimeout(() => {
       ElMessage({
-        message: `📡 使用的数据源: ${stats.data_sources_used.map(sourceLabel).join('、')}`,
+        message: `📡 使用的数据源: ${stats.data_sources_used.map(formatSyncSourceLabel).join('、')}`,
         type: 'info',
         duration: 6000,
         showClose: true
       })
     }, 1000)
   }
-}
-
-const sourceLabel = (source: string): string => {
-  const labels: Record<string, string> = {
-    'stock_list:__local_universe__': '本地已有股票资料（未从外部更新）',
-    'industry_mapping:system_industry_mapping': '系统行业映射'
-  }
-  if (labels[source]) return labels[source]
-  const [kind, name] = source.split(':')
-  const kinds: Record<string, string> = { stock_list: '股票列表', daily_data: '每日指标' }
-  const names: Record<string, string> = { tushare: 'Tushare', akshare: 'AKShare', baostock: 'BaoStock' }
-  return kinds[kind] && names[name] ? `${kinds[kind]}（${names[name]}）` : '其他数据来源'
-}
-
-// 获取状态类型
-const getStatusType = (status?: string): 'success' | 'warning' | 'info' | 'danger' => {
-  const typeMap: Record<string, 'success' | 'warning' | 'info' | 'danger'> = {
-    idle: 'info',
-    queued: 'warning',
-    running: 'warning',
-    success: 'success',
-    success_with_errors: 'warning',
-    failed: 'danger',
-    never_run: 'info'
-  }
-  return typeMap[status || 'never_run'] || 'info'
-}
-
-// 获取状态文本
-const getStatusText = (status?: string) => {
-  if (syncStatus.value?.degraded && status === 'success_with_errors') return '更新不完整'
-  const textMap: Record<string, string> = {
-    idle: '空闲',
-    queued: '后台启动中',
-    running: '运行中',
-    success: '成功',
-    success_with_errors: '部分成功',
-    failed: '失败',
-    never_run: '未运行'
-  }
-  return textMap[status || 'never_run'] || '未知'
 }
 
 // 获取进度百分比
@@ -534,6 +578,9 @@ const getProgress = () => {
 // 获取同步按钮文本
 const getSyncButtonText = () => {
   if (syncing.value) return '启动中...'
+  if (pollTimedOut.value && isSyncInProgress(syncStatus.value?.status)) {
+    return '后台同步中（轮询已暂停）'
+  }
 
   const status = syncStatus.value?.status
   if (status === 'queued') {
@@ -567,35 +614,13 @@ const formatTime = (isoString: string) => {
   }
 }
 
-
-
-// 强制重新同步
-const forceSync = async () => {
-  console.log('🔄 强制重新同步')
-
-  // 先清空当前状态
-  syncStatus.value = null
-
-  // 设置强制同步标志
-  const originalForce = syncForm.force
-  syncForm.force = true
-
-  try {
-    await startSync()
-  } finally {
-    // 恢复原始设置
-    syncForm.force = originalForce
-  }
-}
-
 // 组件挂载
 onMounted(async () => {
   await Promise.all([
     fetchSyncStatus(),
     fetchDataSources()
   ])
-  
-  // 如果正在同步，开始轮询
+
   if (isSyncInProgress(syncStatus.value?.status)) {
     startStatusPolling()
   }
@@ -613,12 +638,12 @@ onUnmounted(() => {
     .card-header {
       display: flex;
       align-items: center;
-      
+
       .header-icon {
         margin-right: 8px;
         color: var(--el-color-primary);
       }
-      
+
       .header-title {
         font-weight: 600;
       }
@@ -635,18 +660,32 @@ onUnmounted(() => {
 
     .sync-status-section {
       margin-bottom: 24px;
-      
+
       .status-display {
         .status-tag {
           margin-bottom: 12px;
         }
-        
+
         .progress-info {
           .progress-text {
             margin-top: 8px;
             font-size: 14px;
             color: var(--el-text-color-regular);
           }
+        }
+      }
+
+      .poll-timeout-alert {
+        margin-top: 12px;
+
+        .poll-timeout-body {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          flex-wrap: wrap;
+          margin-top: 4px;
+          font-size: 13px;
         }
       }
     }
@@ -664,36 +703,36 @@ onUnmounted(() => {
 
     .sync-stats-section {
       margin-bottom: 24px;
-      
+
       .stats-grid {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
         gap: 16px;
         margin-bottom: 16px;
-        
+
         .stat-item {
           text-align: center;
           padding: 16px;
           border: 1px solid var(--el-border-color-light);
           border-radius: 8px;
-          
+
           .stat-value {
             font-size: 24px;
             font-weight: 600;
             margin-bottom: 4px;
-            
+
             &.success { color: var(--el-color-success); }
             &.primary { color: var(--el-color-primary); }
             &.danger { color: var(--el-color-danger); }
           }
-          
+
           .stat-label {
             font-size: 14px;
             color: var(--el-text-color-secondary);
           }
         }
       }
-      
+
       .sources-used {
         display: flex;
         align-items: center;
@@ -727,17 +766,17 @@ onUnmounted(() => {
 
     .sync-controls-section {
       margin-bottom: 24px;
-      
+
       .source-selection {
         margin-bottom: 20px;
-        
+
         .form-help {
           font-size: 12px;
           color: var(--el-text-color-secondary);
           margin-top: 4px;
         }
       }
-      
+
       .action-buttons {
         display: flex;
         gap: 12px;
@@ -747,6 +786,27 @@ onUnmounted(() => {
 
     .error-section {
       margin-top: 16px;
+
+      .degraded-guidance {
+        font-size: 13px;
+        line-height: 1.65;
+
+        p {
+          margin: 4px 0;
+        }
+
+        .degraded-reassurance {
+          color: var(--el-text-color-regular);
+        }
+
+        .degraded-actions {
+          margin-top: 8px;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+      }
     }
   }
 }
@@ -759,11 +819,11 @@ onUnmounted(() => {
           grid-template-columns: repeat(2, 1fr);
         }
       }
-      
+
       .sync-controls-section {
         .action-buttons {
           flex-direction: column;
-          
+
           .el-button {
             width: 100%;
           }

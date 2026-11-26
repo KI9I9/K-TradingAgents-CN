@@ -741,7 +741,7 @@ const getDataSourcePriority = (sourceName: string): number => {
   }
   
   const source = dataSources.value.find(s => s.name.toLowerCase() === sourceName.toLowerCase())
-  return source?.priority || 999 // 未找到的优先级最低
+  return source?.priority ?? 0 // 未找到的优先级最低（降序排末位）
 }
 
 // 按数据源优先级和任务类型分组任务
@@ -1287,6 +1287,23 @@ const handleTriggerTask = async (jobId: string, fullSync: boolean = false) => {
     if (isTaskRunning(jobId)) {
       ElMessage.warning(getTaskRunningHint(jobId))
       return
+    }
+
+    // 🔥 全量同步二次确认防误触
+    if (fullSync) {
+      try {
+        await ElMessageBox.confirm(
+          '全量历史同步会重新拉取全市场历史数据，耗时较长并占用较高数据源配额。\n\n日常更新请优先使用「增量同步」，确定要执行全量同步吗？',
+          '确认执行全量历史同步',
+          {
+            confirmButtonText: '确认全量同步',
+            cancelButtonText: '取消',
+            type: 'warning'
+          }
+        )
+      } catch {
+        return
+      }
     }
 
     // 🔥 检查是否有挂起任务

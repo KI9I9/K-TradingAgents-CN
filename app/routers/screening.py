@@ -12,7 +12,10 @@ from app.routers.auth_db import get_current_user
 
 from app.services.factor_registry_service import get_factor_registry_service
 from app.services.screening_service import ScreeningService, ScreeningParams
-from app.services.enhanced_screening_service import get_enhanced_screening_service
+from app.services.enhanced_screening_service import (
+    ScreeningExecutionError,
+    get_enhanced_screening_service,
+)
 from app.models.screening import (
     ScreeningCondition, ScreeningRequest as NewScreeningRequest,
     ScreeningResponse as NewScreeningResponse, FieldInfo
@@ -189,6 +192,17 @@ async def run_screening(req: ScreeningRequest, user: dict = Depends(get_current_
             use_database_optimization=True
         )
 
+        if isinstance(result, dict) and (result.get("error") or result.get("source") == "error"):
+            err_msg = str(result.get("error") or "底层筛选查询异常")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "SCREENING_QUERY_FAILED",
+                    "message": f"选股筛选查询失败：{err_msg}",
+                    "error": err_msg,
+                },
+            )
+
         logger.info(f"[screening] 筛选完成: total={result.get('total')}, "
                    f"took={result.get('took_ms')}ms, optimization={result.get('optimization_used')}")
 
@@ -198,9 +212,28 @@ async def run_screening(req: ScreeningRequest, user: dict = Depends(get_current_
 
         return ScreeningResponse(total=result["total"], items=result["items"])
 
+    except HTTPException:
+        raise
+    except ScreeningExecutionError as e:
+        logger.error(f"[screening] 底层查询失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "SCREENING_QUERY_FAILED",
+                "message": str(e),
+                "error": str(e),
+            },
+        )
     except Exception as e:
         logger.error(f"[screening] 处理失败: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SCREENING_INTERNAL_ERROR",
+                "message": f"选股筛选处理失败：{str(e)}",
+                "error": str(e),
+            },
+        )
 
 
 # 新的优化筛选接口
@@ -228,6 +261,17 @@ async def enhanced_screening(req: NewScreeningRequest, user: dict = Depends(get_
             use_database_optimization=req.use_database_optimization
         )
 
+        if isinstance(result, dict) and (result.get("error") or result.get("source") == "error"):
+            err_msg = str(result.get("error") or "底层筛选查询异常")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "SCREENING_QUERY_FAILED",
+                    "message": f"增强选股筛选失败：{err_msg}",
+                    "error": err_msg,
+                },
+            )
+
         logger.info(f"[enhanced_screening] 筛选完成: total={result.get('total')}, "
                    f"took={result.get('took_ms')}ms, optimization={result.get('optimization_used')}")
 
@@ -239,9 +283,28 @@ async def enhanced_screening(req: NewScreeningRequest, user: dict = Depends(get_
             source=result.get("source")
         )
 
+    except HTTPException:
+        raise
+    except ScreeningExecutionError as e:
+        logger.error(f"[enhanced_screening] 底层查询失败: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "SCREENING_QUERY_FAILED",
+                "message": str(e),
+                "error": str(e),
+            },
+        )
     except Exception as e:
         logger.error(f"[enhanced_screening] 筛选失败: {e}")
-        raise HTTPException(status_code=500, detail=f"增强筛选失败: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SCREENING_INTERNAL_ERROR",
+                "message": f"增强筛选失败：{str(e)}",
+                "error": str(e),
+            },
+        )
 
 
 # 获取支持的字段信息

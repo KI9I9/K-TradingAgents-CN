@@ -22,7 +22,7 @@ from app.utils.error_formatter import ErrorFormatter
 from app.models.analysis import (
     SingleAnalysisRequest, BatchAnalysisRequest, AnalysisParameters,
     AnalysisTaskResponse, AnalysisBatchResponse, AnalysisHistoryQuery,
-    AnalysisEngine,
+    AnalysisEngine, AnalysisTaskType,
 )
 from tradingagents.utils.stock_utils import StockUtils, StockMarket, SecurityType
 from app.core.database import get_mongo_db
@@ -206,6 +206,229 @@ def get_market_type_from_symbol(symbol: str) -> str:
     return market_type_mapping.get(market, "cn")
 
 
+def _build_user_id_candidates(user_id: Any) -> List[Any]:
+    """构造同时兼容 str 与 ObjectId 的 user_id 候选列表。"""
+    uid_str = str(user_id or "").strip()
+    candidates: List[Any] = []
+    if uid_str:
+        candidates.append(uid_str)
+    if uid_str == "admin":
+        admin_oid_str = "507f1f77bcf86cd799439011"
+        if admin_oid_str not in candidates:
+            candidates.append(admin_oid_str)
+        try:
+            candidates.append(ObjectId(admin_oid_str))
+        except Exception:
+            pass
+    elif uid_str:
+        try:
+            candidates.append(ObjectId(uid_str))
+        except Exception:
+            pass
+    return candidates
+
+
+def _to_py_object_id(user_id: Any):
+    """兼容 admin 字符串与 24 位 hex 字符串，安全构造 PyObjectId。"""
+    from app.models.user import PyObjectId
+    uid_str = str(user_id or "").strip()
+    if uid_str == "admin":
+        return PyObjectId("507f1f77bcf86cd799439011")
+    return PyObjectId(uid_str)
+
+
+def _is_admin_user(user: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(user, dict):
+        return False
+    return bool(
+        user.get("username") == "admin"
+        or user.get("is_admin")
+        or str(user.get("role") or "").lower() == "admin"
+    )
+
+
+def _is_task_owner(task_user_id: Any, user: Optional[Dict[str, Any]]) -> bool:
+    """校验当前用户是否为任务所有者（管理员放行）。"""
+    if _is_admin_user(user):
+        return True
+    if task_user_id is None or not isinstance(user, dict):
+        return False
+    task_uid_str = str(task_user_id).strip()
+    if not task_uid_str:
+        return False
+    candidate_strs = {str(c) for c in _build_user_id_candidates(user.get("id"))}
+    return task_uid_str in candidate_strs
+
+
+def _resolve_symbol_and_etf_routing(
+    raw_symbol: str,
+    requested_market: Optional[str] = None,
+) -> tuple:
+    """统一标准化证券代码并判定是否走 ETF 分析链路。
+
+    Returns:
+        (normalized_symbol, is_etf, resolved_market_type)
+    """
+    norm_symbol = StockUtils.normalize_symbol(raw_symbol)
+    if not norm_symbol:
+        return "", False, "cn"
+
+    req_market = str(requested_market or "").strip()
+    sec_type = StockUtils.identify_security_type(norm_symbol)
+    is_etf = (req_market.upper() == "ETF") or (sec_type == SecurityType.FUND)
+    if is_etf:
+        return norm_symbol, True, "ETF"
+
+    detected_market = StockUtils.identify_stock_market(norm_symbol)
+    if detected_market != StockMarket.UNKNOWN:
+        return norm_symbol, False, get_market_type_from_symbol(norm_symbol)
+
+    req_map = {
+        "A股": "cn", "CN": "cn", "cn": "cn",
+        "港股": "hk", "HK": "hk", "hk": "hk",
+        "美股": "us", "US": "us", "us": "us",
+    }
+    resolved_market = req_map.get(req_market, req_map.get(req_market.upper(), "cn"))
+    return norm_symbol, False, resolved_market
+
+
+async def _check_llm_availability(config: Any, db: Any) -> tuple:
+    """检查系统是否已配置至少一个可用 LLM（兼容模型配置、厂家配置、环境变量与京东云模式）。"""
+    from app.utils.api_key_utils import is_valid_api_key, get_env_api_key_for_provider
+
+    try:
+        from app.core.jdyun import is_jdyun_mode, get_jdyun_api_key
+        if is_jdyun_mode() and is_valid_api_key(get_jdyun_api_key()):
+            return True, "ok", "LLM 就绪（京东云模式）", {"available_llms": ["jdyun"]}
+    except Exception:
+        pass
+
+    raw_llms = getattr(config, "llm_configs", None) if config is not None else None
+    if raw_llms is None and isinstance(config, dict):
+        raw_llms = config.get("llm_configs")
+    raw_llms = raw_llms or []
+
+    enabled_llms = []
+    for item in raw_llms:
+        is_enabled = item.get("enabled", True) if isinstance(item, dict) else getattr(item, "enabled", True)
+        if is_enabled:
+            enabled_llms.append(item)
+
+    if not enabled_llms:
+        return (
+            False,
+            "no_llm",
+            "尚未配置可用的大模型（LLM），请先在系统配置中启用大模型",
+            {"enabled_llms": [], "available_llms": []},
+        )
+
+    # 读取已启用的厂家密钥（可选，表不存在时静默降级）
+    provider_key_map: Dict[str, bool] = {}
+    try:
+        providers_coll = db["llm_providers"]
+        provider_docs = await providers_coll.find({}, {"name": 1, "api_key": 1, "is_active": 1}).limit(200).to_list(length=200)
+        for pdoc in provider_docs or []:
+            pname = str(pdoc.get("name") or "").strip().lower()
+            if not pname:
+                continue
+            if pdoc.get("is_active", True) and is_valid_api_key(pdoc.get("api_key")):
+                provider_key_map[pname] = True
+    except Exception:
+        pass
+
+    enabled_names: List[str] = []
+    available_names: List[str] = []
+    for item in enabled_llms:
+        model_name = item.get("model_name") if isinstance(item, dict) else getattr(item, "model_name", None)
+        provider_raw = item.get("provider") if isinstance(item, dict) else getattr(item, "provider", None)
+        api_key = item.get("api_key") if isinstance(item, dict) else getattr(item, "api_key", None)
+        provider = str(getattr(provider_raw, "value", provider_raw) or "").strip().lower()
+        label = str(model_name or provider or "unknown")
+        enabled_names.append(label)
+
+        has_key = (
+            provider in ("local", "ollama", "localai")
+            or is_valid_api_key(api_key)
+            or provider_key_map.get(provider, False)
+            or bool(provider and get_env_api_key_for_provider(provider))
+        )
+        if has_key:
+            available_names.append(label)
+
+    if not available_names:
+        return (
+            False,
+            "no_llm_key",
+            "已启用的大模型缺少有效的 API Key，请先在系统配置中完善大模型密钥",
+            {"enabled_llms": enabled_names, "available_llms": []},
+        )
+
+    return (
+        True,
+        "ok",
+        "LLM 可用",
+        {"enabled_llms": enabled_names, "available_llms": available_names},
+    )
+
+
+def _extract_doc_symbol(doc: Dict[str, Any]) -> str:
+    params = doc.get("task_params") or doc.get("parameters") or {}
+    return str(
+        doc.get("symbol")
+        or doc.get("stock_code")
+        or doc.get("stock_symbol")
+        or params.get("symbol")
+        or params.get("stock_code")
+        or params.get("code")
+        or ""
+    )
+
+
+def _format_history_datetime(val: Any) -> Optional[str]:
+    if not val:
+        return None
+    if hasattr(val, "isoformat"):
+        if val.tzinfo is None:
+            from datetime import timezone, timedelta
+            val = val.replace(tzinfo=timezone(timedelta(hours=8)))
+        return val.isoformat()
+    return str(val)
+
+
+def _normalize_history_doc(doc: Dict[str, Any], source_collection: str) -> Dict[str, Any]:
+    params = doc.get("task_params") if source_collection == "unified_analysis_tasks" else doc.get("parameters")
+    params = params if isinstance(params, dict) else {}
+    sym = _extract_doc_symbol(doc)
+    raw_status = doc.get("status", "pending")
+    status_str = raw_status.value if hasattr(raw_status, "value") else str(raw_status)
+    frontend_status = "running" if status_str == "processing" else status_str
+    task_type = doc.get("task_type") or ("etf_analysis" if params.get("is_etf") else "stock_analysis")
+    market_type = params.get("market_type") or doc.get("market_type") or ("ETF" if task_type == "etf_analysis" else "cn")
+    user_field = doc.get("user_id", doc.get("user"))
+    return {
+        "task_id": doc.get("task_id"),
+        "user_id": str(user_field) if user_field is not None else None,
+        "symbol": sym,
+        "stock_code": sym,
+        "stock_symbol": sym,
+        "stock_name": doc.get("stock_name") or params.get("stock_name"),
+        "task_type": task_type,
+        "market_type": market_type,
+        "status": frontend_status,
+        "progress": int(doc.get("progress", 0) or 0),
+        "message": doc.get("message", ""),
+        "current_step": doc.get("current_step", ""),
+        "error_message": doc.get("error_message") or doc.get("last_error"),
+        "created_at": _format_history_datetime(doc.get("created_at")),
+        "start_time": _format_history_datetime(doc.get("started_at") or doc.get("created_at")),
+        "end_time": _format_history_datetime(doc.get("completed_at")),
+        "parameters": params,
+        "execution_time": doc.get("execution_time"),
+        "tokens_used": doc.get("tokens_used"),
+        "source_collection": source_collection,
+    }
+
+
 async def get_user_risk_preference(user_id: str) -> str:
     """获取用户的风险偏好设置
 
@@ -304,17 +527,19 @@ async def submit_single_analysis(
 
             task_service = get_task_analysis_service()
 
-            # 准备任务参数 - 将 parameters 的内容展开到顶层
-            symbol = request.get_symbol()
+            # 准备任务参数 - 标准化代码并将 parameters 展开到顶层
+            raw_symbol = request.get_symbol()
+            user_market_raw = (request.parameters and getattr(request.parameters, "market_type", None)) or None
+            symbol, is_etf, resolved_market = _resolve_symbol_and_etf_routing(raw_symbol, user_market_raw)
+            if not symbol:
+                raise HTTPException(status_code=400, detail="股票代码不能为空")
 
-            # 🔥 修复：根据股票代码自动识别市场类型
-            market_type = get_market_type_from_symbol(symbol)
-            logger.info(f"📊 [单股分析] 股票 {symbol} 识别为市场: {market_type}")
+            logger.info(f"📊 [单股分析] 标的 {raw_symbol} -> {symbol}, is_etf={is_etf}, market_type={resolved_market}")
 
             task_params = {
                 "symbol": symbol,
                 "stock_code": symbol,
-                "market_type": market_type,  # 🔑 根据股票代码自动识别市场类型
+                "market_type": resolved_market,
             }
 
             # 将 request.parameters 的所有字段合并到 task_params
@@ -324,21 +549,19 @@ async def submit_single_analysis(
                 params_dict.pop("engine", None)
                 task_params.update(params_dict)
 
-            # 如果用户在 parameters 中指定了 market_type，优先使用用户指定的
-            if request.parameters and hasattr(request.parameters, 'market_type') and request.parameters.market_type:
-                task_params["market_type"] = request.parameters.market_type
-                logger.info(f"📊 [单股分析] 使用用户指定的市场类型: {request.parameters.market_type}")
-
-            # 🔥 ETF 路由：用户选择 ETF 或代码识别为 ETF 时，使用 ETF 分析流程
-            user_market = (request.parameters and getattr(request.parameters, 'market_type', None)) or market_type
-            sec_type = StockUtils.identify_security_type(symbol)
-            if user_market == "ETF" or sec_type == SecurityType.FUND:
+            # 🔥 ETF 路由：保留 market_type="ETF"、is_etf=True、task_type="etf_analysis"，不再覆写为 "cn"
+            if is_etf:
                 task_type = AnalysisTaskType.ETF_ANALYSIS
-                task_params["market_type"] = "cn"  # ETF 仍属 A 股市场
+                task_params["market_type"] = "ETF"
+                task_params["is_etf"] = True
+                task_params["task_type"] = AnalysisTaskType.ETF_ANALYSIS.value
                 task_params["selected_analysts"] = ["etf", "market", "news"]  # ETF 流程固定分析师
-                logger.info(f"📊 [单股分析] {symbol} 识别为 ETF，使用 ETF 分析流程")
+                logger.info(f"📊 [单股分析] {symbol} 识别为 ETF，保留 market_type=ETF / is_etf=True / task_type=etf_analysis")
             else:
                 task_type = AnalysisTaskType.STOCK_ANALYSIS
+                task_params["market_type"] = resolved_market
+                task_params["is_etf"] = False
+                task_params["task_type"] = AnalysisTaskType.STOCK_ANALYSIS.value
 
             logger.info(f"📦 v2任务参数: {task_params}")
 
@@ -348,7 +571,7 @@ async def submit_single_analysis(
 
             # 创建统一任务（不执行）
             task = await task_service.create_task(
-                user_id=PyObjectId(user["id"]),
+                user_id=_to_py_object_id(user["id"]),
                 task_type=task_type,
                 task_params=task_params,
                 engine_type="auto",  # 自动选择引擎
@@ -356,12 +579,12 @@ async def submit_single_analysis(
             )
 
             # 🔑 关键：同时在内存中创建任务状态（用于快速查询）
-            from app.services.memory_state_manager import get_memory_state_manager
+            from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
             memory_manager = get_memory_state_manager()
             await memory_manager.create_task(
                 task_id=task.task_id,
                 user_id=user["id"],
-                stock_code=request.get_symbol(),
+                stock_code=symbol,
                 parameters=task_params,
                 stock_name=None  # 可以后续补充
             )
@@ -378,22 +601,54 @@ async def submit_single_analysis(
                 "symbol": symbol,
                 "stock_code": symbol,
                 "user_id": user["id"],
-                **task_params  # 包含所有任务参数
+                **task_params  # 包含所有任务参数（含 is_etf / task_type / market_type）
             }
             
-            # 提交到队列
-            await queue_service.enqueue_task(
-                user_id=user["id"],
-                symbol=symbol,
-                params=queue_params,
-                batch_id=None,  # 单股分析没有批次ID
-                task_id=task.task_id  # 使用已生成的任务ID
-            )
+            # 提交到队列（入队失败时回写 FAILED 避免僵尸任务）
+            try:
+                await queue_service.enqueue_task(
+                    user_id=user["id"],
+                    symbol=symbol,
+                    params=queue_params,
+                    batch_id=None,  # 单股分析没有批次ID
+                    task_id=task.task_id  # 使用已生成的任务ID
+                )
+            except Exception as enqueue_err:
+                fail_msg = f"任务入队失败: {enqueue_err}"
+                logger.error(f"❌ [v2引擎] {fail_msg} (task_id={task.task_id})")
+                try:
+                    db = get_mongo_db()
+                    await db.unified_analysis_tasks.update_one(
+                        {"task_id": task.task_id},
+                        {"$set": {
+                            "status": "failed",
+                            "error_message": fail_msg,
+                            "message": fail_msg,
+                            "completed_at": now_tz(),
+                            "updated_at": now_tz(),
+                        }},
+                    )
+                except Exception:
+                    pass
+                try:
+                    await memory_manager.update_task_status(
+                        task_id=task.task_id,
+                        status=TaskStatus.FAILED,
+                        message=fail_msg,
+                        error_message=fail_msg,
+                    )
+                except Exception:
+                    pass
+                raise HTTPException(status_code=503, detail=format_http_error_detail(enqueue_err))
+
             logger.info(f"✅ [v2引擎] 任务已提交到队列: {task.task_id}")
 
             result = {
                 "task_id": task.task_id,  # 使用 UUID task_id，不是 ObjectId
                 "status": task.status.value,
+                "task_type": task_type.value,
+                "is_etf": is_etf,
+                "market_type": task_params["market_type"],
                 "created_at": task.created_at.isoformat() if task.created_at else None
             }
             task_id = task.task_id  # 使用 UUID task_id
@@ -414,6 +669,8 @@ async def submit_single_analysis(
             "data": result,
             "message": f"分析任务已提交到队列，等待 Worker 处理 (引擎: {engine_type.value})"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ 提交单股分析任务失败: {e}")
         raise HTTPException(status_code=400, detail=format_http_error_detail(e))
@@ -438,12 +695,15 @@ _CACHE_SOURCE_TYPES = {"local", "mongodb", "local_file"}
 @router.get("/precheck", response_model=Dict[str, Any])
 async def precheck_analysis(
     symbol: Optional[str] = Query(None, description="待分析的股票代码（可选）"),
+    market_type: Optional[str] = Query(None, description="市场类型（可选：CN/HK/US/ETF）"),
     user: dict = Depends(get_current_user),
 ):
     """
-    分析提交前预检：检查数据源配置、基础数据同步状态、目标股票是否存在。
+    分析提交前预检：检查数据源配置、LLM 可用性、基础数据同步状态、目标标的是否存在。
 
-    返回 can_submit=False 时，前端应阻止提交并引导用户先完成对应步骤。
+    - 支持 50/51/52/56/58/15/16/18 全前缀 ETF（含 588000 / 56xxxx / 18xxxx）
+    - 兼顾 HK / US 市场（检查对应市场基础表并在未本地同步时允许在线降级）
+    - 预检可用 LLM 配置，避免提交后必然失败
     """
     from app.services.config_service import config_service
 
@@ -451,10 +711,11 @@ async def precheck_analysis(
         # ── 1. 检查数据源配置 ──
         config = await config_service.get_system_config()
         enabled_real_sources: List[str] = []
-        if config and config.data_source_configs:
+        if config and getattr(config, "data_source_configs", None):
             for ds in config.data_source_configs:
-                if ds.enabled and ds.type not in _CACHE_SOURCE_TYPES:
-                    enabled_real_sources.append(ds.type)
+                ds_type = getattr(getattr(ds, "type", None), "value", getattr(ds, "type", None))
+                if getattr(ds, "enabled", False) and str(ds_type or "").lower() not in _CACHE_SOURCE_TYPES:
+                    enabled_real_sources.append(str(ds_type))
 
         if not enabled_real_sources:
             return {
@@ -466,13 +727,91 @@ async def precheck_analysis(
                 "details": {"enabled_real_sources": []},
             }
 
-        # ── 2. 检查基础数据同步 ──
         db = get_mongo_db()
-        # 与提交分析时使用同一证券类型识别，兼容仅传 symbol 的客户端。
-        is_etf = bool(symbol and StockUtils.identify_security_type(symbol.strip()) == SecurityType.FUND)
-        basics_collection = "etf_basic_info" if is_etf else "stock_basic_info"
-        security_label = "ETF" if is_etf else "股票"
+
+        # ── 2. 检查 LLM 可用性 ──
+        llm_ok, llm_reason, llm_message, llm_details = await _check_llm_availability(config, db)
+        if not llm_ok:
+            return {
+                "can_submit": False,
+                "reason": llm_reason,
+                "message": llm_message,
+                "redirect": "/settings/config",
+                "redirect_tab": "llm",
+                "details": {
+                    "enabled_real_sources": enabled_real_sources,
+                    **llm_details,
+                },
+            }
+
+        # ── 3. 识别市场与证券类型（支持 56/58/18 ETF 与 HK/US） ──
+        norm_symbol = StockUtils.normalize_symbol(symbol) if symbol else ""
+        req_market = str(market_type or "").strip().upper()
+        is_etf = bool(
+            req_market == "ETF"
+            or (norm_symbol and StockUtils.identify_security_type(norm_symbol) == SecurityType.FUND)
+        )
+
+        stock_market = StockUtils.identify_stock_market(symbol) if symbol else StockMarket.CHINA_A
+        if req_market in ("HK", "港股"):
+            stock_market = StockMarket.HONG_KONG
+        elif req_market in ("US", "美股"):
+            stock_market = StockMarket.US
+
+        if is_etf:
+            market_code = "ETF"
+            basics_collection = "etf_basic_info"
+            security_label = "ETF"
+        elif stock_market == StockMarket.HONG_KONG:
+            market_code = "HK"
+            basics_collection = "stock_basic_info_hk"
+            security_label = "港股"
+        elif stock_market == StockMarket.US:
+            market_code = "US"
+            basics_collection = "stock_basic_info_us"
+            security_label = "美股"
+        else:
+            market_code = "CN"
+            basics_collection = "stock_basic_info"
+            security_label = "股票"
+
+        # ── 4. 检查基础数据同步与目标标的存在性 ──
         basics_count = await db[basics_collection].count_documents({})
+        if market_code in ("HK", "US"):
+            # HK / US 市场优先查询本地基础表，未同步时放行并标注在线降级
+            target_exists = False
+            if norm_symbol and basics_count > 0:
+                candidates = [norm_symbol]
+                if market_code == "HK":
+                    plain_hk = norm_symbol.replace(".HK", "")
+                    candidates.extend([plain_hk, plain_hk.zfill(5), f"{plain_hk}.HK", f"{plain_hk.zfill(5)}.HK"])
+                unique_candidates = list(dict.fromkeys([c for c in candidates if c]))
+                doc = await db[basics_collection].find_one(
+                    {"$or": [{"code": {"$in": unique_candidates}}, {"symbol": {"$in": unique_candidates}}]}
+                )
+                target_exists = doc is not None
+            return {
+                "can_submit": True,
+                "reason": "ok",
+                "message": (
+                    f"{security_label}数据就绪，可以开始分析"
+                    if target_exists or not norm_symbol
+                    else f"{security_label} {norm_symbol} 未在本地基础表命中，分析时将自动在线获取行情"
+                ),
+                "details": {
+                    "enabled_real_sources": enabled_real_sources,
+                    "basics_collection": basics_collection,
+                    "basics_count": basics_count,
+                    "market": market_code,
+                    "is_etf": False,
+                    "symbol": norm_symbol or symbol,
+                    "target_exists": target_exists,
+                    "online_fallback": not target_exists,
+                    "llm_ready": True,
+                    **llm_details,
+                },
+            }
+
         if basics_count == 0:
             return {
                 "can_submit": False,
@@ -483,33 +822,38 @@ async def precheck_analysis(
                     "enabled_real_sources": enabled_real_sources,
                     "basics_collection": basics_collection,
                     "basics_count": 0,
+                    "market": market_code,
+                    "is_etf": is_etf,
+                    "llm_ready": True,
+                    **llm_details,
                 },
             }
 
-        # ── 3. 检查目标股票是否存在（如果传了 symbol） ──
         target_exists = True
-        if symbol:
-            sym = symbol.strip()
-            # 同时匹配 code 和 symbol 字段
-            query = {"$or": [{"code": sym}, {"symbol": sym}]}
+        if norm_symbol:
+            query = {"$or": [{"code": norm_symbol}, {"symbol": norm_symbol}]}
             doc = await db[basics_collection].find_one(query)
             target_exists = doc is not None
 
-        if symbol and not target_exists:
+        if norm_symbol and not target_exists:
             return {
                 "can_submit": False,
                 "reason": "stock_not_found",
-                "message": f"{security_label} {symbol} 的基础数据未同步，请先同步该{security_label}数据",
+                "message": f"{security_label} {norm_symbol} 的基础数据未同步，请先同步该{security_label}数据",
                 "redirect": "/settings/sync",
                 "details": {
                     "enabled_real_sources": enabled_real_sources,
                     "basics_collection": basics_collection,
                     "basics_count": basics_count,
-                    "symbol": symbol,
+                    "market": market_code,
+                    "is_etf": is_etf,
+                    "symbol": norm_symbol,
+                    "llm_ready": True,
+                    **llm_details,
                 },
             }
 
-        # ── 4. 全部通过 ──
+        # ── 5. 全部通过 ──
         return {
             "can_submit": True,
             "reason": "ok",
@@ -518,8 +862,12 @@ async def precheck_analysis(
                 "enabled_real_sources": enabled_real_sources,
                 "basics_collection": basics_collection,
                 "basics_count": basics_count,
-                "symbol": symbol,
+                "market": market_code,
+                "is_etf": is_etf,
+                "symbol": norm_symbol or symbol,
                 "target_exists": target_exists,
+                "llm_ready": True,
+                **llm_details,
             },
         }
     except Exception as e:
@@ -1555,13 +1903,21 @@ async def submit_analysis_feedback(
     req: AnalysisFeedbackRequest,
     user: dict = Depends(get_current_user),
 ):
-    """提交分析任务反馈（评分+评论）"""
+    """提交分析任务反馈（评分+评论，兼容 v2 unified_analysis_tasks 与旧表 analysis_tasks）"""
     try:
         db = get_mongo_db()
-        # 检查任务是否存在
-        task = await db.analysis_tasks.find_one({"task_id": task_id})
+        # 优先查询 v2 主集合 unified_analysis_tasks，再回退旧集合 analysis_tasks
+        unified_task = await db.unified_analysis_tasks.find_one({"task_id": task_id})
+        legacy_task = await db.analysis_tasks.find_one({"task_id": task_id})
+        task = unified_task or legacy_task
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在")
+
+        owner_id = task.get("user_id", task.get("user"))
+        if owner_id is not None and not _is_task_owner(owner_id, user):
+            raise HTTPException(status_code=403, detail="无权对此任务提交反馈")
+
+        task_code = _extract_doc_symbol(task) or task.get("code", "")
 
         # 写入反馈
         feedback_doc = {
@@ -1569,7 +1925,7 @@ async def submit_analysis_feedback(
             "user_id": str(user["id"]),
             "rating": req.rating,
             "comment": req.comment,
-            "code": task.get("code", ""),
+            "code": task_code,
             "created_at": now_tz(),
         }
         await db.analysis_feedback.replace_one(
@@ -1578,13 +1934,14 @@ async def submit_analysis_feedback(
             upsert=True,
         )
 
-        # 更新任务中的评分字段
-        await db.analysis_tasks.update_one(
-            {"task_id": task_id},
-            {"$set": {"user_rating": req.rating, "user_feedback": req.comment}},
-        )
+        # 同步更新任务中的评分字段
+        feedback_update = {"$set": {"user_rating": req.rating, "user_feedback": req.comment, "updated_at": now_tz()}}
+        if unified_task:
+            await db.unified_analysis_tasks.update_one({"task_id": task_id}, feedback_update)
+        if legacy_task:
+            await db.analysis_tasks.update_one({"task_id": task_id}, feedback_update)
 
-        return {"message": "反馈提交成功", "rating": req.rating}
+        return {"success": True, "message": "反馈提交成功", "rating": req.rating}
     except HTTPException:
         raise
     except Exception as e:
@@ -1721,9 +2078,25 @@ async def submit_batch_analysis(
         if len(stock_symbols) > MAX_BATCH_SIZE:
             raise ValueError(f"批量分析最多支持 {MAX_BATCH_SIZE} 个股票，当前提交了 {len(stock_symbols)} 个")
 
-        # 为每只股票创建单股分析任务
-        for i, symbol in enumerate(stock_symbols):
-            logger.info(f"📝 [批量分析] 正在创建第 {i+1}/{len(stock_symbols)} 个任务: {symbol}")
+        # 为每只标的创建单股/ETF 分析任务（按标的自动区分 ETF_ANALYSIS / STOCK_ANALYSIS）
+        created_entries: List[Dict[str, Any]] = []
+        preference_type = await get_user_risk_preference(user["id"])
+        from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
+        memory_manager = get_memory_state_manager()
+
+        for i, raw_symbol in enumerate(stock_symbols):
+            logger.info(f"📝 [批量分析] 正在创建第 {i+1}/{len(stock_symbols)} 个任务: {raw_symbol}")
+            user_market_raw = (request.parameters and getattr(request.parameters, "market_type", None)) or None
+            # 批量混选 A股+ETF 时，单个标的是否为 ETF 以代码识别为准；若用户显式选了 ETF 则尊重
+            symbol, is_etf, resolved_market = _resolve_symbol_and_etf_routing(
+                raw_symbol,
+                user_market_raw if len(stock_symbols) == 1 else (
+                    "ETF" if str(user_market_raw or "").strip().upper() == "ETF" and StockUtils.identify_security_type(raw_symbol) == SecurityType.FUND
+                    else None
+                ),
+            )
+            if not symbol:
+                raise ValueError(f"第 {i+1} 个股票代码不能为空")
 
             single_req = SingleAnalysisRequest(
                 symbol=symbol,
@@ -1732,121 +2105,191 @@ async def submit_batch_analysis(
             )
 
             try:
+                per_task_params: Dict[str, Any] = {
+                    "symbol": symbol,
+                    "stock_code": symbol,
+                    "market_type": resolved_market,
+                    "batch_id": batch_id,
+                }
+                if request.parameters:
+                    params_dict = request.parameters.model_dump()
+                    params_dict.pop("engine", None)
+                    per_task_params.update(params_dict)
+
+                if is_etf:
+                    task_type = AnalysisTaskType.ETF_ANALYSIS
+                    per_task_params["market_type"] = "ETF"
+                    per_task_params["is_etf"] = True
+                    per_task_params["task_type"] = AnalysisTaskType.ETF_ANALYSIS.value
+                    per_task_params["selected_analysts"] = ["etf", "market", "news"]
+                else:
+                    task_type = AnalysisTaskType.STOCK_ANALYSIS
+                    per_task_params["market_type"] = resolved_market
+                    per_task_params["is_etf"] = False
+                    per_task_params["task_type"] = AnalysisTaskType.STOCK_ANALYSIS.value
+
                 if engine_type == AnalysisEngine.V2:
-                    # v2 引擎：使用统一任务服务
                     from app.services.task_analysis_service import get_task_analysis_service
-                    from app.models.analysis import AnalysisTaskType
                     from app.models.user import PyObjectId
 
                     task_service = get_task_analysis_service()
-
-                    # 🔥 修复：准备任务参数，确保包含必需的 market_type
-                    # 根据股票代码自动识别市场类型
-                    market_type = get_market_type_from_symbol(symbol)
-                    logger.info(f"📊 [批量分析] 股票 {symbol} 识别为市场: {market_type}")
-
-                    task_params = {
-                        "symbol": symbol,
-                        "stock_code": symbol,
-                        "market_type": market_type,  # 🔑 根据股票代码自动识别市场类型
-                    }
-
-                    # 将 request.parameters 的所有字段合并到 task_params
-                    if request.parameters:
-                        params_dict = request.parameters.model_dump()
-                        # 移除 engine 字段（这是路由层使用的，不是任务参数）
-                        params_dict.pop("engine", None)
-                        task_params.update(params_dict)
-
-                    # 如果用户在 parameters 中指定了 market_type，优先使用用户指定的
-                    if request.parameters and hasattr(request.parameters, 'market_type') and request.parameters.market_type:
-                        task_params["market_type"] = request.parameters.market_type
-                        logger.info(f"📊 [批量分析] 使用用户指定的市场类型: {request.parameters.market_type}")
-
-                    # 🔥 从用户偏好读取风险偏好设置
-                    preference_type = await get_user_risk_preference(user["id"])
-                    logger.info(f"📊 [批量分析] 使用用户风险偏好: {preference_type}")
-
                     task = await task_service.create_task(
-                        user_id=PyObjectId(user["id"]),
-                        task_type=AnalysisTaskType.STOCK_ANALYSIS,
-                        task_params=task_params,
+                        user_id=_to_py_object_id(user["id"]),
+                        task_type=task_type,
+                        task_params=per_task_params,
                         engine_type="auto",
-                        preference_type=preference_type  # 🔥 使用用户偏好设置
+                        preference_type=preference_type,
+                        batch_id=batch_id,
                     )
-                    task_id = task.task_id  # 使用 UUID task_id，不是 ObjectId
+                    task_id = task.task_id
+                    await memory_manager.create_task(
+                        task_id=task_id,
+                        user_id=user["id"],
+                        stock_code=symbol,
+                        parameters=per_task_params,
+                        stock_name=None,
+                    )
                 else:
-                    # unified 引擎：使用 simple_analysis_service 创建任务（legacy 已在前面拦截）
                     create_res = await simple_service.create_analysis_task(user["id"], single_req)
                     task_id = create_res.get("task_id")
                     if not task_id:
                         raise RuntimeError(f"创建任务失败：未返回task_id (symbol={symbol})")
 
                 task_ids.append(task_id)
-                mapping.append({"symbol": symbol, "stock_code": symbol, "task_id": task_id})
-                logger.info(f"✅ [批量分析] 已创建任务: {task_id} - {symbol}")
+                mapping.append({
+                    "symbol": symbol,
+                    "stock_code": symbol,
+                    "task_id": task_id,
+                    "task_type": task_type.value,
+                    "is_etf": is_etf,
+                    "market_type": per_task_params["market_type"],
+                })
+                created_entries.append({
+                    "symbol": symbol,
+                    "task_id": task_id,
+                    "task_params": per_task_params,
+                })
+                logger.info(f"✅ [批量分析] 已创建任务: {task_id} - {symbol} (task_type={task_type.value})")
             except Exception as create_error:
                 logger.error(f"❌ [批量分析] 创建任务失败: {symbol}, 错误: {create_error}", exc_info=True)
                 raise
 
-        # 🔧 使用队列系统统一管理任务，自动控制并发
-        # 不再使用 asyncio.create_task 直接并发，而是通过队列由 Worker 消费
+        # 🔧 使用队列系统统一管理任务，持久化 Redis batch:<id> 元数据并返回 failed_submissions
         from app.services.queue_service import get_queue_service
+        from app.services.queue.keys import BATCH_PREFIX
         queue_service = get_queue_service()
 
-        # 为每个任务准备队列参数
-        for i, symbol in enumerate(stock_symbols):
-            task_id = task_ids[i]
-            
-            # 准备队列参数
+        submitted_task_ids: List[str] = []
+        failed_submissions: List[Dict[str, Any]] = []
+        db = get_mongo_db()
+
+        for entry in created_entries:
+            symbol = entry["symbol"]
+            task_id = entry["task_id"]
+            per_task_params = entry["task_params"]
+
             queue_params = {
                 "task_id": task_id,
                 "symbol": symbol,
                 "stock_code": symbol,
                 "user_id": user["id"],
                 "batch_id": batch_id,
-                "engine": engine_type.value,  # 记录引擎类型，Worker 需要知道
+                "engine": engine_type.value,
+                **per_task_params,
             }
-            
-            # 添加分析参数
-            if request.parameters:
-                params_dict = request.parameters.model_dump()
-                # 移除 engine 字段（已在 queue_params 中）
-                params_dict.pop("engine", None)
-                queue_params.update(params_dict)
-            
+
             try:
-                # 提交任务到队列（会自动检查并发限制）
-                # 使用已有的 task_id，而不是让队列生成新的
                 await queue_service.enqueue_task(
                     user_id=user["id"],
                     symbol=symbol,
                     params=queue_params,
                     batch_id=batch_id,
-                    task_id=task_id  # 使用已创建的任务ID
+                    task_id=task_id,
                 )
+                submitted_task_ids.append(task_id)
                 logger.info(f"✅ [批量分析] 任务已入队: {task_id} - {symbol} (引擎: {engine_type.value})")
-            except ValueError as e:
-                # 并发限制错误
-                logger.warning(f"⚠️ [批量分析] 任务入队失败（并发限制）: {task_id} - {symbol}, 错误: {e}")
-                # 继续处理其他任务，失败的会留在队列中等待
-            except Exception as e:
-                logger.error(f"❌ [批量分析] 任务入队失败: {task_id} - {symbol}, 错误: {e}", exc_info=True)
-        
-        logger.info(f"🚀 [批量分析] 已提交 {len(task_ids)} 个任务到队列 (引擎: {engine_type.value})")
+            except Exception as enqueue_err:
+                fail_reason = str(enqueue_err)
+                logger.error(f"❌ [批量分析] 任务入队失败: {task_id} - {symbol}, 错误: {enqueue_err}", exc_info=True)
+                failed_submissions.append({
+                    "symbol": symbol,
+                    "task_id": task_id,
+                    "error": fail_reason,
+                })
+                # 回写失败状态，避免未入队的任务留在数据库成为永久 pending 僵尸
+                try:
+                    await db.unified_analysis_tasks.update_one(
+                        {"task_id": task_id},
+                        {"$set": {
+                            "status": "failed",
+                            "error_message": f"批量入队失败: {fail_reason}",
+                            "message": f"批量入队失败: {fail_reason}",
+                            "completed_at": now_tz(),
+                            "updated_at": now_tz(),
+                        }},
+                    )
+                except Exception:
+                    pass
+                try:
+                    await memory_manager.update_task_status(
+                        task_id=task_id,
+                        status=TaskStatus.FAILED,
+                        message=f"批量入队失败: {fail_reason}",
+                        error_message=f"批量入队失败: {fail_reason}",
+                    )
+                except Exception:
+                    pass
+
+        # 持久化批次元数据到 Redis，打通 GET /api/analysis/batches/{batch_id}
+        batch_status = (
+            "failed" if len(submitted_task_ids) == 0
+            else ("partial_failed" if failed_submissions else "submitted")
+        )
+        now_ts = str(int(time.time()))
+        batch_meta = {
+            "id": batch_id,
+            "user": str(user["id"]),
+            "title": str(request.title or "批量分析"),
+            "description": str(request.description or ""),
+            "status": batch_status,
+            "engine": engine_type.value,
+            "total_tasks": str(len(task_ids)),
+            "submitted": str(len(submitted_task_ids)),
+            "failed": str(len(failed_submissions)),
+            "created_at": now_ts,
+        }
+        try:
+            if getattr(queue_service, "r", None) is not None:
+                await queue_service.r.hset(BATCH_PREFIX + batch_id, mapping=batch_meta)
+        except Exception as batch_redis_err:
+            logger.warning(f"⚠️ [批量分析] 写入 Redis batch 元数据失败: {batch_id} - {batch_redis_err}")
+
+        logger.info(
+            f"🚀 [批量分析] 批次 {batch_id} 提交完成: 成功入队 {len(submitted_task_ids)}/{len(task_ids)}, "
+            f"失败 {len(failed_submissions)} (引擎: {engine_type.value})"
+        )
 
         return {
-            "success": True,
+            "success": len(submitted_task_ids) > 0,
             "data": {
                 "batch_id": batch_id,
                 "total_tasks": len(task_ids),
+                "submitted_tasks": len(submitted_task_ids),
                 "task_ids": task_ids,
+                "submitted_task_ids": submitted_task_ids,
                 "mapping": mapping,
-                "status": "submitted",
-                "engine": engine_type.value
+                "failed_submissions": failed_submissions,
+                "status": batch_status,
+                "engine": engine_type.value,
             },
-            "message": f"批量分析任务已提交到队列，共{len(task_ids)}个股票，Worker将按并发限制自动执行 (引擎: {engine_type.value})"
+            "message": (
+                f"批量分析任务已提交到队列，成功入队 {len(submitted_task_ids)}/{len(task_ids)} 个标的"
+                + (f"，{len(failed_submissions)} 个入队失败" if failed_submissions else "")
+                + f" (引擎: {engine_type.value})"
+            ),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ [批量分析] 提交失败: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=format_http_error_detail(e))
@@ -1889,7 +2332,7 @@ async def analyze_batch(
 @router.get("/batches/{batch_id}")
 async def get_batch(batch_id: str, user: dict = Depends(get_current_user), svc: QueueService = Depends(get_queue_service)):
     b = await svc.get_batch(batch_id)
-    if not b or b.get("user") != user["id"]:
+    if not b or not _is_task_owner(b.get("user"), user):
         raise HTTPException(status_code=404, detail="batch not found")
     return b
 
@@ -1931,18 +2374,111 @@ async def cancel_task(
     user: dict = Depends(get_current_user),
     svc: QueueService = Depends(get_queue_service)
 ):
-    """取消任务"""
+    """取消任务（同步联动 unified_analysis_tasks + analysis_tasks + Redis 队列 + memory_manager）"""
     try:
-        # 验证任务所有权
-        task = await svc.get_task(task_id)
-        if not task or task.get("user") != user["id"]:
+        from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
+
+        db = get_mongo_db()
+        memory_manager = get_memory_state_manager()
+
+        unified_task = await db.unified_analysis_tasks.find_one({"task_id": task_id})
+        legacy_task = await db.analysis_tasks.find_one({"task_id": task_id})
+        redis_task = None
+        try:
+            redis_task = await svc.get_task(task_id)
+        except Exception as redis_err:
+            logger.warning(f"⚠️ [cancel] 读取 Redis 任务失败（继续校验 DB）: {task_id} - {redis_err}")
+        mem_task = await memory_manager.get_task(task_id)
+
+        if not any([unified_task, legacy_task, redis_task, mem_task]):
             raise HTTPException(status_code=404, detail="任务不存在")
 
-        success = await svc.cancel_task(task_id)
-        if success:
-            return {"success": True, "message": "任务已取消"}
-        else:
-            raise HTTPException(status_code=400, detail="取消任务失败")
+        # 校验任务所有权
+        owner_id = None
+        if unified_task is not None:
+            owner_id = unified_task.get("user_id", unified_task.get("user"))
+        elif legacy_task is not None:
+            owner_id = legacy_task.get("user_id", legacy_task.get("user"))
+        elif redis_task is not None:
+            owner_id = redis_task.get("user") or redis_task.get("user_id")
+        elif mem_task is not None:
+            owner_id = getattr(mem_task, "user_id", None)
+
+        if not _is_task_owner(owner_id, user):
+            raise HTTPException(status_code=403, detail="无权取消此任务")
+
+        # 终态校验（已完成/已失败不可再取消）
+        current_status = None
+        for src_doc in (unified_task, legacy_task, redis_task):
+            if src_doc and src_doc.get("status"):
+                raw_st = src_doc.get("status")
+                current_status = raw_st.value if hasattr(raw_st, "value") else str(raw_st)
+                break
+        if current_status is None and mem_task is not None:
+            raw_mem_st = getattr(mem_task, "status", None)
+            if raw_mem_st is not None:
+                current_status = raw_mem_st.value if hasattr(raw_mem_st, "value") else str(raw_mem_st)
+        if current_status in ("completed", "failed"):
+            raise HTTPException(status_code=400, detail=f"任务当前状态为 {current_status}，无法取消")
+
+        now_ts = now_tz()
+        cancel_fields = {
+            "status": "cancelled",
+            "message": "任务已被用户取消",
+            "error_message": "任务已被用户取消",
+            "completed_at": now_ts,
+            "updated_at": now_ts,
+        }
+
+        updated_unified = False
+        if unified_task is not None:
+            res = await db.unified_analysis_tasks.update_one(
+                {"task_id": task_id, "status": {"$nin": ["completed", "failed"]}},
+                {"$set": cancel_fields},
+            )
+            updated_unified = bool(res.modified_count > 0 or current_status == "cancelled")
+
+        updated_legacy = False
+        if legacy_task is not None:
+            res = await db.analysis_tasks.update_one(
+                {"task_id": task_id, "status": {"$nin": ["completed", "failed"]}},
+                {"$set": {**cancel_fields, "last_error": "任务已被用户取消"}},
+            )
+            updated_legacy = bool(res.modified_count > 0 or current_status == "cancelled")
+
+        redis_cancelled = False
+        try:
+            redis_cancelled = bool(await svc.cancel_task(task_id))
+        except Exception as redis_err:
+            logger.warning(f"⚠️ [cancel] Redis 取消任务失败（已更新 DB）: {task_id} - {redis_err}")
+
+        mem_cancelled = False
+        try:
+            mem_cancelled = bool(
+                await memory_manager.update_task_status(
+                    task_id=task_id,
+                    status=TaskStatus.CANCELLED,
+                    message="任务已被用户取消",
+                    current_step="cancelled",
+                )
+            )
+        except Exception as mem_err:
+            logger.warning(f"⚠️ [cancel] 内存状态更新失败: {task_id} - {mem_err}")
+
+        if updated_unified or updated_legacy or redis_cancelled or mem_cancelled or current_status == "cancelled":
+            return {
+                "success": True,
+                "message": "任务已取消",
+                "details": {
+                    "unified_updated": updated_unified,
+                    "legacy_updated": updated_legacy,
+                    "redis_cancelled": redis_cancelled,
+                    "memory_updated": mem_cancelled,
+                },
+            }
+        raise HTTPException(status_code=400, detail="取消任务失败")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=format_http_error_detail(e))
 
@@ -1973,68 +2509,159 @@ async def get_user_analysis_history(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页大小")
 ):
-    """获取用户分析历史（支持基础筛选与分页）"""
+    """获取用户分析历史（将 symbol/date/status/market_type 筛选下推到 MongoDB，主查 unified_analysis_tasks 兼容 analysis_tasks）"""
     try:
-        # 先获取用户任务列表（内存优先，MongoDB兜底）
-        raw_tasks = await get_simple_analysis_service().list_user_tasks(
-            user_id=user["id"],
-            status=status,
-            limit=page_size,
-            offset=(page - 1) * page_size
+        from datetime import datetime, timedelta
+
+        db = get_mongo_db()
+        uid_candidates = _build_user_id_candidates(user["id"])
+
+        # 解析日期过滤（含 end_date 当天）
+        date_range: Dict[str, Any] = {}
+        if start_date:
+            try:
+                start_dt = datetime.strptime(start_date[:10], "%Y-%m-%d")
+                date_range["$gte"] = start_dt
+            except ValueError:
+                raise HTTPException(status_code=400, detail="start_date 格式应为 YYYY-MM-DD")
+        if end_date:
+            try:
+                end_dt = datetime.strptime(end_date[:10], "%Y-%m-%d") + timedelta(days=1)
+                date_range["$lt"] = end_dt
+            except ValueError:
+                raise HTTPException(status_code=400, detail="end_date 格式应为 YYYY-MM-DD")
+
+        raw_query_symbol = symbol or stock_code
+        query_symbol = StockUtils.normalize_symbol(raw_query_symbol) if raw_query_symbol else None
+
+        status_candidates: Optional[List[str]] = None
+        if status:
+            st_lower = str(status).strip().lower()
+            if st_lower in ("running", "processing"):
+                status_candidates = ["processing", "running"]
+            else:
+                status_candidates = [st_lower]
+
+        def _build_collection_query(is_unified: bool) -> Dict[str, Any]:
+            and_clauses: List[Dict[str, Any]] = [
+                {"$or": [{"user_id": {"$in": uid_candidates}}, {"user": {"$in": uid_candidates}}]}
+            ]
+            if status_candidates:
+                and_clauses.append({"status": {"$in": status_candidates}})
+            if date_range:
+                and_clauses.append({"created_at": date_range})
+            if query_symbol:
+                sym_variants = list(dict.fromkeys([query_symbol, str(raw_query_symbol).strip().upper(), str(raw_query_symbol).strip()]))
+                if is_unified:
+                    and_clauses.append({
+                        "$or": [
+                            {"task_params.symbol": {"$in": sym_variants}},
+                            {"task_params.stock_code": {"$in": sym_variants}},
+                            {"task_params.code": {"$in": sym_variants}},
+                            {"symbol": {"$in": sym_variants}},
+                            {"stock_code": {"$in": sym_variants}},
+                        ]
+                    })
+                else:
+                    and_clauses.append({
+                        "$or": [
+                            {"symbol": {"$in": sym_variants}},
+                            {"stock_code": {"$in": sym_variants}},
+                            {"stock_symbol": {"$in": sym_variants}},
+                            {"parameters.symbol": {"$in": sym_variants}},
+                            {"parameters.stock_code": {"$in": sym_variants}},
+                        ]
+                    })
+            if market_type:
+                mkt = str(market_type).strip()
+                mkt_upper = mkt.upper()
+                if mkt_upper == "ETF":
+                    if is_unified:
+                        and_clauses.append({
+                            "$or": [
+                                {"task_type": "etf_analysis"},
+                                {"task_params.market_type": {"$in": ["ETF", "etf"]}},
+                                {"task_params.is_etf": True},
+                            ]
+                        })
+                    else:
+                        and_clauses.append({
+                            "$or": [
+                                {"parameters.market_type": {"$in": ["ETF", "etf"]}},
+                                {"market_type": {"$in": ["ETF", "etf"]}},
+                            ]
+                        })
+                else:
+                    mkt_aliases = list(dict.fromkeys([mkt, mkt.lower(), mkt_upper]))
+                    if mkt_upper in ("CN", "A股"):
+                        mkt_aliases = list(dict.fromkeys(mkt_aliases + ["CN", "cn", "A股"]))
+                    elif mkt_upper in ("HK", "港股"):
+                        mkt_aliases = list(dict.fromkeys(mkt_aliases + ["HK", "hk", "港股"]))
+                    elif mkt_upper in ("US", "美股"):
+                        mkt_aliases = list(dict.fromkeys(mkt_aliases + ["US", "us", "美股"]))
+                    field_path = "task_params.market_type" if is_unified else "parameters.market_type"
+                    and_clauses.append({
+                        "$or": [
+                            {field_path: {"$in": mkt_aliases}},
+                            {"market_type": {"$in": mkt_aliases}},
+                        ]
+                    })
+            return {"$and": and_clauses} if len(and_clauses) > 1 else and_clauses[0]
+
+        unified_query = _build_collection_query(is_unified=True)
+        legacy_query = _build_collection_query(is_unified=False)
+
+        skip = (page - 1) * page_size
+        fetch_window = skip + page_size
+
+        unified_total = await db.unified_analysis_tasks.count_documents(unified_query)
+        legacy_total = await db.analysis_tasks.count_documents(legacy_query)
+
+        unified_docs = (
+            await db.unified_analysis_tasks.find(unified_query)
+            .sort("created_at", -1)
+            .limit(fetch_window)
+            .to_list(length=fetch_window)
+        )
+        legacy_docs = (
+            await db.analysis_tasks.find(legacy_query)
+            .sort("created_at", -1)
+            .limit(fetch_window)
+            .to_list(length=fetch_window)
         )
 
-        # 进行基础筛选
-        from datetime import datetime
-        def in_date_range(t: Optional[str]) -> bool:
-            if not t:
-                return True
-            try:
-                dt = datetime.fromisoformat(t.replace('Z', '+00:00')) if 'Z' in t else datetime.fromisoformat(t)
-            except Exception:
-                return True
-            ok = True
-            if start_date:
-                try:
-                    ok = ok and (dt.date() >= datetime.fromisoformat(start_date).date())
-                except Exception:
-                    pass
-            if end_date:
-                try:
-                    ok = ok and (dt.date() <= datetime.fromisoformat(end_date).date())
-                except Exception:
-                    pass
-            return ok
-
-        # 获取查询的股票代码 (兼容旧字段)
-        query_symbol = symbol or stock_code
-
-        filtered = []
-        for x in raw_tasks:
-            if query_symbol:
-                task_symbol = x.get("symbol") or x.get("stock_code") or x.get("stock_symbol")
-                if task_symbol not in [query_symbol]:
-                    continue
-            # 市场类型暂时从参数内判断（如有）
-            if market_type:
-                params = x.get("parameters") or {}
-                if params.get("market_type") != market_type:
-                    continue
-            # 时间范围（使用 start_time 或 created_at）
-            t = x.get("start_time") or x.get("created_at")
-            if not in_date_range(t):
+        merged_map: Dict[str, Dict[str, Any]] = {}
+        for doc in unified_docs or []:
+            tid = doc.get("task_id")
+            if tid:
+                merged_map[tid] = _normalize_history_doc(doc, "unified_analysis_tasks")
+        duplicate_count = 0
+        for doc in legacy_docs or []:
+            tid = doc.get("task_id")
+            if not tid:
                 continue
-            filtered.append(x)
+            if tid in merged_map:
+                duplicate_count += 1
+            else:
+                merged_map[tid] = _normalize_history_doc(doc, "analysis_tasks")
+
+        merged_list = list(merged_map.values())
+        merged_list.sort(key=lambda x: str(x.get("created_at") or x.get("start_time") or ""), reverse=True)
+        page_items = merged_list[skip:skip + page_size]
+        total = max(len(merged_list), unified_total + legacy_total - duplicate_count)
 
         return {
             "success": True,
             "data": {
-                "tasks": filtered,
-                "total": len(filtered),
+                "tasks": page_items,
+                "total": total,
                 "page": page,
                 "page_size": page_size
             },
             "message": "历史查询成功"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=format_http_error_detail(e))
 
@@ -2151,15 +2778,31 @@ async def mark_task_as_failed(
     task_id: str,
     user: dict = Depends(get_current_user)
 ):
-    """将指定任务标记为失败
-
-    用于手动清理卡住的任务
-    """
+    """将指定任务标记为失败（同步联动 unified_analysis_tasks + analysis_tasks + Redis + memory_manager）"""
     try:
-        svc = get_simple_analysis_service()
-
-        # 更新内存中的任务状态
         from app.services.memory_state_manager import TaskStatus
+
+        svc = get_simple_analysis_service()
+        db = get_mongo_db()
+
+        unified_task = await db.unified_analysis_tasks.find_one({"task_id": task_id})
+        legacy_task = await db.analysis_tasks.find_one({"task_id": task_id})
+        mem_task = await svc.memory_manager.get_task(task_id)
+
+        if not any([unified_task, legacy_task, mem_task]):
+            raise HTTPException(status_code=404, detail="任务不存在")
+
+        owner_id = (
+            unified_task.get("user_id", unified_task.get("user")) if unified_task
+            else legacy_task.get("user_id", legacy_task.get("user")) if legacy_task
+            else getattr(mem_task, "user_id", None)
+        )
+        if not _is_task_owner(owner_id, user):
+            raise HTTPException(status_code=403, detail="无权操作此任务")
+
+        now_ts = now_tz()
+
+        # 1. 更新内存状态
         await svc.memory_manager.update_task_status(
             task_id=task_id,
             status=TaskStatus.FAILED,
@@ -2167,35 +2810,58 @@ async def mark_task_as_failed(
             error_message="用户手动标记为失败"
         )
 
-        # 更新 MongoDB 中的任务状态
-        from app.core.database import get_mongo_db
-        from datetime import datetime
-        db = get_mongo_db()
+        # 2. 更新 v2 主集合 unified_analysis_tasks 与旧集合 analysis_tasks
+        unified_modified = 0
+        if unified_task is not None:
+            u_res = await db.unified_analysis_tasks.update_one(
+                {"task_id": task_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "error_message": "用户手动标记为失败",
+                        "message": "用户手动标记为失败",
+                        "completed_at": now_ts,
+                        "updated_at": now_ts,
+                    }
+                },
+            )
+            unified_modified = u_res.modified_count
 
-        result = await db.analysis_tasks.update_one(
-            {"task_id": task_id},
-            {
-                "$set": {
-                    "status": "failed",
-                    "last_error": "用户手动标记为失败",
-                    "completed_at": datetime.utcnow(),
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
+        legacy_modified = 0
+        if legacy_task is not None:
+            l_res = await db.analysis_tasks.update_one(
+                {"task_id": task_id},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "last_error": "用户手动标记为失败",
+                        "error_message": "用户手动标记为失败",
+                        "completed_at": now_ts,
+                        "updated_at": now_ts,
+                    }
+                },
+            )
+            legacy_modified = l_res.modified_count
 
-        if result.modified_count > 0:
-            logger.info(f"✅ 任务 {task_id} 已标记为失败")
+        # 3. 同步清理 Redis 队列处理中/待处理状态
+        try:
+            queue_service = get_queue_service()
+            await queue_service.cancel_task(task_id)
+        except Exception as q_err:
+            logger.warning(f"⚠️ [mark-failed] 清理 Redis 队列任务失败（不影响主流程）: {task_id} - {q_err}")
+
+        if unified_modified > 0 or legacy_modified > 0 or mem_task is not None:
+            logger.info(f"✅ 任务 {task_id} 已标记为失败 (unified={unified_modified}, legacy={legacy_modified})")
             return {
                 "success": True,
-                "message": "任务已标记为失败"
+                "message": "任务已标记为失败",
             }
-        else:
-            logger.warning(f"⚠️ 任务 {task_id} 未找到或已是失败状态")
-            return {
-                "success": True,
-                "message": "任务未找到或已是失败状态"
-            }
+        return {
+            "success": True,
+            "message": "任务已是失败状态",
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ 标记任务失败: {task_id} - {e}", exc_info=True)
         raise HTTPException(
@@ -2209,193 +2875,161 @@ async def retry_task(
     task_id: str,
     user: dict = Depends(get_current_user)
 ):
-    """重新创建失败的分析任务
-
-    使用相同的参数重新创建任务，用于复现问题或验证修复。
-    
-    Returns:
-        {
-            "success": True,
-            "task_id": "新任务的ID",
-            "message": "任务已重新创建"
-        }
-    """
+    """重新创建失败/已取消的分析任务（支持 ETF 与旧任务；入队失败回写 FAILED 并显式报错）"""
     try:
-        from app.core.database import get_mongo_db
-        from bson import ObjectId
         from app.services.task_analysis_service import get_task_analysis_service
+        from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
         from app.models.analysis import AnalysisTaskType
         from app.models.user import PyObjectId
-        
+
         db = get_mongo_db()
-        
-        # 查找失败的任务
-        failed_task = await db.unified_analysis_tasks.find_one({
-            "task_id": task_id,
-            "user_id": ObjectId(user["id"])
-        })
-        
-        if not failed_task:
-            # 尝试从旧的任务集合查找
-            old_task = await db.analysis_tasks.find_one({
-                "task_id": task_id,
-                "user_id": ObjectId(user["id"])
-            })
-            if not old_task:
-                raise HTTPException(
-                    status_code=404,
-                    detail="任务不存在或不属于当前用户"
-                )
-            
-            # 旧任务格式：需要转换为新格式
-            logger.info(f"🔄 [重试任务] 找到旧格式任务: {task_id}")
-            
-            # 从旧任务中提取参数
-            task_params = old_task.get("parameters", {})
-            symbol = task_params.get("symbol") or task_params.get("stock_code") or old_task.get("stock_code")
-            market_type = task_params.get("market_type") or old_task.get("market_type", "cn")
-            
-            if not symbol:
+        uid_candidates = _build_user_id_candidates(user["id"])
+
+        # 查找任务（主查 unified_analysis_tasks，兼容 analysis_tasks）
+        failed_task = await db.unified_analysis_tasks.find_one({"task_id": task_id})
+        old_task = None if failed_task else await db.analysis_tasks.find_one({"task_id": task_id})
+
+        source_task = failed_task or old_task
+        if not source_task:
+            raise HTTPException(status_code=404, detail="任务不存在或不属于当前用户")
+
+        owner_id = source_task.get("user_id", source_task.get("user"))
+        if not _is_task_owner(owner_id, user):
+            raise HTTPException(status_code=403, detail="无权重试此任务")
+
+        if failed_task is not None:
+            task_status = failed_task.get("status")
+            status_str = task_status.value if hasattr(task_status, "value") else str(task_status)
+            if status_str not in ["failed", "cancelled"]:
                 raise HTTPException(
                     status_code=400,
-                    detail="无法从旧任务中提取股票代码"
+                    detail=f"只能重新创建失败或已取消的任务，当前状态: {status_str}"
                 )
-            
-            # 🔥 从用户偏好读取风险偏好设置
-            preference_type = await get_user_risk_preference(user["id"])
-            logger.info(f"📊 [重试任务] 使用用户风险偏好: {preference_type}")
-
-            # 创建新任务
-            task_service = get_task_analysis_service()
-            new_task = await task_service.create_task(
-                user_id=PyObjectId(user["id"]),
-                task_type=AnalysisTaskType.STOCK_ANALYSIS,
-                task_params={
-                    "symbol": symbol,
-                    "stock_code": symbol,
-                    "market_type": market_type,
-                    **task_params  # 合并其他参数
-                },
-                engine_type="auto",
-                preference_type=preference_type  # 🔥 使用用户偏好设置
+            raw_params = dict(failed_task.get("task_params") or {})
+            raw_symbol = raw_params.get("symbol") or raw_params.get("stock_code") or failed_task.get("symbol")
+            raw_task_type = failed_task.get("task_type")
+        else:
+            raw_params = dict(old_task.get("parameters") or {})
+            raw_symbol = (
+                raw_params.get("symbol")
+                or raw_params.get("stock_code")
+                or old_task.get("symbol")
+                or old_task.get("stock_code")
             )
-            
-            logger.info(f"✅ [重试任务] 旧格式任务已重新创建: {task_id} -> {new_task.task_id}")
-            
-            # 🔑 关键：将任务加入队列执行
-            from app.services.queue_service import get_queue_service
-            queue_service = get_queue_service()
-            
-            # 准备队列参数
-            queue_params = {
-                "engine": "v2",  # 使用v2引擎
+            raw_task_type = old_task.get("task_type")
+
+        if not raw_symbol:
+            raise HTTPException(status_code=400, detail="任务参数中缺少股票代码")
+
+        req_market = raw_params.get("market_type") or (old_task.get("market_type") if old_task else None)
+        symbol, is_etf, resolved_market = _resolve_symbol_and_etf_routing(raw_symbol, req_market)
+        if str(raw_task_type or "").lower() == "etf_analysis":
+            is_etf = True
+            resolved_market = "ETF"
+
+        if is_etf:
+            task_type = AnalysisTaskType.ETF_ANALYSIS
+            task_params = {
+                **raw_params,
                 "symbol": symbol,
                 "stock_code": symbol,
-                "market_type": market_type,
-                **task_params  # 合并其他参数
+                "market_type": "ETF",
+                "is_etf": True,
+                "task_type": AnalysisTaskType.ETF_ANALYSIS.value,
+                "selected_analysts": raw_params.get("selected_analysts") or ["etf", "market", "news"],
             }
-            
-            try:
-                await queue_service.enqueue_task(
-                    user_id=user["id"],
-                    symbol=symbol,
-                    params=queue_params,
-                    task_id=new_task.task_id  # 使用已创建的任务ID
-                )
-                logger.info(f"✅ [重试任务] 旧格式任务已加入队列: {new_task.task_id}")
-            except Exception as e:
-                logger.error(f"⚠️ [重试任务] 旧格式任务加入队列失败: {new_task.task_id} - {e}", exc_info=True)
-                # 即使入队失败，也返回成功（任务已创建，可以手动触发）
-            
-            return {
-                "success": True,
-                "task_id": new_task.task_id,
-                "message": "任务已重新创建并加入队列"
-            }
-        
-        # 检查任务状态
-        task_status = failed_task.get("status")
-        if isinstance(task_status, str):
-            status_str = task_status
-        elif hasattr(task_status, "value"):
-            status_str = task_status.value
         else:
-            status_str = str(task_status)
-        
-        if status_str not in ["failed", "cancelled"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"只能重新创建失败或已取消的任务，当前状态: {status_str}"
-            )
-        
-        # 获取任务参数
-        task_params = failed_task.get("task_params", {})
-        task_type_str = failed_task.get("task_type")
-        
-        # 转换 task_type
-        if isinstance(task_type_str, str):
             try:
-                task_type = AnalysisTaskType(task_type_str)
+                task_type = AnalysisTaskType(raw_task_type) if isinstance(raw_task_type, str) else AnalysisTaskType.STOCK_ANALYSIS
             except ValueError:
-                # 默认使用股票分析
                 task_type = AnalysisTaskType.STOCK_ANALYSIS
-                logger.warning(f"⚠️ [重试任务] 未知的任务类型: {task_type_str}，使用默认类型: STOCK_ANALYSIS")
-        else:
-            task_type = AnalysisTaskType.STOCK_ANALYSIS
-        
-        # 确保必要的参数存在
-        symbol = task_params.get("symbol") or task_params.get("stock_code")
-        if not symbol:
-            raise HTTPException(
-                status_code=400,
-                detail="任务参数中缺少股票代码"
-            )
-        
-        # 🔥 从用户偏好读取风险偏好设置
-        preference_type = await get_user_risk_preference(user["id"])
-        logger.info(f"📊 [重试任务] 使用用户风险偏好: {preference_type}")
+            task_params = {
+                **raw_params,
+                "symbol": symbol,
+                "stock_code": symbol,
+                "market_type": resolved_market,
+                "is_etf": False,
+                "task_type": task_type.value,
+            }
 
-        # 创建新任务（使用相同的参数）
+        preference_type = await get_user_risk_preference(user["id"])
         task_service = get_task_analysis_service()
         new_task = await task_service.create_task(
-            user_id=PyObjectId(user["id"]),
+            user_id=_to_py_object_id(user["id"]),
             task_type=task_type,
-            task_params=task_params,  # 使用原始参数
+            task_params=task_params,
             engine_type="auto",
-            preference_type=preference_type  # 🔥 使用用户偏好设置
+            preference_type=preference_type,
         )
-        
-        logger.info(f"✅ [重试任务] 任务已重新创建: {task_id} -> {new_task.task_id}")
-        
-        # 🔑 关键：将任务加入队列执行
-        from app.services.queue_service import get_queue_service
+
+        memory_manager = get_memory_state_manager()
+        try:
+            await memory_manager.create_task(
+                task_id=new_task.task_id,
+                user_id=user["id"],
+                stock_code=symbol,
+                parameters=task_params,
+                stock_name=None,
+            )
+        except Exception:
+            pass
+
         queue_service = get_queue_service()
-        
-        # 准备队列参数
-        symbol = task_params.get("symbol") or task_params.get("stock_code")
         queue_params = {
-            "engine": "v2",  # 使用v2引擎
-            **task_params  # 合并所有任务参数
+            "engine": "v2",
+            "task_id": new_task.task_id,
+            "user_id": user["id"],
+            **task_params,
         }
-        
+
         try:
             await queue_service.enqueue_task(
                 user_id=user["id"],
                 symbol=symbol,
                 params=queue_params,
-                task_id=new_task.task_id  # 使用已创建的任务ID
+                task_id=new_task.task_id,
             )
-            logger.info(f"✅ [重试任务] 任务已加入队列: {new_task.task_id}")
-        except Exception as e:
-            logger.error(f"⚠️ [重试任务] 任务加入队列失败: {new_task.task_id} - {e}", exc_info=True)
-            # 即使入队失败，也返回成功（任务已创建，可以手动触发）
-        
+            logger.info(f"✅ [重试任务] 任务已加入队列: {task_id} -> {new_task.task_id}")
+        except Exception as enqueue_err:
+            fail_msg = f"重试任务入队失败: {enqueue_err}"
+            logger.error(f"❌ [重试任务] {fail_msg} (new_task_id={new_task.task_id})", exc_info=True)
+            now_ts = now_tz()
+            try:
+                await db.unified_analysis_tasks.update_one(
+                    {"task_id": new_task.task_id},
+                    {"$set": {
+                        "status": "failed",
+                        "error_message": fail_msg,
+                        "message": fail_msg,
+                        "completed_at": now_ts,
+                        "updated_at": now_ts,
+                    }},
+                )
+            except Exception:
+                pass
+            try:
+                await memory_manager.update_task_status(
+                    task_id=new_task.task_id,
+                    status=TaskStatus.FAILED,
+                    message=fail_msg,
+                    error_message=fail_msg,
+                )
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail=f"任务重新入队失败: {format_http_error_detail(enqueue_err)}",
+            )
+
         return {
             "success": True,
             "task_id": new_task.task_id,
-            "message": "任务已重新创建并加入队列"
+            "task_type": task_type.value,
+            "is_etf": is_etf,
+            "market_type": task_params["market_type"],
+            "message": "任务已重新创建并加入队列",
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -2404,9 +3038,6 @@ async def retry_task(
             status_code=500,
             detail=f"重新创建任务失败: {str(e)}"
         )
-    except Exception as e:
-        logger.error(f"❌ 标记任务失败: {e}")
-        raise HTTPException(status_code=500, detail=f"标记任务失败: {str(e)}")
 
 
 @router.delete("/tasks/{task_id}")
@@ -2414,34 +3045,72 @@ async def delete_task(
     task_id: str,
     user: dict = Depends(get_current_user)
 ):
-    """删除指定任务
-
-    从内存和数据库中删除任务记录
-    """
+    """删除指定任务（强制 user_id 归属校验，同步清理 unified_analysis_tasks + analysis_tasks + Redis + memory_manager）"""
     try:
+        from app.services.queue.keys import TASK_PREFIX
+
         svc = get_simple_analysis_service()
-
-        # 从内存中删除任务
-        await svc.memory_manager.remove_task(task_id)
-
-        # 从 MongoDB 中删除任务
-        from app.core.database import get_mongo_db
         db = get_mongo_db()
 
-        result = await db.analysis_tasks.delete_one({"task_id": task_id})
+        unified_task = await db.unified_analysis_tasks.find_one({"task_id": task_id})
+        legacy_task = await db.analysis_tasks.find_one({"task_id": task_id})
+        mem_task = await svc.memory_manager.get_task(task_id)
 
-        if result.deleted_count > 0:
-            logger.info(f"✅ 任务 {task_id} 已删除")
-            return {
-                "success": True,
-                "message": "任务已删除"
-            }
-        else:
-            logger.warning(f"⚠️ 任务 {task_id} 未找到")
-            return {
-                "success": True,
-                "message": "任务未找到"
-            }
+        redis_task = None
+        queue_service = None
+        try:
+            queue_service = get_queue_service()
+            redis_task = await queue_service.get_task(task_id)
+        except Exception as q_err:
+            logger.debug(f"⚠️ [delete] 查询 Redis 任务忽略异常: {task_id} - {q_err}")
+
+        if not any([unified_task, legacy_task, mem_task, redis_task]):
+            raise HTTPException(status_code=404, detail="任务不存在")
+
+        # 严格校验 user_id 归属（防越权删除）
+        owner_id = (
+            unified_task.get("user_id", unified_task.get("user")) if unified_task
+            else legacy_task.get("user_id", legacy_task.get("user")) if legacy_task
+            else getattr(mem_task, "user_id", None) if mem_task
+            else (redis_task.get("user") or redis_task.get("user_id")) if redis_task
+            else None
+        )
+        if not _is_task_owner(owner_id, user):
+            raise HTTPException(status_code=403, detail="无权删除此任务")
+
+        # 1. 从内存删除
+        await svc.memory_manager.remove_task(task_id)
+
+        # 2. 从 MongoDB 双表删除
+        uid_candidates = _build_user_id_candidates(user["id"])
+        delete_filter: Dict[str, Any] = {"task_id": task_id}
+        if not _is_admin_user(user):
+            delete_filter["$or"] = [
+                {"user_id": {"$in": uid_candidates}},
+                {"user": {"$in": uid_candidates}},
+            ]
+
+        u_res = await db.unified_analysis_tasks.delete_one(delete_filter)
+        l_res = await db.analysis_tasks.delete_one(delete_filter)
+
+        # 3. 清理 Redis 队列任务与哈希
+        if queue_service is not None:
+            try:
+                await queue_service.cancel_task(task_id)
+                if getattr(queue_service, "r", None) is not None:
+                    await queue_service.r.delete(TASK_PREFIX + task_id)
+            except Exception as q_err:
+                logger.warning(f"⚠️ [delete] 清理 Redis 任务失败: {task_id} - {q_err}")
+
+        deleted_total = (u_res.deleted_count or 0) + (l_res.deleted_count or 0)
+        logger.info(f"✅ 任务 {task_id} 已删除 (unified={u_res.deleted_count}, legacy={l_res.deleted_count})")
+        return {
+            "success": True,
+            "deleted_count": deleted_total,
+            "message": "任务已删除",
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ 删除任务失败: {e}")
         raise HTTPException(status_code=500, detail=f"删除任务失败: {str(e)}")

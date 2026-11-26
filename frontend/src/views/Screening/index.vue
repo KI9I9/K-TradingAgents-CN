@@ -98,11 +98,24 @@
                       <div v-if="msg.stocks?.length" class="stock-cards">
                         <el-alert v-if="msg.is_fallback" type="warning" :closable="false" show-icon
                           title="以下为优质股替代候选，不代表满足您原始筛选条件；如需继续精确筛选，请补充更明确条件" style="margin-bottom:8px;" />
+                        <div class="stock-cards-toolbar">
+                          <span class="stock-cards-count">共推荐 {{ msg.stocks.length }} 只标的</span>
+                          <el-button
+                            size="small"
+                            type="primary"
+                            plain
+                            :loading="batchFavoriteLoading"
+                            @click="batchAddAiFavorites(msg.stocks)"
+                          >
+                            <el-icon><Star /></el-icon>
+                            全部加入关注
+                          </el-button>
+                        </div>
                         <el-card v-for="s in msg.stocks" :key="s.code" class="stock-card" shadow="hover">
                           <div class="stock-card-header">
-                            <span class="stock-name">{{ s.name }}</span>
-                            <span class="stock-code">{{ s.code }}</span>
-                            <el-tag size="small" type="info">{{ s.industry }}</el-tag>
+                            <span class="stock-name clickable-stock-title" @click="viewAiStockDetail(s)">{{ s.name }}</span>
+                            <span class="stock-code clickable-stock-title" @click="viewAiStockDetail(s)">{{ s.code }}</span>
+                            <el-tag v-if="s.industry" size="small" type="info">{{ s.industry }}</el-tag>
                           </div>
                           <div class="stock-card-metrics">
                             <span v-if="s.price != null">价格: {{ s.price?.toFixed(2) }}</span>
@@ -128,8 +141,17 @@
                           </div>
                           <div class="stock-card-reason">{{ s.reason }}</div>
                           <div class="stock-card-actions">
-                            <el-button size="small" :type="isFavorited(s.code) ? 'warning' : 'primary'" plain @click="toggleAiFavorite(s)">
-                              {{ isFavorited(s.code) ? '取消关注' : '加入关注列表' }}
+                            <el-button size="small" plain @click="viewAiStockDetail(s)">
+                              详情
+                            </el-button>
+                            <el-button size="small" type="primary" @click="analyzeAiStock(s)">
+                              单股分析
+                            </el-button>
+                            <el-button size="small" type="success" plain @click="orderAiStock(s)">
+                              模拟下单
+                            </el-button>
+                            <el-button size="small" :type="isFavorited(s.code) ? 'warning' : 'default'" plain @click="toggleAiFavorite(s)">
+                              {{ isFavorited(s.code) ? '取消关注' : '加入关注' }}
                             </el-button>
                           </div>
                         </el-card>
@@ -575,6 +597,16 @@
           <span>筛选结果 ({{ screeningResults.length }}只股票)</span>
           <div class="header-actions">
             <el-button
+              type="success"
+              plain
+              :loading="batchFavoriteLoading"
+              @click="batchAddSelectedFavorites"
+              :disabled="selectedStocks.length === 0"
+            >
+              <el-icon><Star /></el-icon>
+              批量加入关注 ({{ selectedStocks.length }})
+            </el-button>
+            <el-button
               type="primary"
               @click="batchAnalyze"
               :disabled="selectedStocks.length === 0"
@@ -584,7 +616,7 @@
             </el-button>
             <el-button type="text" @click="exportResults">
               <el-icon><Download /></el-icon>
-              导出结果
+              导出 CSV
             </el-button>
           </div>
         </div>
@@ -721,14 +753,17 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" width="250" fixed="right">
           <template #default="{ row }">
             <el-button type="text" size="small" @click="analyzeSingle(row)">
               分析
             </el-button>
+            <el-button type="text" size="small" style="color: #67c23a;" @click="orderSingle(row)">
+              模拟下单
+            </el-button>
             <el-button type="text" size="small" @click="toggleFavorite(row)">
               <el-icon><Star /></el-icon>
-              {{ isFavorited(row.symbol) ? '取消关注' : '加入关注列表' }}
+              {{ isFavorited(row.symbol) ? '取消关注' : '加入关注' }}
             </el-button>
           </template>
         </el-table-column>
@@ -773,12 +808,15 @@ import { Search, Refresh, TrendCharts, Download, Star, Connection, Warning, User
 import { renderMarkdown } from '@/utils/markdown'
 import type { StockInfo } from '@/types/analysis'
 import { screeningApi, type FieldConfigResponse, type FieldInfo, type ScreeningConditionItem, type ScreeningConversationSummary, type ScreeningMessageItem, type ScreeningPreset, type ScreeningWsEnvelope, type ScreeningWsProgressData, type StockRecommendation } from '@/api/screening'
+import { analysisApi } from '@/api/analysis'
 import { favoritesApi } from '@/api/favorites'
 import { useAuthStore } from '@/stores/auth'
 import { createWebSocket, type ManagedWebSocket } from '@/utils/createWebSocket'
 import { getFactorDiagnosticEntries, getFactorWarningEntries } from '@/utils/factorPresentation'
 import { loadCurrentDataSourceInfo } from '@/utils/dataSource'
-import { normalizeMarketForAnalysis, exchangeCodeToMarket, getMarketByStockCode } from '@/utils/market'
+import { normalizeMarketForAnalysis, getMarketByStockCode, stripStockCodeSuffix } from '@/utils/market'
+import { goPaperOrder, goSingleAnalysis, goStockDetail, resolveAnalysisMarket } from '@/utils/navigation'
+import { convertAnalystNamesToIds } from '@/constants/analysts'
 
 // Markdown 渲染
 // marked 配置已由 @/utils/markdown 统一管理
@@ -2025,15 +2063,34 @@ const handleSelectionChange = (selection: StockInfo[]) => {
   selectedStocks.value = selection
 }
 
+const batchFavoriteLoading = ref(false)
+
 const batchAnalyze = async () => {
   if (selectedStocks.value.length === 0) {
     ElMessage.warning('请先选择要分析的股票')
     return
   }
 
+  const codes = selectedStocks.value
+    .map((s) => stripStockCodeSuffix(s.symbol))
+    .filter(Boolean)
+
+  if (codes.length === 1) {
+    goSingleAnalysis(router, {
+      code: codes[0],
+      market: (selectedStocks.value[0] as any)?.market || basicFilters.market
+    })
+    return
+  }
+
+  if (codes.length > 10) {
+    ElMessage.warning('单次批量分析最多支持 10 只标的，请减少勾选项')
+    return
+  }
+
   try {
     await ElMessageBox.confirm(
-      `确定要对选中的 ${selectedStocks.value.length} 只股票进行批量分析吗？`,
+      `确定要对选中的 ${codes.length} 只股票进行批量分析吗？`,
       '确认批量分析',
       {
         confirmButtonText: '确定',
@@ -2042,43 +2099,172 @@ const batchAnalyze = async () => {
       }
     )
 
-    // 跳转到批量分析页面（携带统一市场参数）
-    router.push({
-      name: 'BatchAnalysis',
-      query: {
-        stocks: selectedStocks.value.map(s => s.symbol).join(','),
-        market: normalizeMarketForAnalysis(basicFilters.market)
+    const allEtf = codes.every((c) => getMarketByStockCode(c) === 'ETF')
+    const targetMarket = allEtf ? 'ETF' : normalizeMarketForAnalysis(basicFilters.market)
+    if (router.hasRoute('BatchAnalysis')) {
+      await router.push({
+        name: 'BatchAnalysis',
+        query: {
+          stocks: codes.join(','),
+          market: targetMarket
+        }
+      })
+      return
+    }
+
+    const prefs = authStore.user?.preferences as Record<string, any> | undefined
+    const depthIndex = Math.min(5, Math.max(1, Number(prefs?.default_depth || 2))) - 1
+    const depthLabel = ['快速', '基础', '标准', '深度', '全面'][depthIndex] || '基础'
+    const aAnalysts = Array.isArray(prefs?.default_analysts) && prefs.default_analysts.length > 0
+      ? prefs.default_analysts.filter((name: string) => name !== 'ETF分析师')
+      : ['市场分析师', '基本面分析师', '新闻分析师']
+    const defaultAnalysts = allEtf
+      ? ['ETF分析师', '市场分析师', '新闻分析师']
+      : (aAnalysts.length > 0 ? aAnalysts : ['市场分析师', '基本面分析师', '新闻分析师'])
+
+    const res = await analysisApi.startBatchAnalysis({
+      title: `选股筛选批量分析 (${codes.length}只)`,
+      symbols: codes,
+      parameters: {
+        market_type: targetMarket,
+        research_depth: depthLabel,
+        selected_analysts: convertAnalystNamesToIds(defaultAnalysts),
+        engine: 'v2'
       }
     })
-  } catch {
-    // 用户取消
+
+    if ((res as any)?.success === false) {
+      throw new Error((res as any)?.message || '提交批量分析失败')
+    }
+
+    ElMessage.success(`已提交 ${codes.length} 只股票的批量分析任务，前往任务中心查看进度`)
+    await router.push({ path: '/tasks/unified', query: { type: allEtf ? 'etf_analysis' : 'stock_analysis' } })
+  } catch (error: any) {
+    if (error !== 'cancel' && error !== 'close') {
+      ElMessage.error(error?.message || '提交批量分析失败')
+    }
   }
 }
 
-
 const analyzeSingle = (stock: StockInfo) => {
-  router.push({
-    name: 'SingleAnalysis',
-    query: {
-      stock: stock.symbol,
-      market: normalizeMarketForAnalysis((stock as any).market || basicFilters.market)
-    }
+  goSingleAnalysis(router, {
+    code: stock.symbol,
+    market: (stock as any).market || basicFilters.market
+  })
+}
+
+const orderSingle = (stock: StockInfo) => {
+  goPaperOrder(router, {
+    code: stock.symbol,
+    market: (stock as any).market || basicFilters.market,
+    side: 'buy'
   })
 }
 
 const viewStockDetail = (stock: StockInfo) => {
-  // 跳转到股票详情页面
-  router.push({
-    name: 'StockDetail',
-    params: { code: stock.symbol }
+  goStockDetail(router, stock.symbol, (stock as any).market || basicFilters.market)
+}
+
+const viewAiStockDetail = (stock: StockRecommendation) => {
+  goStockDetail(router, stock.code, getMarketByStockCode(stock.code))
+}
+
+const analyzeAiStock = (stock: StockRecommendation) => {
+  goSingleAnalysis(router, {
+    code: stock.code,
+    market: getMarketByStockCode(stock.code)
   })
 }
 
-const isFavorited = (code: string) => favoriteSet.value.has(code)
+const orderAiStock = (stock: StockRecommendation) => {
+  goPaperOrder(router, {
+    code: stock.code,
+    market: getMarketByStockCode(stock.code),
+    side: 'buy'
+  })
+}
+
+const isFavorited = (code: string) => favoriteSet.value.has(stripStockCodeSuffix(code))
+
+const addCandidatesToFavorites = async (candidates: Array<{ code: string; name?: string; market?: string }>) => {
+  const uniqueMap = new Map<string, { code: string; name: string; market: string }>()
+  for (const item of candidates) {
+    const code = stripStockCodeSuffix(item.code)
+    if (!code || uniqueMap.has(code)) continue
+    const market = resolveAnalysisMarket(code, item.market)
+    uniqueMap.set(code, {
+      code,
+      name: item.name || code,
+      market
+    })
+  }
+
+  const pending = Array.from(uniqueMap.values()).filter((item) => !favoriteSet.value.has(item.code))
+  if (pending.length === 0) {
+    ElMessage.info('所选标的均已在关注列表中')
+    return
+  }
+
+  batchFavoriteLoading.value = true
+  let addedCount = 0
+  let failedCount = 0
+  try {
+    for (const item of pending) {
+      try {
+        const res = await favoritesApi.add({
+          symbol: item.code,
+          stock_code: item.code,
+          stock_name: item.name,
+          market: item.market
+        })
+        if ((res as any)?.success === false) {
+          failedCount += 1
+        } else {
+          favoriteSet.value.add(item.code)
+          addedCount += 1
+        }
+      } catch {
+        failedCount += 1
+      }
+    }
+    if (failedCount === 0) {
+      ElMessage.success(`已批量加入关注列表（新增 ${addedCount} 只）`)
+    } else {
+      ElMessage.warning(`批量加入完成：新增 ${addedCount} 只，失败 ${failedCount} 只`)
+    }
+  } finally {
+    batchFavoriteLoading.value = false
+  }
+}
+
+const batchAddAiFavorites = async (stocks: StockRecommendation[]) => {
+  if (!stocks?.length) return
+  await addCandidatesToFavorites(
+    stocks.map((s) => ({
+      code: s.code,
+      name: s.name,
+      market: getMarketByStockCode(s.code)
+    }))
+  )
+}
+
+const batchAddSelectedFavorites = async () => {
+  if (selectedStocks.value.length === 0) {
+    ElMessage.warning('请先勾选要加入关注的股票')
+    return
+  }
+  await addCandidatesToFavorites(
+    selectedStocks.value.map((s) => ({
+      code: s.symbol,
+      name: s.name,
+      market: resolveAnalysisMarket(s.symbol, (s as any).market)
+    }))
+  )
+}
 
 const toggleFavorite = async (stock: FavoriteCandidate) => {
   try {
-    const code = stock.symbol
+    const code = stripStockCodeSuffix(stock.symbol)
     if (favoriteSet.value.has(code)) {
       // 取消关注
       const res = await favoritesApi.remove(code)
@@ -2086,14 +2272,8 @@ const toggleFavorite = async (stock: FavoriteCandidate) => {
       favoriteSet.value.delete(code)
       ElMessage.success(`已取消关注：${stock.name || code}`)
     } else {
-      // 加入关注列表
-      // 根据股票代码判断市场类型
-      let marketType = 'A股'
-      if ((stock as any).market) {
-        marketType = exchangeCodeToMarket((stock as any).market)
-      } else {
-        marketType = getMarketByStockCode(code) || 'A股'
-      }
+      // 加入关注列表：统一按代码优先识别 ETF，避免误判市场
+      const marketType = resolveAnalysisMarket(code, stock.market)
 
       const payload = {
         symbol: code,
@@ -2115,13 +2295,68 @@ const toggleAiFavorite = async (stock: StockRecommendation) => {
   await toggleFavorite({
     symbol: stock.code,
     name: stock.name,
-    market: 'A股',
+    market: getMarketByStockCode(stock.code),
   })
 }
 
+const escapeCsvCell = (value: unknown): string => {
+  if (value === null || value === undefined) return ''
+  const str = String(value)
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`
+  }
+  return str
+}
+
 const exportResults = () => {
-  // 导出筛选结果
-  ElMessage.info('导出功能开发中...')
+  if (screeningResults.value.length === 0) {
+    ElMessage.warning('暂无可导出的筛选结果')
+    return
+  }
+
+  const headers = [
+    '股票代码',
+    '股票名称',
+    '行业',
+    '最新价',
+    '涨跌幅(%)',
+    '总市值(亿)',
+    '市盈率(PE)',
+    '市净率(PB)',
+    'ROE(%)',
+    '板块',
+    '交易所'
+  ]
+
+  const rows = screeningResults.value.map((row: any) => [
+    row.symbol || row.code || '',
+    row.name || '',
+    row.industry || '',
+    row.close != null ? Number(row.close).toFixed(2) : '',
+    row.pct_chg != null ? Number(row.pct_chg).toFixed(2) : '',
+    row.total_mv != null ? Number(row.total_mv).toFixed(2) : '',
+    row.pe != null ? Number(row.pe).toFixed(2) : '',
+    row.pb != null ? Number(row.pb).toFixed(2) : '',
+    row.roe != null ? Number(row.roe).toFixed(2) : '',
+    row.board || '',
+    row.exchange || ''
+  ])
+
+  const csvContent = '\uFEFF' + [headers, ...rows]
+    .map((line) => line.map(escapeCsvCell).join(','))
+    .join('\r\n')
+
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  const today = new Date().toISOString().slice(0, 10)
+  link.href = url
+  link.download = `选股筛选结果_${today}_${screeningResults.value.length}只.csv`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${screeningResults.value.length} 条筛选结果（CSV）`)
 }
 
 const getChangeClass = (changePercent: number) => {
@@ -2193,7 +2428,7 @@ const loadFavorites = async () => {
     const set = new Set<string>()
     ;(list || []).forEach((item: any) => {
       // 兼容新旧字段
-      const code = item.symbol || item.stock_code || item.code
+      const code = stripStockCodeSuffix(item.symbol || item.stock_code || item.code)
       if (code) set.add(code)
     })
     favoriteSet.value = set
@@ -2787,6 +3022,24 @@ onUnmounted(() => {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
       gap: 12px;
+
+      > .el-alert,
+      .stock-cards-toolbar {
+        grid-column: 1 / -1;
+      }
+
+      .stock-cards-toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 4px 2px;
+      }
+
+      .stock-cards-count {
+        font-size: 13px;
+        color: var(--el-text-color-secondary);
+        font-weight: 500;
+      }
     }
 
     .stock-card {
@@ -2800,6 +3053,14 @@ onUnmounted(() => {
 
         .stock-name { font-weight: 600; font-size: 15px; }
         .stock-code { color: var(--el-text-color-secondary); font-size: 13px; }
+        .clickable-stock-title {
+          cursor: pointer;
+          transition: color 0.15s ease;
+          &:hover {
+            color: var(--el-color-primary);
+            text-decoration: underline;
+          }
+        }
       }
 
       .stock-card-metrics {
@@ -2820,6 +3081,8 @@ onUnmounted(() => {
       .stock-card-actions {
         margin-top: 10px;
         display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
         justify-content: flex-end;
       }
     }
