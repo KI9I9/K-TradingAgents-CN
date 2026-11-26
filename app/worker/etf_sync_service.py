@@ -1425,6 +1425,91 @@ class EtfSyncService:
             "errors": [{"error": str(last_error)}],
         }
 
+    async def sync_basic_only(
+        self,
+        force_update: bool = False,
+        job_id: Optional[str] = None,
+        sources: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """仅同步全市场 ETF 基础清单（默认走 AKShare/Sina，不拉取日线，不消耗 Tushare 额度）。"""
+        if self.db is None:
+            await self.initialize()
+
+        target_sources = [
+            _normalize_source_name(src)
+            for src in (sources if sources is not None else ["akshare"])
+            if _normalize_source_name(src) in _FETCH_BASIC
+        ]
+        await self._report_job_progress(job_id, 1, "开始同步全市场 ETF 基础清单（轻量）...")
+
+        if not target_sources:
+            return {
+                "basic_info": {"total_processed": 0, "errors": [{"error": "未找到可用的 ETF 基础清单数据源"}]},
+                "data_source_used": None,
+                "total_processed": 0,
+                "success_count": 0,
+                "skipped_count": 0,
+                "error_count": 1,
+                "errors": [{"error": "未找到可用的 ETF 基础清单数据源"}],
+            }
+
+        last_error: Any = None
+        for source in target_sources:
+            logger.info(f"🔄 [ETF 基础清单同步] 尝试数据源: {source}")
+            try:
+                from app.services.scheduler_service import TaskCancelledException
+
+                basic_stats = await self._sync_basic_by_source(
+                    source,
+                    force_update,
+                    job_id=job_id,
+                    stage_start=5,
+                    stage_end=95,
+                )
+                if basic_stats.get("total_processed", 0) > 0:
+                    total_processed = int(basic_stats.get("total_processed") or 0)
+                    error_count = int(basic_stats.get("error_count") or 0)
+                    success_count = int(basic_stats.get("success_count") or 0)
+                    skipped_count = int(basic_stats.get("skipped_count") or 0)
+                    result = {
+                        "basic_info": basic_stats,
+                        "data_source_used": source,
+                        "total_processed": total_processed,
+                        "success_count": success_count,
+                        "skipped_count": skipped_count,
+                        "error_count": error_count,
+                        "errors": list(basic_stats.get("errors") or []),
+                    }
+                    await self._report_job_progress(
+                        job_id,
+                        99,
+                        f"ETF 基础清单同步完成（{source.upper()}）",
+                        current_item=source.upper(),
+                        total_items=total_processed,
+                        processed_items=total_processed,
+                    )
+                    logger.info(
+                        f"✅ [ETF 基础清单同步] 数据源 {source} 完成: total={total_processed}, "
+                        f"success={success_count}, skipped={skipped_count}, errors={error_count}"
+                    )
+                    return result
+                last_error = basic_stats.get("errors", [{"error": "未获取到 ETF 列表"}])
+            except TaskCancelledException:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning(f"⚠️ [ETF 基础清单同步] 数据源 {source} 失败: {exc}")
+
+        return {
+            "basic_info": {"total_processed": 0, "errors": [{"error": str(last_error)}]},
+            "data_source_used": None,
+            "total_processed": 0,
+            "success_count": 0,
+            "skipped_count": 0,
+            "error_count": 1,
+            "errors": [{"error": str(last_error)}],
+        }
+
     async def sync_symbols(
         self,
         symbols: List[str],
@@ -1608,6 +1693,34 @@ async def run_etf_sync(force_update: bool = False, days: int = 30, job_id: str =
             logger.info("ℹ️ ETF 同步任务已被用户取消")
             return {"cancelled": True, "message": "任务已被用户取消"}
         logger.error(f"❌ ETF 同步失败: {e}", exc_info=True)
+        if job_id:
+            try:
+                from app.services.scheduler_service import mark_job_completed
+                await mark_job_completed(job_id, {}, str(e))
+            except Exception:
+                pass
+        raise
+
+
+async def run_etf_basic_sync(force_update: bool = False, job_id: Optional[str] = None) -> Dict[str, Any]:
+    """运行每周轻量 ETF 基础清单同步（供 APScheduler 或 API 调用）。"""
+    try:
+        service = await get_etf_sync_service()
+        result = await service.sync_basic_only(force_update=force_update, job_id=job_id)
+        if job_id:
+            try:
+                from app.services.scheduler_service import mark_job_completed
+                await mark_job_completed(job_id, result)
+            except Exception:
+                pass
+        return result
+    except Exception as e:
+        from app.services.scheduler_service import TaskCancelledException
+
+        if isinstance(e, TaskCancelledException):
+            logger.info("ℹ️ ETF 基础清单同步任务已被用户取消")
+            return {"cancelled": True, "message": "任务已被用户取消"}
+        logger.error(f"❌ ETF 基础清单同步失败: {e}", exc_info=True)
         if job_id:
             try:
                 from app.services.scheduler_service import mark_job_completed

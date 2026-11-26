@@ -307,6 +307,8 @@ class Settings(BaseSettings):
     ETF_SYNC_CRON: str = Field(default="0 4 * * 1-5", description="ETF 同步 CRON 表达式")  # 工作日凌晨4点
     ETF_SYNC_DAYS: int = Field(default=30, ge=1, le=365, description="ETF 强制同步回溯天数（force/manual 模式使用）")
     ETF_SYNC_ITEM_TIMEOUT_SECONDS: int = Field(default=60, ge=5, le=600, description="ETF 单只标的日线抓取超时时间（秒）")
+    ETF_BASIC_SYNC_ENABLED: bool = Field(default=True, description="启用每周 ETF 基础清单轻量同步")
+    ETF_BASIC_SYNC_CRON: str = Field(default="0 5 * * sat", description="ETF 基础清单同步 CRON 表达式（每周六凌晨5点）")
 
     # 官方行业数据（从官网 URL 获取，避免 AKShare 轮询封号）
     OFFICIAL_INDUSTRY_DATA_URL: Optional[str] = Field(

@@ -59,7 +59,7 @@ from app.worker.baostock_sync_service import (
     run_baostock_historical_sync,
     run_baostock_status_check
 )
-from app.worker.etf_sync_service import run_etf_sync
+from app.worker.etf_sync_service import run_etf_sync, run_etf_basic_sync
 from app.worker.favorites_sync_task import run_favorites_data_sync
 # 港股和美股改为按需获取+缓存模式，不再需要定时同步任务
 # from app.worker.hk_sync_service import ...
@@ -837,6 +837,19 @@ async def lifespan(app: FastAPI):
                 f"首次全量补齐、后续按最新入库日期增量同步；"
                 f"强制回溯窗口为 {settings.ETF_SYNC_DAYS} 天"
             )
+
+        scheduler.add_job(
+            run_etf_basic_sync,
+            CronTrigger.from_crontab(settings.ETF_BASIC_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="etf_basic_sync",
+            name="ETF 基础清单同步（轻量）",
+            kwargs={"force_update": False, "job_id": "etf_basic_sync"},
+        )
+        if not settings.ETF_BASIC_SYNC_ENABLED:
+            scheduler.pause_job("etf_basic_sync")
+            logger.info(f"⏸️ ETF 基础清单同步已添加但暂停: {settings.ETF_BASIC_SYNC_CRON}")
+        else:
+            logger.info(f"📅 ETF 基础清单轻量同步已配置: {settings.ETF_BASIC_SYNC_CRON}")
 
         # 股票关注列表A股数据同步任务配置
         logger.info("🔄 配置股票关注列表A股数据同步任务...")
