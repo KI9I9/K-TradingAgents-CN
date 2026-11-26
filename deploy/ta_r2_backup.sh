@@ -62,9 +62,9 @@ restic backup \
   /home/backup-recv/osaka \
   /home/ubuntu/quote-guard-releases \
   /home/ubuntu/系统运维/trading_agents \
+  /home/ubuntu/系统运维/osaka \
   /home/ubuntu/migrations/k-tradingagents-20261015 \
-  /home/ubuntu/projects/K-TradingAgents-CN-osaka-safety-20261016 \
-  /home/ubuntu/projects/K-TradingAgents-CN-migration-20261015
+  /home/ubuntu/projects/K-TradingAgents-CN-osaka-safety-20261016
 
 # Step 4: 按保留策略清理过期云端快照（保留 14 天每日、8 周每周、6 个月每月）
 restic forget \

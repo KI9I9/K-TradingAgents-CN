@@ -2,7 +2,7 @@
 
 更新时间：2026-11-07（Asia/Shanghai）
 
-本目录供后续 AI 助手维护 `K-TradingAgents-CN-osaka-safety-20261016` 及其生产交付（注：同级的 `K-TradingAgents-CN-migration-20261015` 为承载底层 `.git` 对象库的静态主仓库基线，日常开发与运维仅在 `osaka-safety-20261016` 工作树中进行，切勿删除 `migration-20261015`，详见 `交接总览-20261107.md` 第 1 节）。文档只记录运行边界、已完成工作、证据位置、验收方法和未闭合事项；不保存任何密码、Token、私钥、完整环境变量或敏感配置内容。
+本目录供后续 AI 助手维护 `K-TradingAgents-CN-osaka-safety-20261016` 及其生产交付（注：该目录已于 `2026-11-26` 收口为独立完整的 `.git` 仓库；原历史基线工作树 `K-TradingAgents-CN-migration-20261015` 及已合并的本地旧分支 `deploy/ubuntu-migration-20261014`、`deploy/osaka-fixes-20261022` 已清理删除，详见 `交接总览-20261107.md` 第 1 节）。文档只记录运行边界、已完成工作、证据位置、验收方法和未闭合事项；不保存任何密码、Token、私钥、完整环境变量或敏感配置内容。
 
 ## 阅读顺序
 
