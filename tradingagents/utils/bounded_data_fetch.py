@@ -25,6 +25,108 @@ class DataFetchNetworkError(RuntimeError):
         self.circuit = circuit
 
 
+def _hydrate_circuit_state(state, *, now_wall=None, now_mono=None):
+    """将跨进程熔断状态（UTC epoch / 剩余 TTL 秒数）转换为当前进程的单调时钟截止点。"""
+    if not isinstance(state, dict):
+        return 0, 0.0
+    wall = time.time() if now_wall is None else float(now_wall)
+    mono = time.monotonic() if now_mono is None else float(now_mono)
+    try:
+        failures = max(0, int(state.get("failures", 0) or 0))
+    except (TypeError, ValueError):
+        failures = 0
+
+    remaining = 0.0
+    had_deadline = False
+    raw_epoch = state.get("retry_after_epoch")
+    raw_remaining = state.get("remaining_seconds")
+    raw_mono = state.get("retry_after")
+
+    if isinstance(raw_epoch, (int, float)) and raw_epoch > 0:
+        had_deadline = True
+        remaining = max(0.0, float(raw_epoch) - wall)
+    elif isinstance(raw_remaining, (int, float)) and raw_remaining > 0:
+        had_deadline = True
+        remaining = max(0.0, float(raw_remaining))
+    elif isinstance(raw_mono, (int, float)) and raw_mono > 0:
+        had_deadline = True
+        remaining = max(0.0, float(raw_mono) - mono)
+
+    if remaining > 0:
+        return failures, mono + remaining
+    # 既有熔断窗口已自然过期，允许半开探测，避免旧 failures 残留立即二次熔断。
+    if had_deadline:
+        return 0, 0.0
+    return failures, 0.0
+
+
+def _export_circuit_state(failures, retry_after_mono, *, now_wall=None, now_mono=None):
+    """导出与进程无关的熔断状态（UTC epoch + 剩余 TTL 秒数，同时保留 retry_after 兼容旧调用方）。"""
+    wall = time.time() if now_wall is None else float(now_wall)
+    mono = time.monotonic() if now_mono is None else float(now_mono)
+    try:
+        clean_failures = max(0, int(failures or 0))
+    except (TypeError, ValueError):
+        clean_failures = 0
+    try:
+        mono_target = float(retry_after_mono or 0.0)
+    except (TypeError, ValueError):
+        mono_target = 0.0
+    remaining = max(0.0, mono_target - mono) if mono_target > 0 else 0.0
+    retry_after_epoch = (wall + remaining) if remaining > 0 else 0.0
+    return {
+        "failures": clean_failures if (remaining > 0 or mono_target <= 0) else 0,
+        "remaining_seconds": round(remaining, 3),
+        "retry_after_epoch": retry_after_epoch,
+        "retry_after": mono_target if remaining > 0 else 0.0,
+    }
+
+
+def merge_circuit_state(current, incoming, *, now_wall=None):
+    """在单次同步会话内合并多批次返回的熔断状态（以 UTC epoch 为准，跨进程无漂移）。"""
+    wall = time.time() if now_wall is None else float(now_wall)
+
+    def _extract(state):
+        if not isinstance(state, dict):
+            return 0, 0.0
+        try:
+            f = max(0, int(state.get("failures", 0) or 0))
+        except (TypeError, ValueError):
+            f = 0
+        epoch = state.get("retry_after_epoch")
+        if isinstance(epoch, (int, float)) and epoch > 0:
+            return f, float(epoch)
+        rem = state.get("remaining_seconds")
+        if isinstance(rem, (int, float)) and rem > 0:
+            return f, wall + float(rem)
+        return f, 0.0
+
+    cur_failures, cur_epoch = _extract(current)
+    inc_failures, inc_epoch = _extract(incoming)
+    cur_active = cur_epoch > wall
+    inc_active = inc_epoch > wall
+
+    if cur_active or inc_active:
+        merged_epoch = max(cur_epoch if cur_active else 0.0, inc_epoch if inc_active else 0.0)
+        remaining = max(0.0, merged_epoch - wall)
+        return {
+            "failures": max(cur_failures, inc_failures, 2),
+            "remaining_seconds": round(remaining, 3),
+            "retry_after_epoch": merged_epoch,
+        }
+
+    # 均未处于有效熔断期：若最新批次完全成功（inc_failures == 0），清零失败计数；否则保留最高失败计数。
+    if isinstance(incoming, dict) and inc_failures == 0 and inc_epoch == 0.0:
+        merged_failures = 0
+    else:
+        merged_failures = max(cur_failures if cur_epoch <= 0.0 else 0, inc_failures if inc_epoch <= 0.0 else 0)
+    return {
+        "failures": merged_failures,
+        "remaining_seconds": 0.0,
+        "retry_after_epoch": 0.0,
+    }
+
+
 def _decode(raw):
     value = json.loads(raw)
     if not value.get("ok"):
@@ -104,10 +206,9 @@ def _perform(operation, arguments):
         provider = AKShareProvider()
         arguments = dict(arguments)
         state = arguments.pop("circuit", {})
-        provider._history_failure_count = state.get("failures", 0)
-        provider._history_retry_after = state.get("retry_after", 0.0)
+        provider._history_failure_count, provider._history_retry_after = _hydrate_circuit_state(state)
         def circuit():
-            return {"failures": provider._history_failure_count, "retry_after": provider._history_retry_after}
+            return _export_circuit_state(provider._history_failure_count, provider._history_retry_after)
         try:
             return asyncio.run(provider.get_historical_data(**arguments)), circuit()
         except AKShareNetworkError:
@@ -120,8 +221,7 @@ def _perform(operation, arguments):
         arguments = dict(arguments)
         codes = list(arguments.pop("codes") or ())
         state = arguments.pop("circuit", {})
-        provider._history_failure_count = state.get("failures", 0)
-        provider._history_retry_after = state.get("retry_after", 0.0)
+        provider._history_failure_count, provider._history_retry_after = _hydrate_circuit_state(state)
         start_date = arguments.get("start_date")
         end_date = arguments.get("end_date")
         period = arguments.get("period", "daily")
@@ -133,7 +233,7 @@ def _perform(operation, arguments):
             interval = 0.35
 
         def circuit():
-            return {"failures": provider._history_failure_count, "retry_after": provider._history_retry_after}
+            return _export_circuit_state(provider._history_failure_count, provider._history_retry_after)
 
         async def _run_batch():
             frames, errors = {}, {}
@@ -159,6 +259,15 @@ def _perform(operation, arguments):
     AKShareProvider()
     manager = DataSourceManager()
     sources = arguments.get("preferred_sources")
+    exclude_sources = {
+        str(item).strip().lower()
+        for item in (arguments.get("exclude_sources") or ())
+        if str(item or "").strip()
+    }
+    if exclude_sources:
+        manager.adapters = [a for a in manager.adapters if str(getattr(a, "name", "")).lower() not in exclude_sources]
+        if sources:
+            sources = [s for s in sources if str(s or "").strip().lower() not in exclude_sources]
     if operation == "stock_list":
         return manager.get_stock_list_with_fallback(sources, True)
     if operation == "daily_basic":

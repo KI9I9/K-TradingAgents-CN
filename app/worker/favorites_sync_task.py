@@ -5,6 +5,8 @@
 """
 
 import logging
+import os
+from pathlib import Path
 from typing import List, Set, Dict, Any, Tuple
 from datetime import datetime
 
@@ -22,10 +24,62 @@ ETF_SH_PREFIXES = ("50", "51", "52", "56", "58")
 ETF_SZ_PREFIXES = ("15", "16", "18")
 
 
+def _is_tushare_sync_allowed() -> bool:
+    """检查 Tushare 自动同步是否被全局开关、STOP 门禁或 egress 许可禁止（fail-closed）。"""
+    env_flag = os.getenv("ENABLE_TUSHARE")
+    if env_flag is not None and env_flag.strip().lower() in ("0", "false", "no", "off"):
+        return False
+    try:
+        from app.core.config import settings
+        if getattr(settings, "ENABLE_TUSHARE", True) is False:
+            return False
+    except Exception:
+        pass
+
+    route = os.environ.get("TA_TUSHARE_ROUTE", "").strip()
+    if route.lower() in ("disabled", "off", "stop", "stopped", "none"):
+        return False
+
+    try:
+        from tradingagents.utils.tushare_egress import (
+            STATE_DIR,
+            TushareEgressStopped,
+            raise_if_egress_blocked,
+        )
+        from tradingagents.utils.tushare_manual import DIRECTORY as MANUAL_DIR
+
+        if (Path(STATE_DIR) / "STOP").exists() or (Path(MANUAL_DIR) / "STOP").exists():
+            return False
+        # 大阪生产路由或本地存在 egress 状态目录时，强制走 fail-closed 许可检查；
+        # Tushare 后台自动同步绝不能在未获许可或停机门禁下触发外呼。
+        if route == "mainland_unix" or Path(STATE_DIR).exists():
+            raise_if_egress_blocked()
+    except TushareEgressStopped as stopped:
+        logger.info("⏸️ [favorites_sync] Tushare 受停机/门禁限制 (%s)，自动过滤", stopped.reason)
+        return False
+    except Exception as exc:
+        logger.warning("⚠️ [favorites_sync] 检查 Tushare 门禁状态失败，按 fail-closed 过滤: %s", exc)
+        return False
+
+    return True
+
+
 def _get_sync_data_sources(enabled_sources: List[str]) -> List[str]:
-    """从启用的数据源中排除 local，得到用于同步的数据源列表（按优先级顺序）。"""
-    sync_sources = [s for s in enabled_sources if s and s.lower() != "local"]
-    return sync_sources if sync_sources else ["tushare", "akshare", "baostock"]
+    """从启用的数据源中排除 local 与禁用/停机的 Tushare，返回按优先级排序的同步源列表。"""
+    tushare_allowed = _is_tushare_sync_allowed()
+    raw_sources = [s for s in (enabled_sources or []) if s and str(s).strip().lower() != "local"]
+    if not raw_sources:
+        raw_sources = ["tushare", "akshare", "baostock"] if tushare_allowed else ["akshare", "baostock"]
+
+    filtered: List[str] = []
+    for source in raw_sources:
+        name = str(source).strip().lower()
+        if name == "tushare" and not tushare_allowed:
+            logger.info("⏸️ [favorites_sync] 已过滤禁用/停机数据源: tushare")
+            continue
+        if name and name not in filtered:
+            filtered.append(name)
+    return filtered
 
 
 async def get_all_favorite_a_stocks() -> List[str]:
@@ -218,15 +272,39 @@ async def sync_favorites_historical_data():
             etf_success_count = 0
             etf_records = 0
             used_sources = []
+            stock_sources_succeeded = []
+            stock_sources_failed = []
+            etf_failed = False
             all_details = {}
             
             for i, (source, result) in enumerate(zip(task_sources, results)):
                 if isinstance(result, Exception):
                     logger.warning(f"⚠️ {source} 历史数据同步失败: {result}")
-                    all_details[source] = {"error": str(result)}
+                    all_details[source] = {"success": False, "error": str(result)}
+                    if source == "etf":
+                        etf_failed = True
+                    else:
+                        stock_sources_failed.append(f"{source}: {result}")
+                elif not isinstance(result, dict):
+                    logger.warning(f"⚠️ {source} 历史数据同步返回异常结果: {result}")
+                    all_details[source] = {"success": False, "error": f"非预期返回类型: {type(result).__name__}"}
+                    if source == "etf":
+                        etf_failed = True
+                    else:
+                        stock_sources_failed.append(f"{source}: 非预期返回")
                 else:
                     # 🔥 调试：打印完整的返回结果，查看实际字段
                     logger.debug(f"📊 {source} 历史数据同步返回结果: {result}")
+
+                    if result.get("success") is False:
+                        err_msg = str(result.get("error") or result.get("message") or "同步失败")
+                        logger.warning(f"⚠️ {source} 历史数据同步返回失败: {err_msg}")
+                        all_details[source] = result
+                        if source == "etf":
+                            etf_failed = True
+                        else:
+                            stock_sources_failed.append(f"{source}: {err_msg}")
+                        continue
                     
                     # 🔥 检查是否是跳过的情况（增量同步时间检查）
                     if result.get("skipped", False):
@@ -239,16 +317,23 @@ async def sync_favorites_historical_data():
                         }
                         # 🔥 跳过的情况也计入used_sources，但不计入成功数量
                         used_sources.append(source)
+                        if source != "etf":
+                            stock_sources_succeeded.append(source)
                         continue
 
                     if source == "etf":
                         success_count = result.get("success_count", 0)
+                        error_count = result.get("error_count", 0)
                         records = result.get("records_inserted", 0)
+                        etf_source = result.get("data_source_used")
+                        all_details[source] = result
+                        if error_count > 0 and success_count == 0 and not etf_source:
+                            etf_failed = True
+                            logger.warning(f"⚠️ ETF 历史数据同步失败: {result.get('errors')}")
+                            continue
                         etf_success_count = success_count
                         etf_records += records
-                        etf_source = result.get("data_source_used")
                         used_sources.append(f"etf:{etf_source}" if etf_source else "etf")
-                        all_details[source] = result
                         logger.info(f"✅ ETF 历史数据同步完成: 成功={success_count}, 记录={records}, 数据源={etf_source}")
                         continue
 
@@ -256,36 +341,62 @@ async def sync_favorites_historical_data():
                     if "stats" in result and isinstance(result["stats"], dict):
                         stats = result["stats"]
                         success_count = stats.get("success_count", 0)
+                        skipped_count = stats.get("skipped_count", 0)
+                        error_count = stats.get("error_count", 0)
                         records = stats.get("total_records", 0)
                     else:
                         # 直接使用result中的字段
                         success_count = result.get("success_count", 0)
+                        skipped_count = result.get("skipped_count", 0)
+                        error_count = result.get("error_count", 0)
                         records = result.get("total_records", 0)
                     
                     # 🔥 调试日志：查看具体哪些字段有值
                     logger.info(f"📊 {source} 历史数据返回: success_count={success_count}, total_records={records}, "
                                f"total_processed={result.get('total_processed', result.get('stats', {}).get('total_processed', 'N/A'))}, "
-                               f"error_count={result.get('error_count', result.get('stats', {}).get('error_count', 'N/A'))}, "
+                               f"error_count={error_count}, "
                                f"result keys={list(result.keys())}")
+
+                    if error_count > 0 and success_count == 0 and skipped_count == 0:
+                        logger.warning(f"⚠️ {source} 历史数据同步全部失败: error_count={error_count}")
+                        all_details[source] = result
+                        stock_sources_failed.append(f"{source}: 全部失败({error_count}只)")
+                        continue
 
                     stock_success_count = max(stock_success_count, success_count)  # 取最大值（因不同数据源可能覆盖相同的股票）
                     stock_records += records  # 累加记录数（不同数据源的数据会合并）
                     used_sources.append(source)
+                    stock_sources_succeeded.append(source)
                     all_details[source] = result
                     logger.info(f"✅ {source} 历史数据同步完成: 成功={success_count}, 记录={records}")
 
             total_success_count = stock_success_count + etf_success_count
             total_records = stock_records + etf_records
 
-            if not used_sources:
-                logger.warning("⚠️ 股票关注列表历史数据同步：所有数据源都失败")
+            stock_task_failed = bool(stock_codes) and not stock_sources_succeeded
+            hist_error_reasons = []
+            if stock_task_failed:
+                hist_error_reasons.append(
+                    "股票数据源全部失败"
+                    + (f" ({'; '.join(stock_sources_failed)})" if stock_sources_failed else "")
+                )
+            if etf_codes and etf_failed:
+                hist_error_reasons.append("ETF 历史数据同步失败")
+
+            if not used_sources or hist_error_reasons:
+                err_text = "；".join(hist_error_reasons) if hist_error_reasons else "所有数据源同步失败"
+                logger.warning(f"⚠️ 股票关注列表历史数据同步存在失败: {err_text}")
                 return {
                     "success": False,
-                    "message": "所有数据源同步失败",
+                    "message": err_text,
                     "total_count": len(a_stock_codes),
-                    "synced_count": 0,
-                    "data_source": None,
-                    "error": "所有数据源同步失败",
+                    "synced_count": total_success_count,
+                    "total_records": total_records,
+                    "stock_count": len(stock_codes),
+                    "etf_count": len(etf_codes),
+                    "data_source": ", ".join(used_sources) if used_sources else None,
+                    "data_sources": used_sources,
+                    "error": err_text,
                     "details": all_details
                 }
             
@@ -370,10 +481,23 @@ async def sync_favorites_financial_data():
                 "details": {}
             }
 
-        # 2. 按数据源优先级获取同步数据源列表（排除 local）
+        # 2. 按数据源优先级获取同步数据源列表（排除 local 及禁用/停机的 tushare）
         enabled_sources = await get_enabled_data_sources_async("a_shares")
         data_sources = _get_sync_data_sources(enabled_sources)
         logger.info(f"📊 股票关注列表财务数据同步数据源优先级: {data_sources}")
+
+        if not data_sources:
+            logger.warning("⚠️ 股票关注列表财务数据同步：过滤禁用/停机源后无可用数据源")
+            return {
+                "success": False,
+                "message": "无可用财务数据源（已排除禁用或停机数据源）",
+                "total_count": len(stock_codes),
+                "synced_count": 0,
+                "error_count": len(stock_codes),
+                "skipped_etf_count": skipped_etf_count,
+                "error": "无可用财务数据源",
+                "details": {},
+            }
         
         # 3. 使用财务数据同步服务，按优先级顺序同步
         financial_service = FinancialDataSyncService()
@@ -392,21 +516,25 @@ async def sync_favorites_financial_data():
         # 统计同步结果
         total_synced = 0
         total_errors = 0
+        total_skipped = 0
         for source, stats in result.items():
             total_synced += stats.success_count
             total_errors += stats.error_count
-        
+            total_skipped += getattr(stats, "skipped_count", 0)
+
+        fin_success = not (total_errors > 0 and total_synced == 0 and total_skipped == 0)
         logger.info(
-            f"✅ 股票关注列表A股财务数据同步完成: "
+            f"{'✅' if fin_success else '❌'} 股票关注列表A股财务数据同步完成: "
             f"股票数={len(stock_codes)}, "
             f"排除ETF={skipped_etf_count}, "
             f"成功同步={total_synced}, "
+            f"跳过={total_skipped}, "
             f"失败={total_errors}"
         )
         
-        return {
-            "success": True,
-            "message": "股票关注列表A股财务数据同步完成",
+        payload = {
+            "success": fin_success,
+            "message": "股票关注列表A股财务数据同步完成" if fin_success else f"财务数据同步失败（失败 {total_errors} 只）",
             "total_count": len(stock_codes),
             "synced_count": total_synced,
             "error_count": total_errors,
@@ -418,6 +546,9 @@ async def sync_favorites_financial_data():
                 "total_symbols": stats.total_symbols
             } for source, stats in result.items()}
         }
+        if not fin_success:
+            payload["error"] = payload["message"]
+        return payload
         
     except Exception as e:
         logger.error(f"❌ 股票关注列表A股财务数据同步失败: {e}", exc_info=True)
@@ -525,12 +656,36 @@ async def run_favorites_data_sync():
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         
-        # 更新进度：完成（100%）
+        hist_ok = isinstance(hist_result, dict) and hist_result.get("success") is not False
+        fin_ok = isinstance(fin_result, dict) and fin_result.get("success") is not False
+        overall_success = hist_ok and fin_ok
+
+        error_parts = []
+        if not hist_ok:
+            error_parts.append(
+                f"历史数据: {hist_result.get('error') or hist_result.get('message') or '同步失败'}"
+                if isinstance(hist_result, dict)
+                else "历史数据同步失败"
+            )
+        if not fin_ok:
+            error_parts.append(
+                f"财务数据: {fin_result.get('error') or fin_result.get('message') or '同步失败'}"
+                if isinstance(fin_result, dict)
+                else "财务数据同步失败"
+            )
+
+        summary_message = (
+            f"任务完成（耗时: {duration:.2f}秒）"
+            if overall_success
+            else f"任务存在子项失败（耗时: {duration:.2f}秒）: {'; '.join(error_parts)}"
+        )
+
+        # 更新进度：完成（100%，由调度器回调按返回 success 字段落终态）
         try:
             await update_job_progress(
                 job_id=job_id,
                 progress=100,
-                message=f"任务完成（耗时: {duration:.2f}秒）",
+                message=summary_message,
                 total_items=total_stocks if total_stocks > 0 else 1,
                 processed_items=total_stocks if total_stocks > 0 else 1
             )
@@ -538,18 +693,22 @@ async def run_favorites_data_sync():
             pass
         
         logger.info(
-            f"✅ [APScheduler] 股票关注列表A股数据同步任务完成 "
-            f"(耗时: {duration:.2f}秒)\n"
-            f"   历史数据: {hist_result.get('synced_count', 0)}/{hist_result.get('total_count', 0)} 只股票\n"
-            f"   财务数据: {fin_result.get('synced_count', 0)}/{fin_result.get('total_count', 0)} 只股票"
+            f"{'✅' if overall_success else '❌'} [APScheduler] 股票关注列表A股数据同步任务结束 "
+            f"(success={overall_success}, 耗时: {duration:.2f}秒)\n"
+            f"   历史数据: {hist_result.get('synced_count', 0)}/{hist_result.get('total_count', 0)} 只股票 (ok={hist_ok})\n"
+            f"   财务数据: {fin_result.get('synced_count', 0)}/{fin_result.get('total_count', 0)} 只股票 (ok={fin_ok})"
         )
         
-        return {
-            "success": True,
+        result_payload = {
+            "success": overall_success,
+            "message": summary_message,
             "duration_seconds": duration,
             "historical_data": hist_result,
             "financial_data": fin_result
         }
+        if not overall_success:
+            result_payload["error"] = "; ".join(error_parts)
+        return result_payload
         
     except Exception as e:
         logger.error(f"❌ [APScheduler] 股票关注列表A股数据同步任务失败: {e}", exc_info=True)

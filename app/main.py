@@ -33,7 +33,10 @@ from app.migration_guard import enabled as migration_review_enabled, ReviewGuard
 from app.core.logging_config import setup_logging
 from app.router_registry import register_routers
 from app.services.basics_sync_service import get_basics_sync_service
-from app.services.multi_source_basics_sync_service import MultiSourceBasicsSyncService
+from app.services.multi_source_basics_sync_service import (
+    MultiSourceBasicsSyncService,
+    get_multi_source_sync_service,
+)
 from app.services.scheduler_service import set_scheduler_instance
 from app.worker.tushare_sync_service import (
     run_tushare_realtime_quotes_hourly,
@@ -537,8 +540,8 @@ async def lifespan(app: FastAPI):
             job_defaults=job_defaults
         )
 
-        # 使用多数据源同步服务（支持自动切换）
-        multi_source_service = MultiSourceBasicsSyncService()
+        # 使用多数据源同步服务单例（与路由层共享并发锁与运行态）
+        multi_source_service = get_multi_source_sync_service()
 
         # 🔥 从数据库读取数据源优先级配置（而非硬编码）
         # 排除 local/mongodb 等缓存层，只使用真实 API 数据源
@@ -927,7 +930,13 @@ async def lifespan(app: FastAPI):
             id="trading_calendar_refresh",
             name="交易日历缓存刷新（每日18:30）"
         )
-        logger.info("🗓️ 交易日历缓存刷新任务已配置（每日 18:30 执行）")
+        scheduler.add_job(
+            _refresh_trading_calendar,
+            CronTrigger(day_of_week="mon-fri", hour=9, minute=10, timezone=settings.TIMEZONE),
+            id="trading_calendar_pre_market_refresh",
+            name="交易日历盘前缓存刷新（工作日09:10）"
+        )
+        logger.info("🗓️ 交易日历缓存刷新任务已配置（工作日 09:10 盘前 + 每日 18:30 收盘后执行）")
 
         # v3.5.0 项4 / v3.6.0 项6：HITL 待确认操作过期清理（每 30 分钟执行一次）
         async def _expire_stale_hitl_operations():

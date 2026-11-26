@@ -923,18 +923,56 @@ class EtfSyncService:
 
         try:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, fetch_fn)
+            basic_timeout = float(getattr(self, "basic_fetch_timeout_seconds", 45.0))
+            valuation_timeout = float(getattr(self, "valuation_fetch_timeout_seconds", 30.0))
+            try:
+                rows = await asyncio.wait_for(
+                    loop.run_in_executor(None, fetch_fn),
+                    timeout=basic_timeout,
+                )
+            except asyncio.TimeoutError:
+                stats["error_count"] = 1
+                stats["errors"].append({
+                    "error": f"{source} 获取 ETF 基础信息超时（>{basic_timeout:.0f}s），已中止并切换其他数据源"
+                })
+                await self._report_job_progress(
+                    job_id,
+                    stage_start,
+                    f"获取 ETF 基础信息超时（{source.upper()}），尝试其他数据源",
+                    current_item=source.upper(),
+                )
+                logger.warning(f"⚠️ [{source}] 获取 ETF 列表超时（>{basic_timeout:.0f}s）")
+                return stats
+
             if symbols:
                 normalized_symbols = {_normalize_etf_code(symbol) for symbol in symbols if _normalize_etf_code(symbol)}
                 rows = [row for row in rows if row.get("code") in normalized_symbols]
             valuation_map = {}
             share_map = {}
             if source == "akshare":
-                valuation_map = await loop.run_in_executor(None, _fetch_etf_valuation_map_akshare)
+                try:
+                    valuation_map = await asyncio.wait_for(
+                        loop.run_in_executor(None, _fetch_etf_valuation_map_akshare),
+                        timeout=valuation_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ [{source}] 获取 ETF 估值/净值表超时（>{valuation_timeout:.0f}s），跳过估值补充")
             elif source == "tushare":
                 target_codes = {row["code"] for row in rows if row.get("code")}
-                valuation_map = await loop.run_in_executor(None, partial(_fetch_etf_nav_map_tushare, target_codes, 15))
-                share_map = await loop.run_in_executor(None, partial(_fetch_etf_share_map_tushare, target_codes, 30))
+                try:
+                    valuation_map = await asyncio.wait_for(
+                        loop.run_in_executor(None, partial(_fetch_etf_nav_map_tushare, target_codes, 15)),
+                        timeout=valuation_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ [{source}] 获取 ETF 净值表超时（>{valuation_timeout:.0f}s），跳过净值补充")
+                try:
+                    share_map = await asyncio.wait_for(
+                        loop.run_in_executor(None, partial(_fetch_etf_share_map_tushare, target_codes, 30)),
+                        timeout=valuation_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"⚠️ [{source}] 获取 ETF 份额表超时（>{valuation_timeout:.0f}s），跳过份额补充")
             if not rows:
                 stats["error_count"] = 1
                 stats["errors"].append({"error": f"{source} 未获取到所请求 ETF 的基础信息，请检查数据源连接或切换数据源"})
@@ -1495,16 +1533,46 @@ class EtfSyncService:
             "requested_symbols": normalized_symbols,
         }
 
-    def _is_fresh(self, updated_at: Any, hours: int = 24) -> bool:
-        """检查数据是否在指定小时内更新过"""
+    def _is_fresh(
+        self,
+        updated_at: Any,
+        hours: int = 24,
+        minutes: Optional[int] = None,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """检查数据是否在指定时间窗口内更新过（复用 quote_contract 统一 UTC/CST 解析并拒绝未来时间戳）。"""
         if not updated_at:
             return False
         try:
-            if isinstance(updated_at, str):
-                updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-            if updated_at.tzinfo:
-                updated_at = updated_at.replace(tzinfo=None)
-            return (datetime.utcnow() - updated_at).total_seconds() < hours * 3600
+            from app.services.quote_contract import (
+                DEFAULT_MAX_FUTURE_SECONDS,
+                cn_now,
+                parse_quote_time,
+            )
+
+            parsed = parse_quote_time(updated_at)
+            if parsed is None:
+                return False
+
+            threshold_seconds = (minutes * 60) if minutes is not None else (hours * 3600)
+            if threshold_seconds <= 0:
+                return False
+
+            reference_now = parse_quote_time(now) if now is not None else cn_now()
+            if reference_now is None:
+                return False
+
+            age_seconds = (reference_now - parsed).total_seconds()
+            if age_seconds < -DEFAULT_MAX_FUTURE_SECONDS:
+                logger.warning(
+                    "⚠️ [ETF 同步] 数据时间戳超前当前时间: updated_at=%s, now=%s, age_seconds=%.1f",
+                    parsed.isoformat(),
+                    reference_now.isoformat(),
+                    age_seconds,
+                )
+                return False
+
+            return age_seconds < threshold_seconds
         except Exception:
             return False
 

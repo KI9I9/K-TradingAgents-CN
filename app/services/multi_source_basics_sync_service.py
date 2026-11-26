@@ -66,6 +66,11 @@ class SyncStats:
 class MultiSourceBasicsSyncService:
     """多数据源股票基础信息同步服务"""
 
+    # 支持快速全市场批量拉取 daily_basic 的数据源（baostock 为全市场 5000+ 只串行循环，必然撞穿 45s 超时）
+    FAST_BULK_DAILY_BASIC_SOURCES = frozenset({"tushare"})
+    SLOW_SERIAL_DAILY_BASIC_SOURCES = frozenset({"baostock"})
+    EXCLUDED_DAILY_BASIC_SOURCES = frozenset({"", "local", "mongodb", "local_file", "qmt"})
+
     def __init__(self):
         self._lock = asyncio.Lock()
         self._running = False
@@ -240,12 +245,41 @@ class MultiSourceBasicsSyncService:
 
         self._last_status = {k: v for k, v in stats.items() if k != "_id"}
 
+    @classmethod
+    def _select_daily_basic_sources(
+        cls,
+        available_sources: List[str],
+        preferred_sources: Optional[List[str]] = None,
+    ) -> List[str]:
+        """筛选支持快速批量获取 daily_basic 的数据源，剔除必然超时的全市场串行慢源（如 baostock）。"""
+        available_clean = [
+            str(s).strip().lower()
+            for s in (available_sources or [])
+            if str(s or "").strip().lower() not in cls.EXCLUDED_DAILY_BASIC_SOURCES
+            and str(s or "").strip().lower() not in cls.SLOW_SERIAL_DAILY_BASIC_SOURCES
+        ]
+        fast_available = [s for s in available_clean if s in cls.FAST_BULK_DAILY_BASIC_SOURCES]
+        if not fast_available:
+            return []
+
+        if preferred_sources:
+            ordered = [
+                str(s).strip().lower()
+                for s in preferred_sources
+                if str(s or "").strip().lower() in fast_available
+            ]
+            for source_name in fast_available:
+                if source_name not in ordered:
+                    ordered.append(source_name)
+            return ordered
+        return fast_available
+
     async def _execute_bulk_write_with_retry(
         self,
         db: AsyncIOMotorDatabase,
         operations: List,
         max_retries: int = 3
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int]:
         """
         执行批量写入，带重试机制（线程安全）
 
@@ -255,7 +289,7 @@ class MultiSourceBasicsSyncService:
             max_retries: 最大重试次数
 
         Returns:
-            (新增数量, 更新数量)
+            (新增数量, 更新数量, 匹配数量)
         """
         try:
             # 🔥 使用线程安全的 bulk_write
@@ -269,14 +303,15 @@ class MultiSourceBasicsSyncService:
                 max_retries=max_retries
             )
 
-            inserted = result.upserted_count
-            updated = result.modified_count
-            logger.debug(f"✅ 批量写入成功: 新增 {inserted}, 更新 {updated}")
-            return inserted, updated
+            inserted = getattr(result, "upserted_count", 0) or 0
+            updated = getattr(result, "modified_count", 0) or 0
+            matched = getattr(result, "matched_count", 0) or 0
+            logger.debug(f"✅ 批量写入成功: 新增 {inserted}, 更新 {updated}, 匹配 {matched}")
+            return inserted, updated, matched
 
         except Exception as e:
             logger.error(f"❌ 批量写入失败: {e}")
-            return 0, 0
+            return 0, 0, 0
 
     async def run_full_sync(self, force: bool = False, preferred_sources: List[str] = None) -> Dict[str, Any]:
         """
@@ -473,23 +508,43 @@ class MultiSourceBasicsSyncService:
             daily_data_map = {}
             daily_source = ""
             if latest_trade_date:
-                step_start = time.perf_counter()
-                daily_df, daily_source = await fetch_async(
-                    "daily_basic", {"trade_date": latest_trade_date, "preferred_sources": preferred_sources},
-                    timeout=45,
-                )
-                if daily_df is not None and not daily_df.empty:
-                    for _, row in daily_df.iterrows():
-                        ts_code = row.get("ts_code")
-                        if ts_code:
-                            daily_data_map[ts_code] = row.to_dict()
-                    stats.data_sources_used.append(f"daily_data:{daily_source}")
-                logger.info(
-                    "📈 [多数据源基础信息同步] daily_basic source=%s, records=%s, elapsed=%.2fs",
-                    daily_source or "-",
-                    0 if daily_df is None else len(daily_df),
-                    time.perf_counter() - step_start,
-                )
+                available_names = [getattr(adapter, "name", "") for adapter in available_adapters]
+                daily_basic_sources = self._select_daily_basic_sources(available_names, preferred_sources)
+                if not daily_basic_sources:
+                    logger.warning(
+                        "⚠️ [多数据源基础信息同步] 跳过 daily_basic 拉取：当前无可用快速批量数据源"
+                        "（可用源=%s，已规避 45s 必超时的串行慢源 baostock），已有每日财务指标将保留",
+                        available_names,
+                    )
+                else:
+                    step_start = time.perf_counter()
+                    try:
+                        daily_df, daily_source = await fetch_async(
+                            "daily_basic",
+                            {
+                                "trade_date": latest_trade_date,
+                                "preferred_sources": daily_basic_sources,
+                                "exclude_sources": sorted(self.SLOW_SERIAL_DAILY_BASIC_SOURCES),
+                            },
+                            timeout=45,
+                        )
+                        if daily_df is not None and not daily_df.empty:
+                            for _, row in daily_df.iterrows():
+                                ts_code = row.get("ts_code")
+                                if ts_code:
+                                    daily_data_map[ts_code] = row.to_dict()
+                            stats.data_sources_used.append(f"daily_data:{daily_source}")
+                        logger.info(
+                            "📈 [多数据源基础信息同步] daily_basic source=%s, records=%s, elapsed=%.2fs",
+                            daily_source or "-",
+                            0 if daily_df is None else len(daily_df),
+                            time.perf_counter() - step_start,
+                        )
+                    except Exception as daily_err:
+                        logger.warning(
+                            "⚠️ [多数据源基础信息同步] daily_basic 降级跳过（保留已有指标）: %s",
+                            daily_err,
+                        )
 
             from app.services.official_industry_service import (
                 INDUSTRY_SOURCE_SYSTEM,
@@ -605,12 +660,20 @@ class MultiSourceBasicsSyncService:
                         progress_pct = (idx / total_stocks) * 100
                         logger.info(f"📝 执行批量写入: {len(ops)} 条记录 ({idx}/{total_stocks}, {progress_pct:.1f}%)")
 
-                        batch_inserted, batch_updated = await self._execute_bulk_write_with_retry(db, ops)
+                        batch_result = await self._execute_bulk_write_with_retry(db, ops)
+                        if len(batch_result) == 3:
+                            batch_inserted, batch_updated, batch_matched = batch_result
+                        else:
+                            batch_inserted, batch_updated = batch_result
+                            batch_matched = 0
 
-                        if batch_inserted > 0 or batch_updated > 0:
+                        if batch_inserted > 0 or batch_updated > 0 or batch_matched > 0:
                             inserted += batch_inserted
                             updated += batch_updated
-                            logger.info(f"✅ 批量写入完成: 新增 {batch_inserted}, 更新 {batch_updated} | 累计: 新增 {inserted}, 更新 {updated}, 错误 {errors}")
+                            logger.info(
+                                f"✅ 批量写入完成: 新增 {batch_inserted}, 更新 {batch_updated}, 匹配 {batch_matched} "
+                                f"| 累计: 新增 {inserted}, 更新 {updated}, 错误 {errors}"
+                            )
                         else:
                             errors += len(ops)
                             logger.warning(f"⚠️ 批量写入失败，标记 {len(ops)} 条记录为错误")

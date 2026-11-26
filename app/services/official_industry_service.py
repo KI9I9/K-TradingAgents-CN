@@ -4,9 +4,12 @@
 系统内置一份股票代码 -> 行业 的映射集合，所有读取方统一从该集合取数。
 未来可由官网接口供数；当前在未配置官网接口时，临时使用 Tushare 作为供数来源。
 """
+import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from pymongo import UpdateMany, UpdateOne
 
@@ -16,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 INDUSTRY_MAPPING_COLLECTION = "stock_industry_mappings"
 INDUSTRY_SOURCE_SYSTEM = "system_industry_mapping"
+TUSHARE_INDUSTRY_FETCH_TIMEOUT_SECONDS = 20.0
 
 _industry_cache: Optional[Dict[str, str]] = None
 _cache_time: Optional[datetime] = None
@@ -170,21 +174,69 @@ async def _fetch_mapping_from_official_url() -> Dict[str, str]:
         return {}
 
 
-async def _fetch_mapping_from_tushare() -> Dict[str, str]:
+def _is_tushare_industry_fallback_allowed() -> Tuple[bool, str]:
+    """检查行业映射 Tushare 回退是否受全局开关、STOP 门禁或 egress 许可阻止（fail-closed）。"""
+    env_flag = os.getenv("ENABLE_TUSHARE")
+    if env_flag is not None and env_flag.strip().lower() in ("0", "false", "no", "off"):
+        return False, "env_disabled"
+    try:
+        from app.core.config import settings
+        if getattr(settings, "ENABLE_TUSHARE", True) is False:
+            return False, "settings_disabled"
+    except Exception:
+        pass
+
+    route = os.environ.get("TA_TUSHARE_ROUTE", "").strip()
+    if route.lower() in ("disabled", "off", "stop", "stopped", "none"):
+        return False, "route_disabled"
+
+    try:
+        from tradingagents.utils.tushare_egress import (
+            STATE_DIR,
+            TushareEgressStopped,
+            raise_if_egress_blocked,
+        )
+        from tradingagents.utils.tushare_manual import DIRECTORY as MANUAL_DIR
+
+        if (Path(STATE_DIR) / "STOP").exists() or (Path(MANUAL_DIR) / "STOP").exists():
+            return False, "stop_marker"
+        if route == "mainland_unix" or Path(STATE_DIR).exists():
+            raise_if_egress_blocked()
+    except TushareEgressStopped as stopped:
+        return False, f"egress_stopped:{stopped.reason}"
+    except Exception as exc:
+        logger.warning("⚠️ [行业映射] 检查 Tushare 门禁状态异常，按 fail-closed 跳过: %s", exc)
+        return False, "gate_check_error"
+
+    return True, "ok"
+
+
+async def _fetch_mapping_from_tushare(timeout_seconds: float = TUSHARE_INDUSTRY_FETCH_TIMEOUT_SECONDS) -> Dict[str, str]:
+    allowed, reason = _is_tushare_industry_fallback_allowed()
+    if not allowed:
+        logger.info("⏸️ [行业映射] 跳过 Tushare 回退（受禁用/门禁限制: %s）", reason)
+        return {}
+
     try:
         from tradingagents.dataflows.providers.china.tushare import TushareProvider
 
         provider = TushareProvider()
-        connected = await provider.connect()
+        connected = await asyncio.wait_for(provider.connect(), timeout=timeout_seconds)
         if not connected:
             logger.warning("Tushare 连接失败，无法刷新行业映射集合")
             return {}
 
-        stock_list = await provider.get_stock_list(market="CN")
+        stock_list = await asyncio.wait_for(
+            provider.get_stock_list(market="CN"),
+            timeout=timeout_seconds,
+        )
         mapping = _normalize_mapping_payload(stock_list)
         if mapping:
             logger.info(f"✅ 从 Tushare 临时供数获取行业映射成功: {len(mapping)} 只股票")
         return mapping
+    except asyncio.TimeoutError:
+        logger.warning("⚠️ 从 Tushare 获取行业映射超时（>%.1fs），已中止回退", timeout_seconds)
+        return {}
     except Exception as e:
         logger.warning(f"从 Tushare 获取行业映射失败: {e}")
         return {}
