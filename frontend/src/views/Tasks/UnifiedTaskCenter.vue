@@ -63,6 +63,15 @@
     <!-- 筛选表单 -->
     <el-card class="filter-card" shadow="never">
       <el-form :inline="true" @submit.prevent>
+        <el-form-item label="股票代码">
+          <el-input
+            v-model="filters.symbol"
+            clearable
+            placeholder="如：600519 / 588000"
+            style="width: 170px"
+            @keyup.enter="applyFilters"
+          />
+        </el-form-item>
         <el-form-item label="任务类型">
           <el-select v-model="filters.taskType" clearable placeholder="全部" style="width: 140px">
             <el-option label="全部" value="" />
@@ -97,7 +106,14 @@
         </el-table-column>
         <el-table-column label="股票/代码" width="120">
           <template #default="{ row }">
-            {{ row.symbol || row.code || '-' }}
+            <el-link
+              v-if="row.symbol || row.code"
+              type="primary"
+              @click="openStockDetail(row)"
+            >
+              {{ row.symbol || row.code }}
+            </el-link>
+            <span v-else>-</span>
           </template>
         </el-table-column>
         <el-table-column label="市场" width="80">
@@ -130,8 +146,17 @@
             {{ row.execution_time > 0 ? row.execution_time.toFixed(2) + 's' : '-' }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="350" fixed="right">
+        <el-table-column label="操作" width="380" fixed="right">
           <template #default="{ row }">
+            <el-button
+              v-if="isCompletedReportTask(row)"
+              type="primary"
+              link
+              size="small"
+              @click="viewReport(row)"
+            >
+              查看报告
+            </el-button>
             <el-button type="text" size="small" @click="viewDetail(row)">详情</el-button>
             <el-button type="text" size="small" @click="viewTraces(row)">执行轨迹</el-button>
             <el-button
@@ -210,7 +235,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { List, Refresh } from '@element-plus/icons-vue'
 import {
@@ -219,18 +245,26 @@ import {
   cancelTask as cancelTaskApi,
   resumeTask as resumeTaskApi,
   getTaskDetail,
+  TaskType,
+  TaskStatus,
   TaskTypeNames,
   TaskStatusNames,
   TaskStatusColors,
   type TaskListItem,
   type TaskStatistics,
-  type TaskDetail
+  type TaskDetail,
+  type TaskTagType
 } from '@/api/unifiedTasks'
 import { analysisApi } from '@/api/analysis'
+import { goStockDetail } from '@/utils/navigation'
+import { isEtfCode, stripStockCodeSuffix } from '@/utils/market'
 import TaskDetailDialog from './components/TaskDetailDialog.vue'
 import ExecutionTraceDialog from './components/ExecutionTraceDialog.vue'
 
 // ==================== 状态管理 ====================
+
+const route = useRoute()
+const router = useRouter()
 
 const loading = ref(false)
 const taskList = ref<TaskListItem[]>([])
@@ -251,7 +285,8 @@ const total = ref(0)
 // 筛选
 const filters = ref({
   taskType: '',
-  status: ''
+  status: '',
+  symbol: ''
 })
 
 const getTaskTypeName = (taskType: unknown) => {
@@ -268,11 +303,45 @@ const getTaskStatusName = (status: unknown) => {
   return TaskStatusNames[status as keyof typeof TaskStatusNames] || status
 }
 
-const getTaskStatusColor = (status: unknown) => {
+const getTaskStatusColor = (status: unknown): TaskTagType => {
   if (typeof status !== 'string') {
     return 'info'
   }
   return TaskStatusColors[status as keyof typeof TaskStatusColors] || 'info'
+}
+
+const isCompletedReportTask = (row: TaskListItem) => {
+  return (
+    row.status === TaskStatus.COMPLETED &&
+    (row.task_type === TaskType.STOCK_ANALYSIS || row.task_type === TaskType.ETF_ANALYSIS)
+  )
+}
+
+const viewReport = (row: TaskListItem) => {
+  if (!row.task_id) return
+  router.push(`/reports/view/${row.task_id}`)
+}
+
+const openStockDetail = (row: TaskListItem) => {
+  const code = row.symbol || row.code
+  if (!code) return
+  goStockDetail(router, code, row.market)
+}
+
+const syncFiltersFromRouteQuery = () => {
+  const rawType = String(route.query.type || route.query.task_type || '').trim()
+  const rawSymbol = String(route.query.symbol || route.query.stock || route.query.code || '').trim()
+  const rawStatus = String(route.query.status || '').trim()
+  const normalizedSymbol = rawSymbol ? stripStockCodeSuffix(rawSymbol) : ''
+
+  let resolvedType = rawType && Object.prototype.hasOwnProperty.call(TaskTypeNames, rawType) ? rawType : ''
+  if (resolvedType === TaskType.STOCK_ANALYSIS && normalizedSymbol && isEtfCode(normalizedSymbol)) {
+    resolvedType = TaskType.ETF_ANALYSIS
+  }
+
+  filters.value.taskType = resolvedType
+  filters.value.symbol = normalizedSymbol
+  filters.value.status = rawStatus && Object.prototype.hasOwnProperty.call(TaskStatusNames, rawStatus) ? rawStatus : ''
 }
 
 // 任务详情对话框
@@ -311,12 +380,23 @@ const loadList = async () => {
     if (filters.value.status) {
       params.status = filters.value.status
     }
+    const normalizedSymbol = stripStockCodeSuffix(filters.value.symbol)
+    if (normalizedSymbol) {
+      params.symbol = normalizedSymbol
+    }
 
     const res = await getTaskList(params)
     const data = (res as any)?.data?.data || (res as any)?.data || {}
 
-    // 获取所有任务，然后在前端进行分页
-    const allTasks = data.tasks || []
+    // 获取所有任务，兼容按代码做兜底筛选后再前端分页
+    let allTasks: TaskListItem[] = data.tasks || []
+    if (normalizedSymbol) {
+      allTasks = allTasks.filter((task) => {
+        const candidate = stripStockCodeSuffix(task.symbol || task.code || '')
+        return candidate.includes(normalizedSymbol)
+      })
+    }
+
     const startIdx = (currentPage.value - 1) * pageSize.value
     const endIdx = startIdx + pageSize.value
 
@@ -356,7 +436,8 @@ const applyFilters = () => {
 const resetFilters = () => {
   filters.value = {
     taskType: '',
-    status: ''
+    status: '',
+    symbol: ''
   }
   currentPage.value = 1
   loadList()
@@ -409,7 +490,7 @@ const cancelTask = async (row: TaskListItem) => {
     ElMessage.success('任务已取消')
     await refreshList()
   } catch (e: any) {
-    if (e !== 'cancel') {
+    if (e !== 'cancel' && e !== 'close') {
       ElMessage.error(e?.message || '取消任务失败')
     }
   } finally {
@@ -437,7 +518,7 @@ const resumeTask = async (row: TaskListItem) => {
     ElMessage.success('任务已恢复，正在重新排队...')
     await refreshList()
   } catch (e: any) {
-    if (e !== 'cancel') {
+    if (e !== 'cancel' && e !== 'close') {
       ElMessage.error(e?.message || '恢复任务失败')
     }
   } finally {
@@ -524,7 +605,17 @@ const setupAutoRefresh = () => {
 
 // ==================== 生命周期 ====================
 
+watch(
+  () => [route.query.type, route.query.task_type, route.query.symbol, route.query.stock, route.query.code, route.query.status],
+  () => {
+    syncFiltersFromRouteQuery()
+    currentPage.value = 1
+    loadList()
+  }
+)
+
 onMounted(() => {
+  syncFiltersFromRouteQuery()
   loadList()
   loadStats()
   setupAutoRefresh()

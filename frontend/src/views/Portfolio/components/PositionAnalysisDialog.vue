@@ -314,6 +314,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { renderMarkdown as safeMarkdown } from '@/utils/markdown'
 import { getMarketByStockCode } from '@/utils/market'
+import { goSingleAnalysis } from '@/utils/navigation'
 import { workflowApi, isSelectableAnalysisWorkflow, type WorkflowSummary } from '@/api/workflow'
 import PositionAnalysisHistoryDialog from './PositionAnalysisHistoryDialog.vue'
 
@@ -456,7 +457,7 @@ const hasAccountCapital = computed(() => {
 })
 const isEtfPosition = computed(() => {
   if (!props.position) return false
-  return props.position.market === 'CN' && getMarketByStockCode(props.position.code) === 'ETF'
+  return props.position.market === 'ETF' || (props.position.market === 'CN' && getMarketByStockCode(props.position.code) === 'ETF')
 })
 const securityCodeLabel = computed(() => isEtfPosition.value ? 'ETF代码' : '股票代码')
 const securityNameLabel = computed(() => isEtfPosition.value ? 'ETF名称' : '股票名称')
@@ -604,8 +605,11 @@ const handleAnalyze = async () => {
             // 跳转到单股分析页面，带上股票代码参数
             const marketName = props.position.market === 'CN'
               ? getMarketByStockCode(props.position.code)
-              : 'A股'
-            router.push(`/analysis/single?stock_code=${props.position.code}&market=${marketName}`)
+              : (props.position.market || 'A股')
+            goSingleAnalysis(router, {
+              code: props.position.code,
+              market: marketName
+            })
             visible.value = false // 关闭当前对话框
           }
           return // 取消分析，不执行后续流程

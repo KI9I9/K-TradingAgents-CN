@@ -28,6 +28,7 @@
         <el-col :span="4">
           <el-select v-model="selectedMarket" placeholder="市场" clearable>
             <el-option label="A股" value="A股" />
+            <el-option label="ETF" value="ETF" />
           </el-select>
         </el-col>
 
@@ -86,6 +87,16 @@
               <el-icon><Download /></el-icon>
               批量同步数据
             </el-button>
+            <el-button
+              type="warning"
+              plain
+              :disabled="selectedStocks.length === 0"
+              :loading="batchAnalyzeLoading"
+              @click="handleBatchAnalyze"
+            >
+              <el-icon><TrendCharts /></el-icon>
+              批量分析选中 ({{ selectedStocks.length }})
+            </el-button>
             <el-button @click="openTagManager">
               标签管理
             </el-button>
@@ -118,7 +129,7 @@
         <el-table-column prop="stock_name" label="股票名称" width="150" />
         <el-table-column prop="market" label="市场" width="80">
           <template #default="{ row }">
-            {{ row.market || 'A股' }}
+            {{ resolveFavoriteMarket(row) }}
           </template>
         </el-table-column>
         <el-table-column prop="board" label="板块" width="100">
@@ -172,7 +183,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button
               type="text"
@@ -183,7 +194,7 @@
             </el-button>
             <!-- 只有A股显示同步按钮 -->
             <el-button
-              v-if="row.market === 'A股'"
+              v-if="resolveFavoriteMarket(row) === 'A股'"
               type="text"
               size="small"
               @click="showSingleSyncDialog(row)"
@@ -197,6 +208,14 @@
               @click="analyzeFavorite(row)"
             >
               分析
+            </el-button>
+            <el-button
+              type="text"
+              size="small"
+              @click="orderFavorite(row)"
+              style="color: #67c23a;"
+            >
+              模拟下单
             </el-button>
             <el-button
               type="text"
@@ -230,14 +249,15 @@
         <el-form-item label="市场类型" prop="market">
           <el-select v-model="addForm.market" @change="handleMarketChange">
             <el-option label="A股" value="A股" />
+            <el-option label="ETF" value="ETF" />
           </el-select>
         </el-form-item>
 
-        <el-form-item label="股票代码" prop="stock_code">
+        <el-form-item label="标的代码" prop="stock_code">
           <el-autocomplete
             v-model="addForm.stock_code"
             :fetch-suggestions="searchStocks"
-            placeholder="输入股票代码或名称搜索，如：000001 或 平安银行"
+            placeholder="输入股票/ETF代码或名称搜索，如：000001、588000 或 科创50"
             clearable
             class="w-full"
             value-key="code"
@@ -246,14 +266,21 @@
             @blur="fetchStockInfo"
           >
             <template #default="{ item }">
-              <div style="display: flex; justify-content: space-between; align-items: center; padding: 5px 0;">
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 5px 0; gap: 8px;">
                 <span style="font-weight: 600; color: #303133;">{{ item.code }}</span>
-                <span style="color: #606266; font-size: 13px;">{{ item.name }}</span>
+                <span style="color: #606266; font-size: 13px; flex: 1; text-align: right;">{{ item.name }}</span>
+                <el-tag
+                  size="small"
+                  :type="item.isEtf ? 'warning' : 'info'"
+                  effect="plain"
+                >
+                  {{ item.isEtf ? 'ETF' : 'A股' }}
+                </el-tag>
               </div>
             </template>
           </el-autocomplete>
           <div style="font-size: 12px; color: #909399; margin-top: 4px;">
-            支持股票代码或名称搜索，选择后自动填充
+            支持 A股 / ETF 代码或名称搜索，选择或输入 6 位代码后将自动识别市场类型
           </div>
         </el-form-item>
 
@@ -418,7 +445,7 @@
         style="margin-bottom: 16px;"
       >
         <template v-if="syncAllStocks">
-          将同步研究列表中所有 <strong>{{ favorites.filter(item => item.market === 'A股').length }}</strong> 只A股股票
+          将同步研究列表中所有 <strong>{{ favorites.filter(item => resolveFavoriteMarket(item) === 'A股').length }}</strong> 只A股股票
         </template>
         <template v-else>
           已选择 <strong>{{ selectedStocks.length }}</strong> 只股票
@@ -522,8 +549,10 @@ import {
   Search,
   Refresh,
   Plus,
-  Download
+  Download,
+  TrendCharts
 } from '@element-plus/icons-vue'
+import { analysisApi } from '@/api/analysis'
 import { favoritesApi } from '@/api/favorites'
 import { tagsApi } from '@/api/tags'
 import {
@@ -533,7 +562,9 @@ import {
   type StockSyncTaskStatus,
 } from '@/api/stockSync'
 import { loadManualSyncSourceState, type ManualSyncDataSource } from '@/utils/dataSource'
-import { normalizeMarketForAnalysis } from '@/utils/market'
+import { isEtfCode, stripStockCodeSuffix } from '@/utils/market'
+import { goPaperOrder, goSingleAnalysis, goStockDetail, resolveAnalysisMarket } from '@/utils/navigation'
+import { convertAnalystNamesToIds } from '@/constants/analysts'
 import { ApiClient } from '@/api/request'
 
 import type { FavoriteItem, FavoritesRealtimeSyncTaskStatus } from '@/api/favorites'
@@ -568,6 +599,12 @@ const selectedExchange = ref('')
 
 // 批量选择
 const selectedStocks = ref<FavoriteItem[]>([])
+const batchAnalyzeLoading = ref(false)
+const authStore = useAuthStore()
+
+const resolveFavoriteMarket = (row: Pick<FavoriteItem, 'stock_code' | 'symbol' | 'market'>) => {
+  return resolveAnalysisMarket(row.stock_code || row.symbol || '', row.market)
+}
 
 // 批量同步对话框
 const batchSyncDialogVisible = ref(false)
@@ -654,14 +691,14 @@ const filteredFavorites = computed<FavoriteItem[]>(() => {
     const keyword = searchKeyword.value.toLowerCase()
     result = result.filter((item: FavoriteItem) =>
       String(item.stock_code || item.symbol || '').toLowerCase().includes(keyword) ||
-      item.stock_name.toLowerCase().includes(keyword)
+      String(item.stock_name || '').toLowerCase().includes(keyword)
     )
   }
 
   // 市场筛选
   if (selectedMarket.value) {
     result = result.filter((item: FavoriteItem) =>
-      item.market === selectedMarket.value
+      resolveFavoriteMarket(item) === selectedMarket.value
     )
   }
 
@@ -691,7 +728,7 @@ const filteredFavorites = computed<FavoriteItem[]>(() => {
 
 // 判断是否有A股股票关注列表
 const hasAStocks = computed(() => {
-  return favorites.value.some(item => item.market === 'A股')
+  return favorites.value.some(item => resolveFavoriteMarket(item) === 'A股')
 })
 
 // 方法
@@ -917,7 +954,7 @@ const handleMarketChange = () => {
   }
 }
 
-// 搜索股票（支持代码和名称）
+// 搜索股票/ETF（支持代码和名称）
 // 注意：不能声明为 async——el-autocomplete 的 fetch-suggestions 要求同步返回
 // void 的函数签名，async 函数返回 Promise<void> 会触发 vue-tsc 类型错误
 const searchStocks = (queryString: string, cb: (results: any[]) => void) => {
@@ -931,11 +968,18 @@ const searchStocks = (queryString: string, cb: (results: any[]) => void) => {
     .get(`/api/markets/CN/stocks/search`, { params: { q, limit: 20 } })
     .then((res: any) => {
       const stocks = res?.data?.stocks || []
-      cb(stocks.map((s: any) => ({
-        value: s.code || s.symbol || '',
-        code: s.code || s.symbol || '',
-        name: s.name || '',
-      })))
+      cb(stocks.map((s: any) => {
+        const code = stripStockCodeSuffix(s.code || s.symbol || '')
+        const isEtf = String(s.security_type || '').toUpperCase() === 'ETF' || isEtfCode(code)
+        return {
+          value: code,
+          code,
+          name: s.name || '',
+          security_type: s.security_type || (isEtf ? 'ETF' : 'STOCK'),
+          market: isEtf ? 'ETF' : 'A股',
+          isEtf
+        }
+      }))
     })
     .catch((err: any) => {
       console.error('搜索失败:', err)
@@ -943,11 +987,14 @@ const searchStocks = (queryString: string, cb: (results: any[]) => void) => {
     })
 }
 
-// 选择搜索结果后自动填充
+// 选择搜索结果后自动填充并识别市场
 const handleStockSelect = (item: any) => {
-  console.log('选中项:', item)
-  // el-autocomplete 会自动把 item.value 填到 v-model，只需填 name
-  addForm.value.stock_name = item.name
+  const code = stripStockCodeSuffix(item.code || item.value || '')
+  addForm.value.stock_code = code
+  addForm.value.stock_name = item.name || ''
+  addForm.value.market = (item.isEtf || String(item.security_type || '').toUpperCase() === 'ETF' || isEtfCode(code))
+    ? 'ETF'
+    : 'A股'
   addFormRef.value?.clearValidate()
 }
 
@@ -955,10 +1002,30 @@ const fetchStockInfo = async () => {
   if (!addForm.value.stock_code) return
 
   try {
-    const symbol = addForm.value.stock_code.trim()
-    const market = addForm.value.market
+    const symbol = stripStockCodeSuffix(addForm.value.stock_code)
+    addForm.value.stock_code = symbol
 
-    if (market === 'A股') {
+    // 自动根据 6 位代码纠偏 A股 / ETF 市场
+    if (/^\d{6}$/.test(symbol)) {
+      addForm.value.market = isEtfCode(symbol) ? 'ETF' : 'A股'
+    }
+
+    if (addForm.value.market === 'ETF') {
+      if (!addForm.value.stock_name) {
+        const res: any = await request.get('/api/markets/CN/stocks/search', {
+          params: { q: symbol, limit: 5 }
+        })
+        const list = res?.data?.stocks || []
+        const exact = list.find((s: any) => stripStockCodeSuffix(s.code || s.symbol || '') === symbol)
+        if (exact?.name) {
+          addForm.value.stock_name = exact.name
+          ElMessage.success(`已自动识别 ETF 名称: ${exact.name}`)
+        }
+      }
+      return
+    }
+
+    if (addForm.value.market === 'A股') {
       // 从后台获取股票基础信息
       const res = await ApiClient.get(`/api/stock-data/basic-info/${symbol}`)
 
@@ -975,7 +1042,7 @@ const fetchStockInfo = async () => {
     }
   } catch (error: any) {
     console.error('获取股票信息失败:', error)
-    ElMessage.warning('获取股票信息失败，请手动输入股票名称')
+    ElMessage.warning('获取标的信息失败，请手动输入名称')
   }
 }
 
@@ -983,7 +1050,14 @@ const handleAddFavorite = async () => {
   try {
     await addFormRef.value.validate()
     addLoading.value = true
-    const payload = { ...addForm.value }
+    const cleanCode = stripStockCodeSuffix(addForm.value.stock_code)
+    const resolvedMarket = resolveAnalysisMarket(cleanCode, addForm.value.market)
+    const payload = {
+      ...addForm.value,
+      symbol: cleanCode,
+      stock_code: cleanCode,
+      market: resolvedMarket
+    }
     const res = await favoritesApi.add(payload as any)
     if ((res as any)?.success === false) throw new Error((res as any)?.message || '添加失败')
     ElMessage.success('添加成功')
@@ -1022,7 +1096,7 @@ const editFavorite = (row: any) => {
   editForm.value = {
     stock_code: row.stock_code || row.symbol || '',
     stock_name: row.stock_name,
-    market: row.market || 'A股',
+    market: resolveFavoriteMarket(row),
     tags: Array.isArray(row.tags) ? [...row.tags] : [],
     notes: row.notes || ''
   }
@@ -1030,10 +1104,133 @@ const editFavorite = (row: any) => {
 }
 
 const analyzeFavorite = (row: any) => {
-  router.push({
-    name: 'SingleAnalysis',
-    query: { stock: row.stock_code, market: normalizeMarketForAnalysis(row.market || 'A股') }
+  goSingleAnalysis(router, {
+    code: row.stock_code || row.symbol || '',
+    market: row.market
   })
+}
+
+const orderFavorite = (row: any) => {
+  goPaperOrder(router, {
+    code: row.stock_code || row.symbol || '',
+    market: row.market,
+    side: 'buy'
+  })
+}
+
+const handleBatchAnalyze = async () => {
+  if (selectedStocks.value.length === 0) {
+    ElMessage.warning('请先勾选要分析的自选标的')
+    return
+  }
+
+  const normalizedList = selectedStocks.value
+    .map((item) => ({
+      code: stripStockCodeSuffix(item.stock_code || item.symbol || ''),
+      market: resolveFavoriteMarket(item)
+    }))
+    .filter((item) => Boolean(item.code))
+
+  if (normalizedList.length === 0) {
+    ElMessage.warning('未识别到有效的标的代码')
+    return
+  }
+
+  if (normalizedList.length === 1) {
+    goSingleAnalysis(router, {
+      code: normalizedList[0].code,
+      market: normalizedList[0].market
+    })
+    return
+  }
+
+  if (normalizedList.length > 10) {
+    ElMessage.warning('单次批量分析最多支持 10 只标的，请减少勾选项')
+    return
+  }
+
+  const allEtf = normalizedList.every((item) => item.market === 'ETF')
+  const targetMarket = allEtf ? 'ETF' : 'A股'
+
+  try {
+    await ElMessageBox.confirm(
+      `确定对选中的 ${normalizedList.length} 只标的发起批量分析吗？`,
+      '批量分析选中标的',
+      {
+        confirmButtonText: '确定发起',
+        cancelButtonText: '取消',
+        type: 'info'
+      }
+    )
+
+    if (router.hasRoute('BatchAnalysis')) {
+      await router.push({
+        name: 'BatchAnalysis',
+        query: {
+          stocks: normalizedList.map((item) => item.code).join(','),
+          market: targetMarket
+        }
+      })
+      return
+    }
+
+    batchAnalyzeLoading.value = true
+    const prefs = authStore.user?.preferences as Record<string, any> | undefined
+    const depthIndex = Math.min(5, Math.max(1, Number(prefs?.default_depth || 2))) - 1
+    const depthLabel = ['快速', '基础', '标准', '深度', '全面'][depthIndex] || '基础'
+    const aCodes = normalizedList.filter((item) => item.market !== 'ETF').map((item) => item.code)
+    const etfCodes = normalizedList.filter((item) => item.market === 'ETF').map((item) => item.code)
+
+    const aAnalysts = Array.isArray(prefs?.default_analysts) && prefs.default_analysts.length > 0
+      ? prefs.default_analysts.filter((name: string) => name !== 'ETF分析师')
+      : ['市场分析师', '基本面分析师', '新闻分析师']
+    const effectiveAAnalysts = aAnalysts.length > 0 ? aAnalysts : ['市场分析师', '基本面分析师', '新闻分析师']
+    const etfAnalysts = ['ETF分析师', '市场分析师', '新闻分析师']
+
+    const submissions: Array<{ codes: string[]; market: 'A股' | 'ETF'; analysts: string[] }> = []
+    if (aCodes.length > 0) {
+      submissions.push({ codes: aCodes, market: 'A股', analysts: effectiveAAnalysts })
+    }
+    if (etfCodes.length > 0) {
+      submissions.push({ codes: etfCodes, market: 'ETF', analysts: etfAnalysts })
+    }
+
+    for (const group of submissions) {
+      const res = await analysisApi.startBatchAnalysis({
+        title: `自选池批量分析 (${group.market} ${group.codes.length}只)`,
+        symbols: group.codes,
+        parameters: {
+          market_type: group.market,
+          research_depth: depthLabel,
+          selected_analysts: convertAnalystNamesToIds(group.analysts),
+          engine: 'v2'
+        }
+      })
+
+      if ((res as any)?.success === false) {
+        throw new Error((res as any)?.message || '提交批量分析失败')
+      }
+    }
+
+    ElMessage.success(`已提交 ${normalizedList.length} 只标的的批量分析任务，前往任务中心查看进度`)
+    const taskTypeQuery =
+      etfCodes.length > 0 && aCodes.length === 0
+        ? { type: 'etf_analysis' }
+        : aCodes.length > 0 && etfCodes.length === 0
+          ? { type: 'stock_analysis' }
+          : {}
+    await router.push({
+      path: '/tasks/unified',
+      query: taskTypeQuery
+    })
+  } catch (error: any) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('批量分析提交失败:', error)
+      ElMessage.error(error?.message || '提交批量分析失败')
+    }
+  } finally {
+    batchAnalyzeLoading.value = false
+  }
 }
 
 const removeFavorite = async (row: any) => {
@@ -1047,7 +1244,7 @@ const removeFavorite = async (row: any) => {
         type: 'warning'
       }
     )
-    const res = await favoritesApi.remove(row.stock_code)
+    const res = await favoritesApi.remove(row.stock_code || row.symbol)
     if ((res as any)?.success === false) throw new Error((res as any)?.message || '移除失败')
     ElMessage.success('移除成功')
     await loadFavorites()
@@ -1057,10 +1254,7 @@ const removeFavorite = async (row: any) => {
 }
 
 const viewStockDetail = (row: any) => {
-  router.push({
-    name: 'StockDetail',
-    params: { code: String(row.stock_code || '').toUpperCase() }
-  })
+  goStockDetail(router, row.stock_code || row.symbol || '', row.market)
 }
 
 // 处理表格选择变化
@@ -1250,7 +1444,7 @@ const showBatchSyncDialog = async () => {
         }
       )
       // 用户选择"全部同步"：同步研究列表中所有A股股票
-      const aStocks = favorites.value.filter(item => item.market === 'A股')
+      const aStocks = favorites.value.filter(item => resolveFavoriteMarket(item) === 'A股')
       if (aStocks.length === 0) {
         ElMessage.warning('研究列表中没有A股股票可以同步')
         return
@@ -1282,7 +1476,7 @@ const handleBatchSync = async () => {
   let symbols: string[]
   if (syncAllStocks.value) {
     // 全部同步：使用所有A股股票
-    const aStocks = favorites.value.filter(item => item.market === 'A股')
+    const aStocks = favorites.value.filter(item => resolveFavoriteMarket(item) === 'A股')
     if (aStocks.length === 0) {
       ElMessage.warning('没有A股股票可以同步')
       return

@@ -9,19 +9,31 @@
             {{ analysisForm.market === 'ETF' ? 'ETF分析' : '单股分析' }}
           </h1>
           
-          <!-- 风险提示 -->
-          <div class="risk-disclaimer">
-            <el-alert
-              type="warning"
-              :closable="false"
-              show-icon
-            >
-              <template #title>
-                <span style="font-size: 14px;">
-                  <strong>⚠️ 重要提示：</strong>本次分析所有分析结论用于学习和验证AI证券分析技术，不作为真实交易操盘指导。
-                </span>
-              </template>
-            </el-alert>
+          <!-- 风险提示（单行可折叠，收敛全页重复声明） -->
+          <div class="risk-disclaimer-compact">
+            <div class="disclaimer-bar">
+              <div class="disclaimer-bar-left">
+                <el-icon class="disclaimer-icon"><WarningFilled /></el-icon>
+                <span>风险提示：本次分析所有结论仅用于 AI 证券分析技术学习与验证，不构成任何投资建议或买卖依据，投资风险请独立承担。</span>
+              </div>
+              <el-button
+                type="warning"
+                link
+                size="small"
+                @click="disclaimerExpanded = !disclaimerExpanded"
+              >
+                {{ disclaimerExpanded ? '收起详情' : '查看完整免责声明' }}
+              </el-button>
+            </div>
+            <ul v-if="disclaimerExpanded" class="disclaimer-detail-list">
+              <li><strong>平台性质：</strong>本平台为AI辅助分析技术学习平台，专注于AI技术在证券与ETF分析领域的应用验证和技术学习。</li>
+              <li><strong>分析目的：</strong>所有分析结论仅用于学习和验证AI辅助分析技术，不作为真实交易操盘指导或投资依据。</li>
+              <li><strong>非投资建议：</strong>所有分析结果、评分、建议仅为技术验证参考，不构成任何买卖建议或投资决策依据。</li>
+              <li><strong>数据局限性：</strong>分析基于历史数据和公开信息，可能存在延迟、不完整或不准确的情况，无法预测未来市场走势。</li>
+              <li><strong>投资风险：</strong>股票与ETF投资均存在市场风险、流动性风险、政策风险等多种风险，可能导致本金损失。</li>
+              <li><strong>独立决策：</strong>投资者应基于自身风险承受能力、投资目标和财务状况独立做出投资决策。</li>
+              <li><strong>责任声明：</strong>使用本平台产生的任何投资决策及其后果由使用者自行承担，本平台不承担任何责任。</li>
+            </ul>
           </div>
           
           <p class="page-description">
@@ -51,20 +63,40 @@
                 <el-row :gutter="16">
                   <el-col :span="12">
                     <el-form-item :label="analysisForm.market === 'ETF' ? 'ETF代码' : '股票代码'" required>
-                      <el-input
+                      <el-autocomplete
                         v-model="analysisForm.stockCode"
-                        placeholder="如：000001、512400(ETF)"
+                        :fetch-suggestions="searchStockSuggestions"
+                        value-key="code"
+                        :debounce="250"
+                        :trigger-on-focus="false"
+                        placeholder="输入代码或名称，如：600519、588000、科创50"
                         clearable
                         size="large"
                         class="stock-input"
+                        style="width: 100%"
                         :class="{ 'is-error': stockCodeError }"
+                        @select="handleStockSuggestionSelect"
                         @blur="validateStockCodeInput"
                         @input="onStockCodeInput"
+                        @clear="onStockCodeInput"
                       >
                         <template #prefix>
                           <el-icon><TrendCharts /></el-icon>
                         </template>
-                      </el-input>
+                        <template #default="{ item }">
+                          <div class="stock-suggestion-row">
+                            <span class="suggestion-code">{{ item.code }}</span>
+                            <span class="suggestion-name">{{ item.name }}</span>
+                            <el-tag
+                              size="small"
+                              :type="item.isEtf ? 'warning' : 'info'"
+                              effect="plain"
+                            >
+                              {{ item.isEtf ? 'ETF' : 'A股' }}
+                            </el-tag>
+                          </div>
+                        </template>
+                      </el-autocomplete>
                       <div v-if="stockCodeError" class="error-message">
                         <el-icon><WarningFilled /></el-icon>
                         {{ stockCodeError }}
@@ -90,12 +122,57 @@
                         </el-option>
                         <el-option label="📈 ETF 基金" value="ETF">
                           <span>📈 ETF 基金</span>
-                          <span style="color: #909399; font-size: 12px; margin-left: 8px;">（510050、159919 等）</span>
+                          <span style="color: #909399; font-size: 12px; margin-left: 8px;">（510300、588000、159915 等）</span>
                         </el-option>
                       </el-select>
                     </el-form-item>
                   </el-col>
                 </el-row>
+
+                <!-- 标的名称与参考价预览 -->
+                <div
+                  v-if="selectedStockPreview && selectedStockPreview.code === stripStockCodeSuffix(analysisForm.stockCode)"
+                  class="stock-preview-bar"
+                >
+                  <div class="preview-left">
+                    <el-tag size="small" :type="analysisForm.market === 'ETF' ? 'warning' : 'primary'" effect="plain">
+                      {{ analysisForm.market }}
+                    </el-tag>
+                    <span class="preview-name">{{ selectedStockPreview.name || selectedStockPreview.code }}</span>
+                    <span class="preview-code">({{ selectedStockPreview.code }})</span>
+                  </div>
+                  <div v-if="selectedStockPreview.price !== null" class="preview-quote">
+                    <span class="preview-price">¥{{ selectedStockPreview.price.toFixed(2) }}</span>
+                    <span
+                      v-if="selectedStockPreview.changePercent !== null"
+                      class="preview-change"
+                      :class="selectedStockPreview.changePercent >= 0 ? 'is-up' : 'is-down'"
+                    >
+                      {{ selectedStockPreview.changePercent >= 0 ? '+' : '' }}{{ selectedStockPreview.changePercent.toFixed(2) }}%
+                    </span>
+                  </div>
+                </div>
+
+                <!-- 我的自选快捷胶囊 -->
+                <div v-if="quickFavorites.length > 0" class="quick-favorites-bar">
+                  <span class="quick-favorites-label">
+                    <el-icon><StarFilled /></el-icon>
+                    我的自选：
+                  </span>
+                  <div class="quick-favorites-pills">
+                    <el-tag
+                      v-for="fav in quickFavorites.slice(0, 12)"
+                      :key="fav.stock_code || fav.symbol"
+                      size="small"
+                      class="favorite-pill"
+                      :effect="stripStockCodeSuffix(analysisForm.stockCode) === stripStockCodeSuffix(fav.stock_code || fav.symbol) ? 'dark' : 'plain'"
+                      :type="isEtfCode(fav.stock_code || fav.symbol) ? 'warning' : 'primary'"
+                      @click="selectQuickFavorite(fav)"
+                    >
+                      {{ fav.stock_name || fav.stock_code }} {{ stripStockCodeSuffix(fav.stock_code || fav.symbol) }}
+                    </el-tag>
+                  </div>
+                </div>
 
                 <el-form-item label="分析日期">
                   <div style="display: flex; align-items: center; gap: 8px; width: 100%">
@@ -120,6 +197,34 @@
                     </el-button>
                   </div>
                 </el-form-item>
+              </div>
+
+              <!-- 黄金场景一键预设 -->
+              <div class="form-section preset-section">
+                <div class="preset-header">
+                  <h4 class="section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0;">⚡ 黄金场景一键预设</h4>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    plain
+                    :loading="savingDefaults"
+                    @click="saveAsPersonalDefault"
+                  >
+                    设为个人默认
+                  </el-button>
+                </div>
+                <div class="preset-grid">
+                  <div
+                    v-for="preset in goldenPresets"
+                    :key="preset.id"
+                    class="preset-card"
+                    :class="{ active: isPresetActive(preset) }"
+                    @click="applyGoldenPreset(preset)"
+                  >
+                    <div class="preset-title">{{ preset.icon }} {{ preset.label }}</div>
+                    <div class="preset-desc">{{ preset.description }}</div>
+                  </div>
+                </div>
               </div>
 
               <!-- 分析深度 -->
@@ -246,17 +351,30 @@
                     </el-button>
                   </div>
 
-                  <el-button
-                    v-else-if="analysisStatus === 'failed'"
-                    type="danger"
-                    size="large"
-                    @click="restartAnalysis"
-                    class="submit-btn large-analysis-btn"
-                    style="width: 280px; height: 56px; font-size: 18px; font-weight: 700; border-radius: 16px;"
+                  <div
+                    v-else-if="analysisStatus === 'failed' || analysisStatus === 'cancelled' || analysisStatus === 'suspended'"
+                    style="display: flex; flex-direction: column; align-items: center; gap: 12px; width: 100%;"
                   >
-                    <el-icon><Refresh /></el-icon>
-                    重新分析
-                  </el-button>
+                    <el-alert
+                      v-if="analysisStatus === 'cancelled' || analysisStatus === 'suspended'"
+                      :type="analysisStatus === 'cancelled' ? 'info' : 'warning'"
+                      :closable="false"
+                      show-icon
+                      style="max-width: 560px; width: 100%;"
+                      :title="analysisStatus === 'cancelled' ? '分析任务已取消' : '分析任务已挂起'"
+                      :description="progressInfo.message || (analysisStatus === 'cancelled' ? '您可以调整参数后重新发起分析' : '服务重启导致任务挂起，可前往统一任务中心恢复或在此重新发起')"
+                    />
+                    <el-button
+                      :type="analysisStatus === 'failed' ? 'danger' : 'primary'"
+                      size="large"
+                      @click="restartAnalysis"
+                      class="submit-btn large-analysis-btn"
+                      style="width: 280px; height: 56px; font-size: 18px; font-weight: 700; border-radius: 16px;"
+                    >
+                      <el-icon><Refresh /></el-icon>
+                      重新分析
+                    </el-button>
+                  </div>
                 </div>
               </div>
 
@@ -271,17 +389,26 @@
                         </el-icon>
                         分析进行中...
                       </h4>
-                      <el-button
-                        type="primary"
-                        size="small"
-                        @click="startNewAnalysis"
-                        style="margin-left: auto;"
-                      >
-                        <el-icon><Plus /></el-icon>
-                        开始新分析
-                      </el-button>
-                      <!-- 任务ID已隐藏 -->
-                      <!-- <el-tag type="warning">{{ currentTaskId }}</el-tag> -->
+                      <div class="progress-header-actions">
+                        <el-button
+                          type="danger"
+                          plain
+                          size="small"
+                          :loading="cancellingTask"
+                          @click="handleCancelAnalysis"
+                        >
+                          <el-icon><Close /></el-icon>
+                          取消分析
+                        </el-button>
+                        <el-button
+                          type="primary"
+                          size="small"
+                          @click="startNewAnalysis"
+                        >
+                          <el-icon><Plus /></el-icon>
+                          开始新分析
+                        </el-button>
+                      </div>
                     </div>
                   </template>
 
@@ -289,20 +416,6 @@
                     <!-- 总体进度信息 -->
                     <div class="overall-progress-info">
                       <div class="progress-stats">
-                        <!-- 当前步骤已隐藏 -->
-                        <!--
-                        <div class="stat-item">
-                          <div class="stat-label">当前步骤</div>
-                          <div class="stat-value">{{ progressInfo.currentStep || '初始化中...' }}</div>
-                        </div>
-                        -->
-                        <!-- 整体进度已隐藏 -->
-                        <!--
-                        <div class="stat-item">
-                          <div class="stat-label">整体进度</div>
-                          <div class="stat-value">{{ progressInfo.progress.toFixed(1) }}%</div>
-                        </div>
-                        -->
                         <div class="stat-item">
                           <div class="stat-label">已用时间</div>
                           <div class="stat-value">{{ formatTime(progressInfo.elapsedTime) }}</div>
@@ -345,40 +458,20 @@
                       </div>
                     </div>
 
-                    <!-- 分析步骤显示 - 已隐藏 -->
-                    <!--
-                    <div v-if="analysisSteps.length > 0" class="analysis-steps">
-                      <h5 class="steps-title">📋 分析步骤</h5>
-                      <div class="steps-container">
-                        <div
-                          v-for="(step, index) in analysisSteps"
-                          :key="index"
-                          class="step-item"
-                          :class="{
-                            'step-completed': step.status === 'completed',
-                            'step-current': step.status === 'current',
-                            'step-pending': step.status === 'pending'
-                          }"
-                        >
-                          <div class="step-icon">
-                            <el-icon v-if="step.status === 'completed'" class="completed-icon">
-                              <Check />
-                            </el-icon>
-                            <el-icon v-else-if="step.status === 'current'" class="current-icon rotating-icon">
-                              <Loading />
-                            </el-icon>
-                            <el-icon v-else class="pending-icon">
-                              <Clock />
-                            </el-icon>
-                          </div>
-                          <div class="step-content">
-                            <div class="step-title">{{ step.title }}</div>
-                            <div class="step-description">{{ step.description }}</div>
-                          </div>
-                        </div>
+                    <!-- 精简阶段步骤指示器 -->
+                    <div v-if="displayProgressSteps.length > 0" class="compact-steps-strip">
+                      <div
+                        v-for="(step, index) in displayProgressSteps"
+                        :key="step.key || index"
+                        class="compact-step-pill"
+                        :class="`is-${step.status}`"
+                      >
+                        <el-icon v-if="step.status === 'completed'" class="step-pill-icon"><Check /></el-icon>
+                        <el-icon v-else-if="step.status === 'current'" class="step-pill-icon rotating-icon"><Loading /></el-icon>
+                        <el-icon v-else class="step-pill-icon"><Clock /></el-icon>
+                        <span class="step-pill-title">{{ step.title }}</span>
                       </div>
                     </div>
-                    -->
                   </div>
                 </el-card>
               </div>
@@ -562,33 +655,6 @@
               </template>
 
               <div class="results-content">
-                <!-- 风险提示 -->
-                <div class="risk-disclaimer">
-                  <el-alert
-                    type="warning"
-                    :closable="false"
-                    show-icon
-                  >
-                    <template #title>
-                      <div class="disclaimer-content">
-                        <el-icon class="disclaimer-icon"><WarningFilled /></el-icon>
-                        <div class="disclaimer-text">
-                          <p style="margin: 0 0 8px 0;"><strong>⚠️ 重要风险提示与免责声明</strong></p>
-                          <ul style="margin: 0; padding-left: 20px; line-height: 1.8;">
-                            <li><strong>平台性质：</strong>本平台为AI辅助分析技术学习平台，专注于AI技术在证券与ETF分析领域的应用验证和技术学习。</li>
-                            <li><strong>分析目的：</strong>所有分析结论仅用于学习和验证AI辅助分析技术，不作为真实交易操盘指导或投资依据。</li>
-                            <li><strong>非投资建议：</strong>所有分析结果、评分、建议仅为技术验证参考，不构成任何买卖建议或投资决策依据。</li>
-                            <li><strong>数据局限性：</strong>分析基于历史数据和公开信息，可能存在延迟、不完整或不准确的情况，无法预测未来市场走势。</li>
-                            <li><strong>投资风险：</strong>股票与ETF投资均存在市场风险、流动性风险、政策风险等多种风险，可能导致本金损失。</li>
-                            <li><strong>独立决策：</strong>投资者应基于自身风险承受能力、投资目标和财务状况独立做出投资决策。</li>
-                            <li><strong>责任声明：</strong>使用本平台产生的任何投资决策及其后果由使用者自行承担，本平台不承担任何责任。</li>
-                          </ul>
-                        </div>
-                      </div>
-                    </template>
-                  </el-alert>
-                </div>
-
                 <!-- 降级节点警告 -->
                 <el-alert
                   v-if="analysisResults.degraded_nodes && Object.keys(analysisResults.degraded_nodes).length > 0"
@@ -655,20 +721,6 @@
 
                         <!-- 报告内容 -->
                         <div class="report-content-wrapper">
-                          <!-- AI分析免责声明 -->
-                          <el-alert
-                            type="info"
-                            :closable="false"
-                            show-icon
-                            style="margin-bottom: 16px;"
-                          >
-                            <template #title>
-                              <span style="font-size: 13px;">
-                                ⚠️ 重要提示：本报告由AI基于有限资料分析生成，仅供参考，不构成投资建议。投资有风险，决策需谨慎。
-                              </span>
-                            </template>
-                          </el-alert>
-                          
                           <div
                             class="report-content"
                             v-html="formatReportContent(report.content)"
@@ -685,6 +737,23 @@
 
                 <!-- 操作按钮 -->
                 <div class="result-actions">
+                  <el-button type="success" @click="orderFromAnalysisResult">
+                    <el-icon><TrendCharts /></el-icon>
+                    基于本报告模拟下单
+                  </el-button>
+                  <el-button @click="openResultStockDetail">
+                    <el-icon><View /></el-icon>
+                    股票详情
+                  </el-button>
+                  <el-button
+                    :type="resultIsFavorite ? 'warning' : 'default'"
+                    plain
+                    :loading="resultFavoriteLoading"
+                    @click="toggleResultFavorite"
+                  >
+                    <el-icon><StarFilled v-if="resultIsFavorite" /><Star v-else /></el-icon>
+                    {{ resultIsFavorite ? '已关注' : '加入关注' }}
+                  </el-button>
                   <el-dropdown trigger="click" @command="downloadReport">
                     <el-button type="primary">
                       <el-icon><Download /></el-icon>
@@ -709,18 +778,6 @@
                     </template>
                   </el-dropdown>
                 </div>
-
-                <!-- 风险提示 -->
-                <el-alert
-                  type="warning"
-                  :closable="false"
-                  show-icon
-                  class="risk-disclaimer"
-                >
-                  <template #title>
-                    <span style="font-weight: bold;">报告依据真实交易数据使用AI分析生成，仅供参考，不构成任何投资建议。市场有风险，投资需谨慎。</span>
-                  </template>
-                </el-alert>
               </div>
             </el-card>
           </el-col>
@@ -823,7 +880,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, computed } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -831,6 +888,8 @@ import {
   TrendCharts,
   InfoFilled,
   Check,
+  Clock,
+  Close,
   Loading,
   Refresh,
   Download,
@@ -840,14 +899,18 @@ import {
   Plus,
   DocumentChecked,
   View,
+  Star,
+  StarFilled,
 } from '@element-plus/icons-vue'
 import { analysisApi, type SingleAnalysisRequest } from '@/api/analysis'
+import { cancelTask as cancelUnifiedTask } from '@/api/unifiedTasks'
+import { favoritesApi, type FavoriteItem } from '@/api/favorites'
 import { workflowApi, isSelectableAnalysisWorkflow, type WorkflowSummary } from '@/api/workflow'
 import { stocksApi, type FundamentalsResponse } from '@/api/stocks'
 import { stockSyncApi, type StockSyncTaskStatus, type SingleStockSyncResponse } from '@/api/stockSync'
 import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
-import { ApiClient } from '@/api/request'
+import request, { ApiClient } from '@/api/request'
 import { configApi } from '@/api/config'
 import DeepModelSelector from '@/components/DeepModelSelector.vue'
 import TaskGrowthPanel from '@/components/growth/TaskGrowthPanel.vue'
@@ -855,9 +918,15 @@ import { ANALYSTS, convertAnalystNamesToIds } from '@/constants/analysts'
 import { marked } from 'marked'
 import { recommendModels } from '@/api/modelCapabilities'
 import { validateStockCode, getStockCodeFormatHelp } from '@/utils/stockValidator'
-import { normalizeMarketForAnalysis, getMarketByStockCode } from '@/utils/market'
+import {
+  normalizeMarketForAnalysis,
+  getMarketByStockCode,
+  isEtfCode,
+  stripStockCodeSuffix
+} from '@/utils/market'
+import { goPaperOrder, goStockDetail, resolveAnalysisMarket } from '@/utils/navigation'
+import { loadManualSyncSourceState } from '@/utils/dataSource'
 import { fetchTaskResultWithRetry, hasTaskResultContent, mergeTaskResult } from '@/utils/taskResult'
-import type { StockInfo } from '@/types/analysis'
 
 // 配置marked选项
 marked.setOptions({
@@ -898,10 +967,35 @@ const factorPreviewLoading = ref(false)
 const factorPreview = ref<FundamentalsResponse | null>(null)
 const syncStatus = ref<'idle' | 'running' | 'success' | 'error'>('idle')
 const syncPollingTimer = ref<any>(null)
+const disclaimerExpanded = ref(false)
+const cancellingTask = ref(false)
+const savingDefaults = ref(false)
+const quickFavorites = ref<FavoriteItem[]>([])
+const resultIsFavorite = ref(false)
+const resultFavoriteLoading = ref(false)
+let isComponentUnmounted = false
+
+interface StockSuggestionItem {
+  value: string
+  code: string
+  name: string
+  security_type?: string
+  market: MarketType
+  isEtf: boolean
+}
+
+interface StockPreviewInfo {
+  code: string
+  name: string
+  price: number | null
+  changePercent: number | null
+}
+
+const selectedStockPreview = ref<StockPreviewInfo | null>(null)
 
 // 分析进度和结果相关状态
 const currentTaskId = ref('')
-const analysisStatus = ref('idle') // 'idle', 'running', 'completed', 'failed'
+const analysisStatus = ref<'idle' | 'running' | 'completed' | 'failed' | 'cancelled' | 'suspended'>('idle')
 const showResults = ref(false)
 const analysisResults = ref<any>(null)
 const analysisReportManifest = ref<Array<{ field: string; display_name: string; icon?: string; description?: string }>>([])
@@ -918,9 +1012,33 @@ const progressInfo = ref({
 })
 const pollingTimer = ref<any>(null)
 
+const pickValidIdentifier = (...candidates: unknown[]): string => {
+  for (const candidate of candidates) {
+    const value = String(candidate ?? '').trim()
+    if (value && value.toLowerCase() !== 'unknown') {
+      return value
+    }
+  }
+  return ''
+}
+
 const applyAnalysisResult = (result: any) => {
   analysisResults.value = result
   activeReportTab.value = ''
+  const resultCode = stripStockCodeSuffix(
+    pickValidIdentifier(
+      result?.stock_code,
+      result?.stock_symbol,
+      result?.symbol,
+      analysisForm.symbol,
+      analysisForm.stockCode
+    )
+  )
+  if (resultCode) {
+    void checkResultFavoriteStatus(resultCode)
+  } else {
+    resultIsFavorite.value = false
+  }
 }
 
 const loadCompletedAnalysisResult = async (taskId: string, status?: any) => {
@@ -944,6 +1062,123 @@ const loadCompletedAnalysisResult = async (taskId: string, status?: any) => {
 
 // 分析步骤定义（动态生成）
 const analysisSteps = ref<any[]>([])
+
+const displayProgressSteps = computed(() => {
+  if (analysisSteps.value.length > 0) {
+    return analysisSteps.value
+  }
+  const pct = Number(progressInfo.value.progress || 0)
+  const stages = [
+    { key: 'stage_data', title: '数据与行情采集', min: 0, max: 25 },
+    { key: 'stage_analysts', title: '多维分析师研判', min: 25, max: 60 },
+    { key: 'stage_debate', title: '多空与风控辩论', min: 60, max: 88 },
+    { key: 'stage_report', title: '研究报告整合', min: 88, max: 100 }
+  ]
+  return stages.map((stage) => {
+    let status: 'completed' | 'current' | 'pending' = 'pending'
+    if (pct >= stage.max) {
+      status = 'completed'
+    } else if (pct >= stage.min) {
+      status = 'current'
+    }
+    return {
+      key: stage.key,
+      title: stage.title,
+      status
+    }
+  })
+})
+
+interface GoldenPreset {
+  id: string
+  icon: string
+  label: string
+  description: string
+  market: MarketType
+  depth: number
+  analysts: string[]
+}
+
+const goldenPresets: GoldenPreset[] = [
+  {
+    id: 'quick-screen',
+    icon: '⚡',
+    label: '初筛排雷 2级',
+    description: '市场 + 基本面 · 快速排除硬伤',
+    market: 'A股',
+    depth: 2,
+    analysts: ['市场分析师', '基本面分析师']
+  },
+  {
+    id: 'swing-research',
+    icon: '🎯',
+    label: '波段立项 3级',
+    description: '技术 + 基本面 + 新闻 + 板块',
+    market: 'A股',
+    depth: 3,
+    analysts: ['市场分析师', '基本面分析师', '新闻分析师', '板块分析师']
+  },
+  {
+    id: 'heavy-debate',
+    icon: '🏆',
+    label: '重仓辩论 4级',
+    description: '全 6 位 A 股分析师多轮辩论',
+    market: 'A股',
+    depth: 4,
+    analysts: ['市场分析师', '基本面分析师', '新闻分析师', '社媒分析师', '大盘分析师', '板块分析师']
+  },
+  {
+    id: 'etf-allocation',
+    icon: '📈',
+    label: 'ETF配置 3级',
+    description: 'ETF + 市场 + 新闻专研模板',
+    market: 'ETF',
+    depth: 3,
+    analysts: ['ETF分析师', '市场分析师', '新闻分析师']
+  }
+]
+
+const isPresetActive = (preset: GoldenPreset) => {
+  if (analysisForm.market !== preset.market || analysisForm.researchDepth !== preset.depth) {
+    return false
+  }
+  if (analysisForm.selectedAnalysts.length !== preset.analysts.length) {
+    return false
+  }
+  return preset.analysts.every((name) => analysisForm.selectedAnalysts.includes(name))
+}
+
+const applyGoldenPreset = (preset: GoldenPreset) => {
+  analysisForm.market = preset.market
+  analysisForm.researchDepth = preset.depth
+  analysisForm.selectedAnalysts = [...preset.analysts]
+  if (preset.market === 'ETF') {
+    clearFactorPreview()
+  }
+  stockCodeHelp.value = getStockCodeFormatHelp(analysisForm.market)
+  ElMessage.success(`已应用「${preset.label}」模板`)
+}
+
+const saveAsPersonalDefault = async () => {
+  if (analysisForm.selectedAnalysts.length === 0) {
+    ElMessage.warning('请至少选择一位分析师后再保存默认配置')
+    return
+  }
+  const authStore = useAuthStore()
+  savingDefaults.value = true
+  try {
+    const clampedDepth = String(Math.min(5, Math.max(1, analysisForm.researchDepth))) as '1' | '2' | '3' | '4' | '5'
+    await authStore.updateUserInfo({
+      preferences: {
+        default_market: analysisForm.market as any,
+        default_depth: clampedDepth,
+        default_analysts: [...analysisForm.selectedAnalysts]
+      }
+    })
+  } finally {
+    savingDefaults.value = false
+  }
+}
 
 // 从后端步骤数据生成前端步骤
 const generateStepsFromBackend = (backendSteps: any[]) => {
@@ -1064,15 +1299,6 @@ const disabledDate = (time: Date) => {
   return time.getTime() > Date.now()
 }
 
-const factorPreviewRow = computed<StockInfo>(() => ({
-  symbol: analysisForm.stockCode || '',
-  name: analysisForm.stockCode || '',
-  market: analysisForm.market,
-  report_period: factorPreview.value?.report_period,
-  factor_diagnostics: factorPreview.value?.factor_diagnostics || {},
-  factor_warnings: factorPreview.value?.factor_warnings || {},
-}))
-
 const clearFactorPreview = () => {
   factorPreview.value = null
 }
@@ -1101,11 +1327,173 @@ const fetchFactorPreview = async (normalizedCode?: string) => {
   }
 }
 
+const syncAnalystsForMarket = (market: MarketType) => {
+  if (market === 'ETF') {
+    analysisForm.selectedAnalysts = [...ETF_ANALYST_NAMES]
+    return
+  }
+  const normalized = normalizeSelectedAnalystsForMarket(market, analysisForm.selectedAnalysts)
+  analysisForm.selectedAnalysts = normalized.length > 0 ? normalized : ['市场分析师', '基本面分析师']
+}
+
+// 自动根据 6 位代码在 A股 / ETF 之间切换市场并同步分析师
+const autoDetectAndSwitchMarket = (rawCode: string, silent = false): MarketType => {
+  const cleanCode = stripStockCodeSuffix(rawCode)
+  if (!/^\d{6}$/.test(cleanCode)) {
+    return analysisForm.market
+  }
+
+  if (isEtfCode(cleanCode)) {
+    if (analysisForm.market !== 'ETF') {
+      analysisForm.market = 'ETF'
+      clearFactorPreview()
+      syncAnalystsForMarket('ETF')
+      if (!silent) {
+        ElMessage.info('已自动识别为 ETF 基金并切换市场')
+      }
+    }
+    return 'ETF'
+  }
+
+  const aCheck = validateStockCode(cleanCode, 'A股')
+  if (aCheck.valid && analysisForm.market === 'ETF') {
+    analysisForm.market = 'A股'
+    syncAnalystsForMarket('A股')
+    if (!silent) {
+      ElMessage.info('已自动识别为 A股并切换市场')
+    }
+    return 'A股'
+  }
+
+  return analysisForm.market
+}
+
+// 搜索股票/ETF建议（注意：不能声明为 async，以符合 el-autocomplete 同步返回 void 的类型要求）
+const searchStockSuggestions = (queryString: string, cb: (results: any[]) => void) => {
+  const q = String(queryString || '').trim()
+  if (!q) {
+    cb([])
+    return
+  }
+
+  request
+    .get('/api/markets/CN/stocks/search', { params: { q, limit: 15 }, skipErrorHandler: true })
+    .then((res: any) => {
+      const stocks = res?.data?.stocks || res?.stocks || []
+      const mapped: StockSuggestionItem[] = stocks.map((s: any) => {
+        const code = stripStockCodeSuffix(s.code || s.symbol || '')
+        const isEtf = String(s.security_type || '').toUpperCase() === 'ETF' || isEtfCode(code)
+        return {
+          value: code,
+          code,
+          name: s.name || '',
+          security_type: s.security_type || (isEtf ? 'ETF' : 'STOCK'),
+          market: isEtf ? 'ETF' : 'A股',
+          isEtf
+        }
+      }).filter((item: StockSuggestionItem) => Boolean(item.code))
+      cb(mapped)
+    })
+    .catch((err: any) => {
+      console.warn('搜索标的失败:', err)
+      cb([])
+    })
+}
+
+const handleStockSuggestionSelect = (item: Record<string, any>) => {
+  const cleanCode = stripStockCodeSuffix(item.code || item.value || '')
+  analysisForm.stockCode = cleanCode
+  stockCodeError.value = ''
+
+  const nextMarket: MarketType = (item.isEtf || String(item.security_type || '').toUpperCase() === 'ETF' || isEtfCode(cleanCode))
+    ? 'ETF'
+    : 'A股'
+  if (analysisForm.market !== nextMarket) {
+    analysisForm.market = nextMarket
+    syncAnalystsForMarket(nextMarket)
+    ElMessage.info(nextMarket === 'ETF' ? '已自动识别为 ETF 基金并切换市场' : '已自动识别为 A股并切换市场')
+  }
+
+  stockCodeHelp.value = `✓ ${nextMarket}代码格式正确`
+  const existingPreview = selectedStockPreview.value?.code === cleanCode ? selectedStockPreview.value : null
+  selectedStockPreview.value = {
+    code: cleanCode,
+    name: item.name || existingPreview?.name || cleanCode,
+    price: existingPreview?.price ?? null,
+    changePercent: existingPreview?.changePercent ?? null
+  }
+
+  void fetchStockInfo(cleanCode)
+  if (nextMarket === 'A股') {
+    void fetchFactorPreview(cleanCode)
+  } else {
+    clearFactorPreview()
+  }
+}
+
+const loadQuickFavorites = async () => {
+  try {
+    const res = await favoritesApi.list()
+    quickFavorites.value = ((res as any)?.data || []) as FavoriteItem[]
+  } catch (error) {
+    console.warn('加载自选快捷栏失败:', error)
+  }
+}
+
+const selectQuickFavorite = (fav: FavoriteItem) => {
+  const cleanCode = stripStockCodeSuffix(fav.stock_code || fav.symbol || '')
+  if (!cleanCode) return
+
+  analysisForm.stockCode = cleanCode
+  stockCodeError.value = ''
+  const targetMarket = resolveAnalysisMarket(cleanCode, fav.market)
+  if (analysisForm.market !== targetMarket) {
+    analysisForm.market = targetMarket
+    syncAnalystsForMarket(targetMarket)
+  }
+
+  stockCodeHelp.value = `✓ ${targetMarket}代码格式正确`
+  selectedStockPreview.value = {
+    code: cleanCode,
+    name: fav.stock_name || cleanCode,
+    price: typeof fav.current_price === 'number' ? fav.current_price : null,
+    changePercent: typeof fav.change_percent === 'number' ? fav.change_percent : null
+  }
+
+  void fetchStockInfo(cleanCode)
+  if (targetMarket === 'A股') {
+    void fetchFactorPreview(cleanCode)
+  } else {
+    clearFactorPreview()
+  }
+}
+
 // 股票代码输入时的处理
 const onStockCodeInput = () => {
   // 清除错误信息
   stockCodeError.value = ''
   clearFactorPreview()
+
+  const cleanCode = stripStockCodeSuffix(analysisForm.stockCode)
+  if (selectedStockPreview.value && selectedStockPreview.value.code !== cleanCode) {
+    selectedStockPreview.value = null
+  }
+
+  if (/^\d{6}$/.test(cleanCode)) {
+    const prevMarket = analysisForm.market
+    const detectedMarket = autoDetectAndSwitchMarket(cleanCode)
+    const validation = validateStockCode(cleanCode, detectedMarket)
+    if (validation.valid) {
+      stockCodeHelp.value = prevMarket !== detectedMarket
+        ? `✓ 已自动识别为 ${detectedMarket} 并切换市场`
+        : `✓ ${detectedMarket}代码格式正确`
+      void fetchStockInfo(cleanCode)
+    } else {
+      stockCodeHelp.value = getStockCodeFormatHelp(analysisForm.market)
+    }
+    return
+  }
+
   // 显示格式提示
   stockCodeHelp.value = getStockCodeFormatHelp(analysisForm.market)
 }
@@ -1147,6 +1535,9 @@ const availableAnalysts = computed(() => {
 // 市场类型变更时的处理
 const onMarketChange = () => {
   clearFactorPreview()
+  // 同步分析师团队
+  syncAnalystsForMarket(analysisForm.market)
+
   // 重新验证股票代码
   if (analysisForm.stockCode.trim()) {
     validateStockCodeInput()
@@ -1154,86 +1545,88 @@ const onMarketChange = () => {
     // 显示新市场的格式提示
     stockCodeHelp.value = getStockCodeFormatHelp(analysisForm.market)
   }
-
-  // 🔥 ETF 市场：固定使用 ETF / 市场 / 新闻 分析师
-  if (analysisForm.market === 'ETF') {
-    analysisForm.selectedAnalysts = [...ETF_ANALYST_NAMES]
-    return
-  }
-
-  analysisForm.selectedAnalysts = normalizeSelectedAnalystsForMarket(
-    analysisForm.market,
-    analysisForm.selectedAnalysts
-  )
 }
 
 // 验证股票代码输入
 const validateStockCodeInput = () => {
-  const code = analysisForm.stockCode.trim()
+  const code = stripStockCodeSuffix(analysisForm.stockCode)
 
   if (!code) {
     stockCodeError.value = ''
     stockCodeHelp.value = ''
+    selectedStockPreview.value = null
     return
   }
 
+  // 6 位代码优先自动识别并切换 A股 / ETF，不再红字阻断
+  autoDetectAndSwitchMarket(code)
+
   // 验证股票代码格式
-  let validation = validateStockCode(code, analysisForm.market)
+  const validation = validateStockCode(code, analysisForm.market)
 
   if (!validation.valid) {
-    // 🔥 智能提示：A股验证失败但代码符合ETF格式时，提示用户切换市场
-    if (analysisForm.market === 'A股') {
-      const etfCheck = validateStockCode(code, 'ETF')
-      if (etfCheck.valid) {
-        stockCodeError.value = '该代码为ETF基金，请将市场类型改为「ETF 基金」'
-        stockCodeHelp.value = ''
-        return
-      }
-    }
     stockCodeError.value = validation.message || '股票代码格式不正确'
     stockCodeHelp.value = ''
-  } else {
-    stockCodeError.value = ''
-    stockCodeHelp.value = `✓ ${validation.market}代码格式正确`
-
-    // 自动更新市场类型（如果识别出的市场与当前选择不同）
-    // V3.0 聚焦 A 股，港美股已暂停
-    if (validation.market && validation.market !== analysisForm.market) {
-      const validMarkets: MarketType[] = ['A股', 'ETF']
-      if ((validMarkets as string[]).includes(validation.market)) {
-        analysisForm.market = validation.market as MarketType
-        onMarketChange()  // 同步更新分析师选择（如 ETF 固定分析师）
-        ElMessage.success(`已自动识别为${validation.market}`)
-      }
-    }
-
-    // 标准化代码
-    if (validation.normalizedCode) {
-      analysisForm.stockCode = validation.normalizedCode
-    }
+    return
   }
 
-  // 获取股票信息
-  fetchStockInfo()
+  stockCodeError.value = ''
+  stockCodeHelp.value = `✓ ${validation.market}代码格式正确`
+
+  // 标准化代码
+  if (validation.normalizedCode) {
+    analysisForm.stockCode = validation.normalizedCode
+  }
+
+  // 获取标的名称与参考价
+  void fetchStockInfo(analysisForm.stockCode)
 }
 
-// 获取股票信息（实时行情，用于显示股票名称和当前价格）
-const fetchStockInfo = async () => {
-  const code = analysisForm.stockCode.trim()
-  if (!code) return
+// 获取标的信息（实时行情，用于独立 ref 展示名称和参考价）
+const fetchStockInfo = async (targetCode?: string) => {
+  const code = stripStockCodeSuffix(targetCode || analysisForm.stockCode)
+  if (!code || !/^\d{6}$/.test(code)) return
 
   try {
     const response = await stocksApi.getQuote(code)
+    if (isComponentUnmounted || stripStockCodeSuffix(analysisForm.stockCode) !== code) return
     const data = (response as any)?.data
-    if (data) {
-      // 更新 factorPreviewRow 中的名称（如果行情返回了名称）
-      if (data.name && factorPreviewRow.value) {
-        factorPreviewRow.value.name = data.name
+    if (data && (data.name || data.price != null || data.current_price != null)) {
+      const rawPrice = data.current_price ?? data.price ?? data.close
+      const rawPct = data.change_percent ?? data.pct_chg
+      const existingPreview = selectedStockPreview.value?.code === code ? selectedStockPreview.value : null
+      selectedStockPreview.value = {
+        code,
+        name: data.name || existingPreview?.name || code,
+        price: rawPrice !== undefined && rawPrice !== null && !Number.isNaN(Number(rawPrice)) ? Number(rawPrice) : (existingPreview?.price ?? null),
+        changePercent: rawPct !== undefined && rawPct !== null && !Number.isNaN(Number(rawPct)) ? Number(rawPct) : (existingPreview?.changePercent ?? null)
       }
+      return
     }
   } catch (error) {
-    // 行情获取失败不影响主流程，静默处理
-    console.warn('获取股票行情失败', error)
+    console.warn('获取实时行情失败，尝试基础信息兜底', error)
+  }
+
+  // 行情接口无数据时用搜索接口补齐名称（兼容 ETF）
+  try {
+    const res: any = await request.get('/api/markets/CN/stocks/search', {
+      params: { q: code, limit: 5 },
+      skipErrorHandler: true
+    })
+    if (isComponentUnmounted || stripStockCodeSuffix(analysisForm.stockCode) !== code) return
+    const list = res?.data?.stocks || res?.stocks || []
+    const exact = list.find((s: any) => stripStockCodeSuffix(s.code || s.symbol || '') === code)
+    if (exact?.name) {
+      const existingPreview = selectedStockPreview.value?.code === code ? selectedStockPreview.value : null
+      selectedStockPreview.value = {
+        code,
+        name: exact.name,
+        price: existingPreview?.price ?? null,
+        changePercent: existingPreview?.changePercent ?? null
+      }
+    }
+  } catch {
+    // 静默兜底
   }
 }
 
@@ -1249,28 +1642,25 @@ const toggleAnalyst = (analystName: string) => {
 
 // 数据校验
 const handleValidateData = async () => {
-  const stockCode = analysisForm.stockCode.trim()
+  const stockCode = stripStockCodeSuffix(analysisForm.stockCode)
   if (!stockCode) {
     ElMessage.warning('请先输入股票代码')
     return
   }
 
+  // 校验前自动纠偏 ETF / A股市场
+  autoDetectAndSwitchMarket(stockCode)
+
   // 验证股票代码格式
-  let validation = validateStockCode(stockCode, analysisForm.market)
+  const validation = validateStockCode(stockCode, analysisForm.market)
   if (!validation.valid) {
-    if (analysisForm.market === 'A股') {
-      const etfCheck = validateStockCode(stockCode, 'ETF')
-      if (etfCheck.valid) {
-        ElMessage.warning('该代码为ETF基金，请将市场类型改为「ETF 基金」后再进行数据校验')
-        return
-      }
-    }
     ElMessage.error(validation.message || '股票代码格式不正确')
     return
   }
 
   // 使用标准化后的代码
   const normalizedCode = validation.normalizedCode || stockCode.toUpperCase()
+  analysisForm.stockCode = normalizedCode
 
   // 确定市场类型（用于API调用）
   const marketTypeMap: Record<string, string> = {
@@ -1295,7 +1685,7 @@ const handleValidateData = async () => {
         check_basic_info: true,
         check_historical_data: true,
         check_financial_data: analysisForm.market !== 'ETF',
-        check_realtime_quotes: true
+        check_realtime_quotes: analysisForm.market !== 'ETF'
       }
     )
 
@@ -1361,6 +1751,9 @@ const STOCK_SYNC_POLL_INTERVAL_MS = 2000
 
 const waitForStockSyncTask = async (taskId: string): Promise<StockSyncTaskStatus> => {
   for (let attempt = 0; attempt < STOCK_SYNC_POLL_MAX_ATTEMPTS; attempt += 1) {
+    if (isComponentUnmounted) {
+      throw new Error('页面已离开，停止等待同步结果')
+    }
     const res = await stockSyncApi.getTaskStatus(taskId)
     if (res.success && isTerminalStockSyncStatus(res.data.status)) {
       return res.data
@@ -1375,19 +1768,24 @@ const waitForStockSyncTask = async (taskId: string): Promise<StockSyncTaskStatus
 const monitorSingleSyncTask = async (taskId: string, symbol: string) => {
   try {
     const task = await waitForStockSyncTask(taskId)
+    if (isComponentUnmounted) return
+
     const message = buildSingleSyncTaskMessage(task, symbol)
     if (task.status === 'success') {
+      syncStatus.value = 'success'
       ElMessage.success(message)
+      await handleValidateData()
     } else if (task.status === 'success_with_errors') {
+      syncStatus.value = 'success'
       ElMessage.warning(message)
+      await handleValidateData()
     } else {
+      syncStatus.value = 'error'
       ElMessage.error(message)
     }
-
-    // 同步完成后，重新调用数据检验
-    await handleValidateData()
   } catch (error: any) {
-    if (error?.message !== '页面已离开，停止等待同步结果') {
+    syncStatus.value = 'error'
+    if (!isComponentUnmounted && error?.message !== '页面已离开，停止等待同步结果') {
       ElMessage.error(error?.message || '同步结果查询失败，请稍后刷新页面查看')
     }
   } finally {
@@ -1397,7 +1795,8 @@ const monitorSingleSyncTask = async (taskId: string, symbol: string) => {
 
 // 同步缺失数据
 const handleSyncMissingData = async () => {
-  const stockCode = analysisForm.stockCode.trim()
+  const stockCode = stripStockCodeSuffix(analysisForm.stockCode)
+  autoDetectAndSwitchMarket(stockCode, true)
   const validation = validateStockCode(stockCode, analysisForm.market)
 
   if (!validation.valid) {
@@ -1407,33 +1806,55 @@ const handleSyncMissingData = async () => {
 
   const normalizedCode = validation.normalizedCode || stockCode.toUpperCase()
   const missingData = validationResult.value?.missing_data || [] as string[]
+  const isEtf = analysisForm.market === 'ETF'
 
-  // 根据缺失数据确定同步什么
+  // 根据缺失数据确定同步什么（ETF 跳过不适用于场内基金的 A股实时行情与财务报表）
   const syncTypes: string[] = []
-  if (missingData.includes('实时行情')) syncTypes.push('realtime')
+  if (!isEtf && missingData.includes('实时行情')) syncTypes.push('realtime')
   if (missingData.includes('历史数据')) syncTypes.push('historical')
-  if (missingData.includes('财务数据')) syncTypes.push('financial')
+  if (!isEtf && missingData.includes('财务数据')) syncTypes.push('financial')
   if (missingData.includes('基础信息')) syncTypes.push('basic')
 
-  // 如果没有明确指定缺失，默认都同步
+  // 如果没有明确指定缺失，按市场给出安全默认集合
   if (syncTypes.length === 0) {
-    syncTypes.push('realtime', 'historical', 'financial', 'basic')
+    if (isEtf) {
+      syncTypes.push('historical', 'basic')
+    } else {
+      syncTypes.push('realtime', 'historical', 'financial', 'basic')
+    }
   }
 
   try {
     syncStatus.value = 'running'
+    let preferredDataSource: 'tushare' | 'akshare' | 'qmt' = 'akshare'
+    try {
+      const sourceState = await loadManualSyncSourceState()
+      if (isEtf) {
+        if (sourceState.availableSources.akshare) {
+          preferredDataSource = 'akshare'
+        } else if (sourceState.availableSources.qmt) {
+          preferredDataSource = 'qmt'
+        } else if (sourceState.preferredSource && sourceState.preferredSource !== 'tushare') {
+          preferredDataSource = sourceState.preferredSource
+        }
+      } else if (sourceState.preferredSource) {
+        preferredDataSource = sourceState.preferredSource
+      }
+    } catch {
+      preferredDataSource = 'akshare'
+    }
     const res = await stockSyncApi.syncSingle({
       symbol: normalizedCode,
-      sync_realtime: syncTypes.includes('realtime'),
+      sync_realtime: !isEtf && syncTypes.includes('realtime'),
       sync_historical: syncTypes.includes('historical'),
-      sync_financial: syncTypes.includes('financial'),
+      sync_financial: !isEtf && syncTypes.includes('financial'),
       sync_basic: syncTypes.includes('basic'),
-      data_source: 'akshare',
+      data_source: preferredDataSource,
       days: 365
     })
 
     if (res.success) {
-      ElMessage.success(`股票 ${normalizedCode} 同步任务已提交，后台执行中`)
+      ElMessage.success(`${isEtf ? 'ETF' : '股票'} ${normalizedCode} 同步任务已提交，后台执行中`)
       void monitorSingleSyncTask(res.data.task_id, normalizedCode)
     } else {
       syncStatus.value = 'error'
@@ -1528,31 +1949,26 @@ const formatValidationDetails = (details: any) => {
 
 // 提交分析
 const submitAnalysis = async () => {
-  const stockCode = analysisForm.stockCode.trim()
+  const stockCode = stripStockCodeSuffix(analysisForm.stockCode)
   if (!stockCode) {
     ElMessage.warning('请输入股票代码')
     return
   }
 
+  // 提交前自动识别 ETF / A股市场，避免阻断
+  autoDetectAndSwitchMarket(stockCode)
+
   // 验证股票代码格式
-  let validation = validateStockCode(stockCode, analysisForm.market)
+  const validation = validateStockCode(stockCode, analysisForm.market)
   if (!validation.valid) {
-    if (analysisForm.market === 'A股') {
-      const etfCheck = validateStockCode(stockCode, 'ETF')
-      if (etfCheck.valid) {
-        const msg = '该代码为ETF基金，请将市场类型改为「ETF 基金」后再开始分析'
-        ElMessage.warning(msg)
-        stockCodeError.value = msg
-        return
-      }
-    }
     ElMessage.error(validation.message || '股票代码格式不正确')
     stockCodeError.value = validation.message || '股票代码格式不正确'
     return
   }
 
   // 使用标准化后的代码
-  analysisForm.symbol = validation.normalizedCode || stockCode.toUpperCase()
+  analysisForm.stockCode = validation.normalizedCode || stockCode.toUpperCase()
+  analysisForm.symbol = analysisForm.stockCode
   await fetchFactorPreview(analysisForm.symbol)
 
   if (analysisForm.selectedAnalysts.length === 0) {
@@ -1672,12 +2088,20 @@ const submitAnalysis = async () => {
 
     // 立即查询一次状态（不等待第一次轮询）
     setTimeout(async () => {
+      const queriedTaskId = currentTaskId.value
+      if (isComponentUnmounted || !queriedTaskId || analysisStatus.value !== 'running') return
       try {
-        const response = await analysisApi.getTaskStatus(currentTaskId.value)
+        const response = await analysisApi.getTaskStatus(queriedTaskId)
+        if (isComponentUnmounted || analysisStatus.value !== 'running' || currentTaskId.value !== queriedTaskId) {
+          return
+        }
         const status = response.data // 响应拦截器已返回 response.data
         console.log('🔄 立即查询状态:', status)
         console.log('🔄 当前 analysisStatus:', analysisStatus.value)
-        if (status.status === 'pending' || status.status === 'running') {
+        if (handleTerminalInterruptedStatus(status)) {
+          return
+        }
+        if (status.status === 'pending' || status.status === 'running' || status.status === 'processing') {
           analysisStatus.value = 'running'
           console.log('✅ 设置 analysisStatus 为 running')
           updateProgressInfo(status)
@@ -1710,16 +2134,20 @@ const startPollingTaskStatus = () => {
 
   pollingTimer.value = setInterval(async () => {
     try {
-      if (!currentTaskId.value) {
-        console.error('❌ 轮询中任务ID为空')
+      const queriedTaskId = currentTaskId.value
+      if (!queriedTaskId || analysisStatus.value !== 'running') {
         if (pollingTimer.value) {
           clearInterval(pollingTimer.value)
+          pollingTimer.value = null
         }
         return
       }
 
-      console.log('🔄 开始查询任务状态:', currentTaskId.value)
-      const response = await analysisApi.getTaskStatus(currentTaskId.value)
+      console.log('🔄 开始查询任务状态:', queriedTaskId)
+      const response = await analysisApi.getTaskStatus(queriedTaskId)
+      if (isComponentUnmounted || analysisStatus.value !== 'running' || currentTaskId.value !== queriedTaskId) {
+        return
+      }
       const status = response.data // 响应拦截器已返回 response.data
 
       console.log('🔍 任务状态响应:', response)
@@ -1791,7 +2219,9 @@ const startPollingTaskStatus = () => {
           showClose: true
         })
 
-      } else if (status.status === 'pending' || status.status === 'running') {
+      } else if (handleTerminalInterruptedStatus(status)) {
+        // 已处理 cancelled / suspended 分支并停止轮询
+      } else if (status.status === 'pending' || status.status === 'running' || status.status === 'processing') {
         // 分析进行中，更新进度
         console.log('🔄 轮询中设置 analysisStatus 为 running')
         analysisStatus.value = 'running'
@@ -1860,6 +2290,151 @@ const updateProgressInfo = (status: any) => {
 
   // 前端不进行估算，只展示后端返回的数据
   progressInfo.value.message = status.message || '分析正在进行中...'
+}
+
+// 统一处理 cancelled / suspended 终态，确保及时退出转圈
+const handleTerminalInterruptedStatus = (status: any): boolean => {
+  const state = String(status?.status || '').toLowerCase()
+  if (state !== 'cancelled' && state !== 'suspended') {
+    return false
+  }
+
+  if (pollingTimer.value) {
+    clearInterval(pollingTimer.value)
+    pollingTimer.value = null
+  }
+  clearTaskCache()
+
+  if (state === 'cancelled') {
+    analysisStatus.value = 'cancelled'
+    progressInfo.value.currentStep = '分析已取消'
+    progressInfo.value.message = status?.message || '当前分析任务已取消，您可以调整参数后重新发起'
+    ElMessage.info('分析任务已取消')
+  } else {
+    analysisStatus.value = 'suspended'
+    progressInfo.value.currentStep = '分析已挂起'
+    progressInfo.value.message = status?.message || '服务重启导致任务已挂起，可前往统一任务中心恢复或在此重新发起'
+    ElMessage.warning('分析任务已挂起，可前往统一任务中心恢复或在此重新发起')
+  }
+  return true
+}
+
+// 取消正在运行的分析任务
+const handleCancelAnalysis = async () => {
+  if (!currentTaskId.value) return
+
+  try {
+    await ElMessageBox.confirm(
+      '确定要取消当前正在执行的分析任务吗？',
+      '取消分析确认',
+      {
+        confirmButtonText: '确定取消',
+        cancelButtonText: '继续等待',
+        type: 'warning'
+      }
+    )
+
+    cancellingTask.value = true
+    const res = await cancelUnifiedTask(currentTaskId.value)
+    if ((res as any)?.success === false) {
+      throw new Error((res as any)?.message || '取消任务失败')
+    }
+
+    if (pollingTimer.value) {
+      clearInterval(pollingTimer.value)
+      pollingTimer.value = null
+    }
+    clearTaskCache()
+    analysisStatus.value = 'cancelled'
+    progressInfo.value.currentStep = '分析已取消'
+    progressInfo.value.message = '当前分析任务已取消，您可以调整参数后重新发起'
+    ElMessage.success('已取消分析任务')
+  } catch (error: any) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('取消分析任务失败:', error)
+      ElMessage.error(error?.message || '取消分析任务失败，请稍后在任务中心重试')
+    }
+  } finally {
+    cancellingTask.value = false
+  }
+}
+
+// 检查分析结果标的关注状态
+const checkResultFavoriteStatus = async (stockCode: string) => {
+  try {
+    const res = await favoritesApi.check(stockCode)
+    resultIsFavorite.value = Boolean((res as any)?.data?.is_favorite ?? (res as any)?.is_favorite)
+  } catch {
+    resultIsFavorite.value = false
+  }
+}
+
+const getResultCodeAndMarket = () => {
+  const code = stripStockCodeSuffix(
+    pickValidIdentifier(
+      analysisResults.value?.stock_code,
+      analysisResults.value?.stock_symbol,
+      analysisResults.value?.symbol,
+      analysisForm.symbol,
+      analysisForm.stockCode
+    )
+  )
+  const market = resolveAnalysisMarket(code, analysisResults.value?.market_type || analysisForm.market)
+  const name = pickValidIdentifier(analysisResults.value?.stock_name, selectedStockPreview.value?.name) || code
+  const analysisId = pickValidIdentifier(
+    analysisResults.value?.analysis_id,
+    analysisResults.value?.task_id,
+    analysisResults.value?.id,
+    currentTaskId.value
+  )
+  return { code, market, name, analysisId }
+}
+
+const orderFromAnalysisResult = () => {
+  const { code, market, analysisId } = getResultCodeAndMarket()
+  if (!code) return
+  goPaperOrder(router, {
+    code,
+    market,
+    analysisId,
+    side: 'buy'
+  })
+}
+
+const openResultStockDetail = () => {
+  const { code, market } = getResultCodeAndMarket()
+  if (!code) return
+  goStockDetail(router, code, market)
+}
+
+const toggleResultFavorite = async () => {
+  const { code, market, name } = getResultCodeAndMarket()
+  if (!code) return
+
+  resultFavoriteLoading.value = true
+  try {
+    if (resultIsFavorite.value) {
+      const res = await favoritesApi.remove(code)
+      if ((res as any)?.success === false) throw new Error((res as any)?.message || '取消关注失败')
+      resultIsFavorite.value = false
+      ElMessage.success(`已取消关注：${name}`)
+    } else {
+      const res = await favoritesApi.add({
+        symbol: code,
+        stock_code: code,
+        stock_name: name,
+        market
+      })
+      if ((res as any)?.success === false) throw new Error((res as any)?.message || '加入关注失败')
+      resultIsFavorite.value = true
+      ElMessage.success(`已加入关注列表：${name}`)
+    }
+    void loadQuickFavorites()
+  } catch (error: any) {
+    ElMessage.error(error?.message || '更新关注状态失败')
+  } finally {
+    resultFavoriteLoading.value = false
+  }
 }
 
 // 重新开始分析
@@ -2426,8 +3001,10 @@ const getFileExtension = (format: string): string => {
   return extensions[format] || 'txt'
 }
 
-// 组件销毁时清理定时器
+// 组件销毁时清理定时器和页面可见性监听
 onUnmounted(() => {
+  isComponentUnmounted = true
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
   if (pollingTimer.value) {
     clearInterval(pollingTimer.value)
     pollingTimer.value = null
@@ -2443,12 +3020,18 @@ const handleVisibilityChange = () => {
     console.log('📱 页面显示，恢复轮询')
     // 页面重新可见时，立即查询一次状态
     if (currentTaskId.value && analysisStatus.value === 'running') {
+      const polledTaskId = currentTaskId.value
       setTimeout(async () => {
+        if (isComponentUnmounted || currentTaskId.value !== polledTaskId || analysisStatus.value !== 'running') return
         try {
-          const response = await analysisApi.getTaskStatus(currentTaskId.value)
+          const response = await analysisApi.getTaskStatus(polledTaskId)
+          if (isComponentUnmounted || currentTaskId.value !== polledTaskId || analysisStatus.value !== 'running') return
           const status = response.data // 响应拦截器已返回 response.data
           console.log('🔄 页面恢复查询状态:', status)
-          if (status.status === 'pending' || status.status === 'running') {
+          if (handleTerminalInterruptedStatus(status)) {
+            return
+          }
+          if (status.status === 'pending' || status.status === 'running' || status.status === 'processing') {
             analysisStatus.value = 'running'
             updateProgressInfo(status)
           }
@@ -2459,9 +3042,6 @@ const handleVisibilityChange = () => {
     }
   }
 }
-
-// 监听页面可见性变化
-document.addEventListener('visibilitychange', handleVisibilityChange)
 
 // 获取深度描述
 const getDepthDescription = (depth: number) => {
@@ -2656,7 +3236,7 @@ const restoreTaskFromCache = async () => {
       console.log('✅ 任务已完成，显示结果')
       return true
 
-    } else if (status.status === 'pending' || status.status === 'running') {
+    } else if (status.status === 'pending' || status.status === 'running' || status.status === 'processing') {
       // 任务仍在运行，恢复进度显示
       currentTaskId.value = cached.taskId
       analysisStatus.value = 'running'
@@ -2672,6 +3252,10 @@ const restoreTaskFromCache = async () => {
       startPollingTaskStatus()
 
       console.log('🔄 任务仍在运行，恢复进度显示')
+      return true
+
+    } else if (status.status === 'cancelled' || status.status === 'suspended') {
+      handleTerminalInterruptedStatus(status)
       return true
 
     } else if (status.status === 'failed') {
@@ -2837,7 +3421,6 @@ const applyRecommendedModels = () => {
 }
 
 // 监听分析深度变化
-import { watch } from 'vue'
 watch(() => analysisForm.researchDepth, () => {
   checkModelSuitability()
 })
@@ -2847,9 +3430,47 @@ watch([() => modelSettings.value.quickAnalysisModel, () => modelSettings.value.d
   checkModelSuitability()
 })
 
+// 监听路由参数变化（兼容页面复用时从其他入口切换股票/ETF）
+watch(
+  () => [route.query.stock, route.query.stock_code, route.query.market],
+  async ([stock, stockCode, market]) => {
+    const rawQueryCode = String(stock || stockCode || '').trim()
+    if (!rawQueryCode) return
+    const cleanCode = stripStockCodeSuffix(rawQueryCode)
+    if (!cleanCode) return
+
+    const prevCode = stripStockCodeSuffix(analysisForm.stockCode)
+    analysisForm.stockCode = cleanCode
+    clearTaskCache()
+    if (prevCode !== cleanCode && analysisStatus.value !== 'running') {
+      analysisStatus.value = 'idle'
+      showResults.value = false
+      analysisResults.value = null
+      activeReportTab.value = ''
+    }
+    const detectedByCode = getMarketByStockCode(cleanCode)
+    if (detectedByCode === 'ETF') {
+      analysisForm.market = 'ETF'
+    } else if (market) {
+      analysisForm.market = normalizeMarketForAnalysis(market) as MarketType
+    } else {
+      analysisForm.market = detectedByCode as MarketType
+    }
+    syncAnalystsForMarket(analysisForm.market)
+    void fetchStockInfo(cleanCode)
+    if (analysisForm.market === 'A股') {
+      await fetchFactorPreview(cleanCode)
+    } else {
+      clearFactorPreview()
+    }
+  }
+)
+
 // 页面初始化
 onMounted(async () => {
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   initializeModelSettings()
+  void loadQuickFavorites()
 
   // 🆕 从用户偏好加载默认设置
   const authStore = useAuthStore()
@@ -2860,7 +3481,7 @@ onMounted(async () => {
   if (userPrefs) {
     // 加载默认市场
     if (userPrefs.default_market) {
-      analysisForm.market = userPrefs.default_market as MarketType
+      analysisForm.market = normalizeMarketForAnalysis(userPrefs.default_market) as MarketType
     }
 
     // 加载默认分析深度（转换为数字）
@@ -2884,7 +3505,7 @@ onMounted(async () => {
   } else {
     // 降级到 appStore.preferences
     if (appStore.preferences.defaultMarket) {
-      analysisForm.market = appStore.preferences.defaultMarket as MarketType
+      analysisForm.market = normalizeMarketForAnalysis(appStore.preferences.defaultMarket) as MarketType
     }
     if (appStore.preferences.defaultDepth) {
       analysisForm.researchDepth = parseInt(appStore.preferences.defaultDepth)
@@ -2892,41 +3513,36 @@ onMounted(async () => {
     console.log('✅ 已加载应用偏好设置（降级）')
   }
 
-  // 接收一次路由参数（从筛选页带入）- 路由参数优先级最高
+  // 接收一次路由参数（兼容 stock / stock_code，优先按代码纠偏 ETF）
   const q = route.query as any
-  const hasNewStock = !!q?.stock
+  const rawQueryCode = String(q?.stock || q?.stock_code || '').trim()
+  const hasNewStock = Boolean(rawQueryCode)
   if (hasNewStock) {
-    analysisForm.stockCode = String(q.stock)
-    // 🔥 关键修复：如果有新的股票代码，清除旧任务缓存
+    const cleanCode = stripStockCodeSuffix(rawQueryCode)
+    const prevCode = stripStockCodeSuffix(analysisForm.stockCode)
+    analysisForm.stockCode = cleanCode
     clearTaskCache()
-    console.log('🔄 检测到新股票代码，已清除旧任务缓存:', q.stock)
+    if (prevCode !== cleanCode && analysisStatus.value !== 'running') {
+      analysisStatus.value = 'idle'
+      showResults.value = false
+      analysisResults.value = null
+      activeReportTab.value = ''
+    }
+    console.log('🔄 检测到新标的代码，已清除旧任务缓存:', cleanCode)
 
-    // 🆕 自动识别市场类型（如果URL中没有明确指定market参数）
-    if (!q?.market) {
-      const detectedMarket = getMarketByStockCode(analysisForm.stockCode)
-      analysisForm.market = detectedMarket as MarketType
-      if (detectedMarket === 'ETF') {
-        analysisForm.selectedAnalysts = [...ETF_ANALYST_NAMES]
-      } else {
-        analysisForm.selectedAnalysts = normalizeSelectedAnalystsForMarket(
-          detectedMarket as MarketType,
-          analysisForm.selectedAnalysts
-        )
-      }
-      console.log('🔍 自动识别市场类型:', analysisForm.stockCode, '->', detectedMarket)
-    }
-  }
-  if (q?.market) {
-    analysisForm.market = normalizeMarketForAnalysis(q.market) as MarketType
-    // 🔥 如果从路由参数设置市场类型，也需要同步分析师
-    if (analysisForm.market === 'ETF') {
-      analysisForm.selectedAnalysts = [...ETF_ANALYST_NAMES]
+    const detectedByCode = getMarketByStockCode(cleanCode)
+    if (detectedByCode === 'ETF') {
+      analysisForm.market = 'ETF'
+    } else if (q?.market) {
+      analysisForm.market = normalizeMarketForAnalysis(q.market) as MarketType
     } else {
-      analysisForm.selectedAnalysts = normalizeSelectedAnalystsForMarket(
-        analysisForm.market,
-        analysisForm.selectedAnalysts
-      )
+      analysisForm.market = detectedByCode as MarketType
     }
+    syncAnalystsForMarket(analysisForm.market)
+    void fetchStockInfo(cleanCode)
+  } else if (q?.market) {
+    analysisForm.market = normalizeMarketForAnalysis(q.market) as MarketType
+    syncAnalystsForMarket(analysisForm.market)
   }
 
   if (analysisForm.market === 'A股' && analysisForm.stockCode) {
@@ -2997,6 +3613,47 @@ onMounted(async () => {
         margin: 0 0 12px 0;
       }
 
+      .risk-disclaimer-compact {
+        margin: 0 0 12px 0;
+        padding: 10px 14px;
+        border-radius: 8px;
+        border: 1px solid var(--el-color-warning-light-5);
+        background: var(--el-color-warning-light-9);
+
+        .disclaimer-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+
+        .disclaimer-bar-left {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+          color: var(--el-color-warning-dark-2);
+          line-height: 1.5;
+        }
+
+        .disclaimer-icon {
+          font-size: 16px;
+          color: var(--el-color-warning);
+          flex-shrink: 0;
+        }
+
+        .disclaimer-detail-list {
+          margin: 10px 0 0 0;
+          padding-left: 20px;
+          font-size: 12px;
+          line-height: 1.7;
+          color: var(--el-text-color-regular);
+          border-top: 1px dashed var(--el-color-warning-light-5);
+          padding-top: 8px;
+        }
+      }
+
       .page-description {
         font-size: 16px;
         color: #64748b;
@@ -3056,6 +3713,189 @@ onMounted(async () => {
           border: 1px solid #e2e8f0;
           border-radius: 12px;
           background: #f8fafc;
+        }
+
+        .stock-preview-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin: 0 0 12px 100px;
+          padding: 8px 14px;
+          border-radius: 8px;
+          background: var(--el-fill-color-light);
+          border: 1px solid var(--el-border-color-lighter);
+
+          .preview-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+          }
+
+          .preview-name {
+            font-weight: 600;
+            color: var(--el-text-color-primary);
+          }
+
+          .preview-code {
+            font-size: 12px;
+            color: var(--el-text-color-secondary);
+          }
+
+          .preview-quote {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+          }
+
+          .preview-price {
+            color: var(--el-text-color-primary);
+          }
+
+          .preview-change {
+            font-size: 13px;
+            &.is-up { color: #f56c6c; }
+            &.is-down { color: #67c23a; }
+          }
+        }
+
+        .quick-favorites-bar {
+          display: flex;
+          align-items: flex-start;
+          gap: 8px;
+          margin: 0 0 16px 100px;
+
+          .quick-favorites-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 12px;
+            color: var(--el-text-color-secondary);
+            white-space: nowrap;
+            line-height: 24px;
+          }
+
+          .quick-favorites-pills {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+          }
+
+          .favorite-pill {
+            cursor: pointer;
+            transition: transform 0.15s ease;
+            &:hover {
+              transform: translateY(-1px);
+            }
+          }
+        }
+
+        .preset-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding-bottom: 8px;
+          margin-bottom: 14px;
+          border-bottom: 2px solid #e2e8f0;
+        }
+
+        .preset-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+          gap: 12px;
+        }
+
+        .preset-card {
+          padding: 12px 14px;
+          border-radius: 10px;
+          border: 1px solid var(--el-border-color);
+          background: var(--el-bg-color);
+          cursor: pointer;
+          transition: all 0.2s ease;
+
+          &:hover {
+            border-color: var(--el-color-primary);
+            transform: translateY(-1px);
+          }
+
+          &.active {
+            border-color: var(--el-color-primary);
+            background: var(--el-color-primary-light-9);
+            box-shadow: 0 0 0 1px var(--el-color-primary-light-5);
+          }
+
+          .preset-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--el-text-color-primary);
+            margin-bottom: 4px;
+          }
+
+          .preset-desc {
+            font-size: 12px;
+            color: var(--el-text-color-secondary);
+            line-height: 1.4;
+          }
+        }
+
+        .progress-header-actions {
+          margin-left: auto;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+        .compact-steps-strip {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-top: 14px;
+        }
+
+        .compact-step-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 6px 12px;
+          border-radius: 999px;
+          font-size: 12px;
+          border: 1px solid var(--el-border-color-lighter);
+          background: var(--el-fill-color-light);
+          color: var(--el-text-color-secondary);
+
+          &.is-completed {
+            border-color: var(--el-color-success-light-5);
+            background: var(--el-color-success-light-9);
+            color: var(--el-color-success-dark-2);
+          }
+
+          &.is-current {
+            border-color: var(--el-color-primary-light-5);
+            background: var(--el-color-primary-light-9);
+            color: var(--el-color-primary);
+            font-weight: 600;
+          }
+        }
+
+        .stock-suggestion-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          padding: 4px 0;
+
+          .suggestion-code {
+            font-weight: 600;
+            color: var(--el-text-color-primary);
+          }
+
+          .suggestion-name {
+            flex: 1;
+            text-align: right;
+            font-size: 13px;
+            color: var(--el-text-color-regular);
+          }
         }
 
         .factor-preview-meta {
@@ -4004,6 +4844,7 @@ onMounted(async () => {
 
 .result-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   justify-content: center;
   padding-top: 24px;
