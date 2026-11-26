@@ -17,10 +17,13 @@ from app.routers.auth_db import get_current_user
 from app.core.database import get_mongo_db
 from app.core.response import ok
 from app.services.unified_stock_service import UnifiedStockService
+from tradingagents.utils.stock_utils import StockUtils
 
 logger = logging.getLogger("webapi")
 
 router = APIRouter(prefix="/markets", tags=["multi-market"])
+
+SUPPORTED_MARKETS = ("CN", "HK", "US", "ETF")
 
 
 @router.get("", response_model=dict)
@@ -55,6 +58,14 @@ async def get_supported_markets(current_user: dict = Depends(get_current_user)):
             "trading_hours": "09:30-15:00"
         },
         {
+            "code": "ETF",
+            "name": "场内ETF",
+            "name_en": "China ETFs",
+            "currency": "CNY",
+            "timezone": "Asia/Shanghai",
+            "trading_hours": "09:30-15:00"
+        },
+        {
             "code": "HK",
             "name": "港股",
             "name_en": "Hong Kong Stocks",
@@ -80,15 +91,17 @@ async def search_stocks(
     market: str,
     q: str = Query(..., description="搜索关键词（代码或名称）"),
     limit: int = Query(20, ge=1, le=100, description="返回结果数量"),
+    include_etf: bool = Query(True, description="CN 市场搜索时是否合并匹配 ETF（默认合并）"),
     current_user: dict = Depends(get_current_user)
 ):
     """
-    搜索股票（支持多市场）
+    搜索股票/ETF（支持多市场）
     
     Args:
-        market: 市场类型 (CN/HK/US)
+        market: 市场类型 (CN/HK/US/ETF)
         q: 搜索关键词
         limit: 返回结果数量
+        include_etf: 当 market=CN 时是否默认合并 etf_basic_info 结果
     
     Returns:
         {
@@ -96,11 +109,10 @@ async def search_stocks(
             "data": {
                 "stocks": [
                     {
-                        "code": "00700",
-                        "name": "腾讯控股",
-                        "name_en": "Tencent Holdings",
-                        "market": "HK",
-                        "source": "yfinance",
+                        "code": "588000",
+                        "name": "科创50ETF",
+                        "market": "ETF",
+                        "security_type": "ETF",
                         ...
                     }
                 ],
@@ -109,7 +121,7 @@ async def search_stocks(
         }
     """
     market = market.upper()
-    if market not in ["CN", "HK", "US"]:
+    if market not in SUPPORTED_MARKETS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的市场类型: {market}"
@@ -119,7 +131,7 @@ async def search_stocks(
     service = UnifiedStockService(db)
     
     try:
-        results = await service.search_stocks(market, q, limit)
+        results = await service.search_stocks(market, q, limit, include_etf=include_etf)
         return ok(data={
             "stocks": results,
             "total": len(results)
@@ -143,7 +155,7 @@ async def get_stock_info(
     获取股票基础信息（支持多市场、多数据源）
     
     Args:
-        market: 市场类型 (CN/HK/US)
+        market: 市场类型 (CN/HK/US/ETF)
         code: 股票代码
         source: 指定数据源（可选，不指定则按优先级自动选择）
     
@@ -166,22 +178,23 @@ async def get_stock_info(
         }
     """
     market = market.upper()
-    if market not in ["CN", "HK", "US"]:
+    if market not in SUPPORTED_MARKETS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的市场类型: {market}"
         )
-    
+
+    normalized_code = StockUtils.normalize_symbol(code) or code.strip()
     db = get_mongo_db()
     service = UnifiedStockService(db)
     
     try:
-        stock_info = await service.get_stock_info(market, code, source)
+        stock_info = await service.get_stock_info(market, normalized_code, source)
         
         if not stock_info:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"未找到股票: {market}:{code}"
+                detail=f"未找到股票: {market}:{normalized_code}"
             )
         
         return ok(data=stock_info)
@@ -202,10 +215,10 @@ async def get_stock_quote(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    获取股票实时行情（支持多市场）
+    获取股票实时行情（支持多市场与 ETF）
     
     Args:
-        market: 市场类型 (CN/HK/US)
+        market: 市场类型 (CN/HK/US/ETF)
         code: 股票代码
     
     Returns:
@@ -227,22 +240,23 @@ async def get_stock_quote(
         }
     """
     market = market.upper()
-    if market not in ["CN", "HK", "US"]:
+    if market not in SUPPORTED_MARKETS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的市场类型: {market}"
         )
-    
+
+    normalized_code = StockUtils.normalize_symbol(code) or code.strip()
     db = get_mongo_db()
     service = UnifiedStockService(db)
     
     try:
-        quote = await service.get_stock_quote(market, code)
+        quote = await service.get_stock_quote(market, normalized_code)
         
         if not quote:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"未找到股票行情: {market}:{code}"
+                detail=f"未找到股票行情: {market}:{normalized_code}"
             )
         
         return ok(data=quote)
@@ -266,10 +280,10 @@ async def get_stock_daily_quotes(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    获取股票历史K线数据（支持多市场）
+    获取股票历史K线数据（支持多市场与 ETF）
     
     Args:
-        market: 市场类型 (CN/HK/US)
+        market: 市场类型 (CN/HK/US/ETF)
         code: 股票代码
         start_date: 开始日期
         end_date: 结束日期
@@ -298,22 +312,23 @@ async def get_stock_daily_quotes(
         }
     """
     market = market.upper()
-    if market not in ["CN", "HK", "US"]:
+    if market not in SUPPORTED_MARKETS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的市场类型: {market}"
         )
-    
+
+    normalized_code = StockUtils.normalize_symbol(code) or code.strip()
     db = get_mongo_db()
     service = UnifiedStockService(db)
     
     try:
         quotes = await service.get_daily_quotes(
-            market, code, start_date, end_date, limit
+            market, normalized_code, start_date, end_date, limit
         )
         
         return ok(data={
-            "code": code,
+            "code": normalized_code,
             "market": market,
             "quotes": quotes,
             "total": len(quotes)

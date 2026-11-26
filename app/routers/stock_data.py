@@ -220,6 +220,45 @@ async def get_combined_stock_data(
         )
 
 
+def _standardize_etf_search_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """将 etf_basic_info 文档标准化为与 /api/stock-data/search 一致的返回结构。"""
+    from tradingagents.utils.stock_utils import ETF_SH_PREFIXES, ETF_SZ_PREFIXES
+
+    code = str(doc.get("code") or doc.get("symbol") or "").strip().zfill(6)
+    if code.startswith(ETF_SH_PREFIXES):
+        full_symbol = doc.get("full_symbol") or f"{code}.SH"
+        exchange = "SSE"
+        exchange_name = "上海证券交易所"
+    elif code.startswith(ETF_SZ_PREFIXES):
+        full_symbol = doc.get("full_symbol") or f"{code}.SZ"
+        exchange = "SZSE"
+        exchange_name = "深圳证券交易所"
+    else:
+        full_symbol = doc.get("full_symbol") or f"{code}.SH"
+        exchange = "SSE"
+        exchange_name = "上海证券交易所"
+
+    return {
+        "symbol": code,
+        "code": code,
+        "full_symbol": full_symbol,
+        "name": doc.get("name") or doc.get("fund_name") or doc.get("etf_name") or code,
+        "industry": doc.get("fund_type") or "ETF",
+        "market": "ETF",
+        "board": "ETF",
+        "sse": exchange_name,
+        "security_type": "ETF",
+        "source": doc.get("source") or "etf_basic_info",
+        "market_info": {
+            "market": "ETF",
+            "exchange": exchange,
+            "exchange_name": exchange_name,
+            "currency": "CNY",
+            "timezone": "Asia/Shanghai",
+        },
+    }
+
+
 @router.get("/search")
 async def search_stocks(
     keyword: str = Query(..., min_length=1, description="搜索关键词"),
@@ -227,67 +266,172 @@ async def search_stocks(
     current_user: dict = Depends(get_current_user)
 ):
     """
-    搜索股票
+    搜索股票与 ETF（支持转义正则、多数据源降级与 etf_basic_info 合并）
     
     Args:
-        keyword: 搜索关键词 (股票代码或名称)
+        keyword: 搜索关键词 (股票/ETF 代码或名称)
         limit: 返回数量限制
         
     Returns:
         dict: 搜索结果
     """
     try:
+        import re
         from app.core.database import get_mongo_db
-        from app.core.data_source_priority import get_preferred_data_source_async
+        from app.core.data_source_priority import (
+            get_preferred_data_source_async,
+            get_enabled_data_sources_async,
+        )
+        from tradingagents.utils.stock_utils import StockUtils, SecurityType
 
         db = get_mongo_db()
         collection = db.stock_basic_info
+        etf_collection = db.etf_basic_info
 
-        # 🔥 使用统一的数据源优先级管理函数
+        raw_keyword = str(keyword or "").strip()
+        if not raw_keyword:
+            return {
+                "success": True,
+                "data": [],
+                "total": 0,
+                "keyword": keyword,
+                "source": None,
+                "message": "搜索完成",
+            }
+
+        normalized_kw = StockUtils.normalize_symbol(raw_keyword) or raw_keyword
+        escaped_kw = re.escape(normalized_kw)
+        fetch_limit = min(max(limit * 3, 30), 200)
+
+        # 获取优先级数据源列表（支持多源降级，避免单源缺数据时返回空）
         preferred_source = await get_preferred_data_source_async(market_category="a_shares")
+        try:
+            enabled_sources = await get_enabled_data_sources_async(market_category="a_shares")
+        except Exception:
+            enabled_sources = []
 
-        # 构建搜索条件
-        search_conditions = []
+        source_candidates: List[str] = []
+        for src in [preferred_source, *(enabled_sources or []), "tushare", "multi_source", "akshare", "baostock"]:
+            if not src:
+                continue
+            src_lower = str(src).strip().lower()
+            if src_lower in ("local", "mongodb", "local_file"):
+                continue
+            if src_lower not in source_candidates:
+                source_candidates.append(src_lower)
 
-        # 如果是6位数字，按代码精确匹配
-        if keyword.isdigit() and len(keyword) == 6:
-            search_conditions.append({"symbol": keyword})
+        # 构建转义后的安全搜索条件
+        if normalized_kw.isdigit() and len(normalized_kw) == 6:
+            match_condition: Dict[str, Any] = {
+                "$or": [{"symbol": normalized_kw}, {"code": normalized_kw}]
+            }
         else:
-            # 按名称模糊匹配
-            search_conditions.append({"name": {"$regex": keyword, "$options": "i"}})
-            # 如果包含数字，也尝试代码匹配
-            if any(c.isdigit() for c in keyword):
-                search_conditions.append({"symbol": {"$regex": keyword}})
-
-        # 🔥 添加数据源筛选：只查询优先级最高的数据源
-        query = {
-            "$and": [
-                {"$or": search_conditions},
-                {"source": preferred_source}
+            search_conditions: List[Dict[str, Any]] = [
+                {"name": {"$regex": escaped_kw, "$options": "i"}},
+                {"symbol": {"$regex": escaped_kw, "$options": "i"}},
+                {"code": {"$regex": escaped_kw, "$options": "i"}},
             ]
-        }
+            match_condition = {"$or": search_conditions}
 
-        # 执行搜索
-        cursor = collection.find(query, {"_id": 0}).limit(limit)
+        # 1) 在 stock_basic_info 中按优先级多源降级查询
+        stock_docs_by_code: Dict[str, Dict[str, Any]] = {}
+        used_source = preferred_source
+        for src in source_candidates:
+            query = {"$and": [match_condition, {"source": src}]}
+            cursor = collection.find(query, {"_id": 0}).limit(fetch_limit)
+            docs = await cursor.to_list(length=fetch_limit)
+            if docs:
+                if not stock_docs_by_code:
+                    used_source = src
+                for doc in docs:
+                    code = str(doc.get("symbol") or doc.get("code") or "").strip()
+                    if code and code not in stock_docs_by_code:
+                        stock_docs_by_code[code] = doc
+                if len(stock_docs_by_code) >= limit:
+                    break
 
-        results = await cursor.to_list(length=limit)
+        # 兜底：若按 source 过滤全部无命中，尝试不限 source 兼容旧数据
+        if not stock_docs_by_code:
+            cursor = collection.find(match_condition, {"_id": 0}).limit(fetch_limit)
+            fallback_docs = await cursor.to_list(length=fetch_limit)
+            for doc in fallback_docs:
+                code = str(doc.get("symbol") or doc.get("code") or "").strip()
+                if code and code not in stock_docs_by_code:
+                    stock_docs_by_code[code] = doc
+                    if not used_source and doc.get("source"):
+                        used_source = doc.get("source")
 
-        # 数据标准化
+        # 2) 同时检索 etf_basic_info 并按优先级去重
+        etf_priority = {"akshare": 0, "tushare": 1, "qmt": 2}
+        etf_docs_by_code: Dict[str, tuple[int, Dict[str, Any]]] = {}
+        try:
+            if normalized_kw.isdigit() and len(normalized_kw) == 6:
+                etf_match_condition = match_condition
+            else:
+                etf_match_condition = {
+                    "$or": [
+                        {"name": {"$regex": escaped_kw, "$options": "i"}},
+                        {"fund_name": {"$regex": escaped_kw, "$options": "i"}},
+                        {"etf_name": {"$regex": escaped_kw, "$options": "i"}},
+                        {"symbol": {"$regex": escaped_kw, "$options": "i"}},
+                        {"code": {"$regex": escaped_kw, "$options": "i"}},
+                    ]
+                }
+            etf_cursor = etf_collection.find(etf_match_condition, {"_id": 0}).limit(fetch_limit)
+            etf_raw_docs = await etf_cursor.to_list(length=fetch_limit)
+            for doc in etf_raw_docs:
+                code = str(doc.get("code") or doc.get("symbol") or "").strip()
+                if not code:
+                    continue
+                rank = etf_priority.get(str(doc.get("source") or "").strip().lower(), 99)
+                if code not in etf_docs_by_code or rank < etf_docs_by_code[code][0]:
+                    etf_docs_by_code[code] = (rank, doc)
+        except Exception:
+            pass
+
+        # 3) 标准化并合并结果（股票 + ETF）
         service = get_stock_data_service()
-        standardized_results = []
-        for doc in results:
+        merged_by_code: Dict[str, Dict[str, Any]] = {}
+        for code, doc in stock_docs_by_code.items():
             standardized_doc = service._standardize_basic_info(doc)
-            standardized_results.append(standardized_doc)
+            is_etf = StockUtils.identify_security_type(code) == SecurityType.FUND
+            standardized_doc["security_type"] = "ETF" if is_etf else "STOCK"
+            standardized_doc["market"] = "ETF" if is_etf else "CN"
+            merged_by_code[code] = standardized_doc
+
+        for code, (_, etf_doc) in etf_docs_by_code.items():
+            merged_by_code[code] = _standardize_etf_search_doc(etf_doc)
+
+        kw_lower = normalized_kw.lower()
+
+        def _rank_item(item: Dict[str, Any]) -> tuple:
+            code_val = str(item.get("symbol") or item.get("code") or "").lower()
+            name_val = str(item.get("name") or "").lower()
+            if code_val == kw_lower:
+                rank = 0
+            elif code_val.startswith(kw_lower):
+                rank = 1
+            elif name_val == kw_lower:
+                rank = 2
+            elif name_val.startswith(kw_lower):
+                rank = 3
+            else:
+                rank = 4
+            return (rank, code_val)
+
+        standardized_results = sorted(merged_by_code.values(), key=_rank_item)[:limit]
 
         return {
             "success": True,
             "data": standardized_results,
             "total": len(standardized_results),
             "keyword": keyword,
-            "source": preferred_source,  # 🔥 返回数据来源
+            "source": used_source,
             "message": "搜索完成"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

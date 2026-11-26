@@ -33,7 +33,9 @@ from app.services.memory_state_manager import get_memory_state_manager, TaskStat
 from app.services.redis_progress_tracker import RedisProgressTracker, get_progress_by_id
 from app.services.progress_log_handler import register_analysis_tracker, unregister_analysis_tracker
 
-ETF_CODE_PREFIXES = ("50", "51", "52", "56", "58", "15", "16", "18")
+from tradingagents.utils.stock_utils import ETF_PREFIXES, StockUtils
+
+ETF_CODE_PREFIXES = ETF_PREFIXES
 
 # 研究深度档位 → 火山方舟推理模型思考预算（reasoning_effort 七档：none/minimal/low/medium/high/xhigh/max）
 # 档位映射仅作为默认值：DB 模型配置中显式设置的 reasoning_effort 优先级更高（见 trading_graph 合并逻辑）
@@ -69,7 +71,7 @@ config_service = ConfigService()
 
 
 def _is_cn_etf_symbol(code: Optional[str]) -> bool:
-    code_str = str(code or "").strip()
+    code_str = StockUtils.normalize_symbol(code)
     return len(code_str) == 6 and code_str.isdigit() and code_str.startswith(ETF_CODE_PREFIXES)
 
 
@@ -77,7 +79,9 @@ def _get_cached_security_name(code: Optional[str]) -> Optional[str]:
     if not code or get_mongodb_client is None:
         return None
 
-    code_str = str(code).strip().zfill(6)
+    code_str = StockUtils.normalize_symbol(code) or str(code).strip()
+    if code_str.isdigit():
+        code_str = code_str.zfill(6)
 
     try:
         client = get_mongodb_client()
@@ -2727,7 +2731,9 @@ class SimpleAnalysisService:
             return []
 
     async def cleanup_zombie_tasks(self, max_running_hours: int = 2) -> Dict[str, Any]:
-        """清理僵尸任务（长时间处于 processing/running 状态的任务）
+        """清理僵尸任务（长时间处于 processing/running/pending 状态的任务）
+
+        以 v2 主集合 unified_analysis_tasks 为主，同时兼容清理旧集合 analysis_tasks。
 
         Args:
             max_running_hours: 最大运行时长（小时），超过此时长的任务将被标记为失败
@@ -2739,40 +2745,60 @@ class SimpleAnalysisService:
             # 1) 清理内存中的僵尸任务
             memory_cleaned = await self.memory_manager.cleanup_zombie_tasks(max_running_hours)
 
-            # 2) 清理 MongoDB 中的僵尸任务
+            # 2) 清理 MongoDB 中的僵尸任务（unified_analysis_tasks 为主 + analysis_tasks 兼容）
             db = get_mongo_db()
-            from datetime import timedelta
-            cutoff_time = datetime.utcnow() - timedelta(hours=max_running_hours)
+            from datetime import timedelta, timezone
+            now_utc = datetime.now(timezone.utc)
+            cutoff_time = now_utc - timedelta(hours=max_running_hours)
+            timeout_msg = f"任务超时（运行时间超过 {max_running_hours} 小时）"
 
-            # 查找长时间处于 processing 状态的任务
             zombie_filter = {
                 "status": {"$in": ["processing", "running", "pending"]},
                 "$or": [
                     {"started_at": {"$lt": cutoff_time}},
-                    {"created_at": {"$lt": cutoff_time, "started_at": None}}
+                    {"created_at": {"$lt": cutoff_time}, "started_at": None},
+                    {"created_at": {"$lt": cutoff_time}, "started_at": {"$exists": False}},
                 ]
             }
 
-            # 更新为失败状态
-            update_result = await db.analysis_tasks.update_many(
+            unified_result = await db.unified_analysis_tasks.update_many(
                 zombie_filter,
                 {
                     "$set": {
                         "status": "failed",
-                        "last_error": f"任务超时（运行时间超过 {max_running_hours} 小时）",
-                        "completed_at": datetime.utcnow(),
-                        "updated_at": datetime.utcnow()
+                        "error_message": timeout_msg,
+                        "message": timeout_msg,
+                        "completed_at": now_utc,
+                        "updated_at": now_utc,
                     }
                 }
             )
+            unified_cleaned = unified_result.modified_count
 
-            mongo_cleaned = update_result.modified_count
+            legacy_result = await db.analysis_tasks.update_many(
+                zombie_filter,
+                {
+                    "$set": {
+                        "status": "failed",
+                        "last_error": timeout_msg,
+                        "completed_at": now_utc,
+                        "updated_at": now_utc,
+                    }
+                }
+            )
+            legacy_cleaned = legacy_result.modified_count
+            mongo_cleaned = unified_cleaned + legacy_cleaned
 
-            logger.info(f"🧹 僵尸任务清理完成: 内存={memory_cleaned}, MongoDB={mongo_cleaned}")
+            logger.info(
+                f"🧹 僵尸任务清理完成: 内存={memory_cleaned}, "
+                f"unified={unified_cleaned}, legacy={legacy_cleaned}"
+            )
 
             return {
                 "success": True,
                 "memory_cleaned": memory_cleaned,
+                "unified_cleaned": unified_cleaned,
+                "legacy_cleaned": legacy_cleaned,
                 "mongo_cleaned": mongo_cleaned,
                 "total_cleaned": memory_cleaned + mongo_cleaned,
                 "max_running_hours": max_running_hours
@@ -2784,12 +2810,16 @@ class SimpleAnalysisService:
                 "success": False,
                 "error": str(e),
                 "memory_cleaned": 0,
+                "unified_cleaned": 0,
+                "legacy_cleaned": 0,
                 "mongo_cleaned": 0,
                 "total_cleaned": 0
             }
 
     async def get_zombie_tasks(self, max_running_hours: int = 2) -> List[Dict[str, Any]]:
         """获取僵尸任务列表（不执行清理，仅查询）
+
+        以 v2 主集合 unified_analysis_tasks 为主，同时兼容旧集合 analysis_tasks。
 
         Args:
             max_running_hours: 最大运行时长（小时）
@@ -2799,40 +2829,85 @@ class SimpleAnalysisService:
         """
         try:
             db = get_mongo_db()
-            from datetime import timedelta
-            cutoff_time = datetime.utcnow() - timedelta(hours=max_running_hours)
+            from datetime import timedelta, timezone
+            now_utc = datetime.now(timezone.utc)
+            cutoff_time = now_utc - timedelta(hours=max_running_hours)
 
-            # 查找长时间处于 processing 状态的任务
             zombie_filter = {
                 "status": {"$in": ["processing", "running", "pending"]},
                 "$or": [
                     {"started_at": {"$lt": cutoff_time}},
-                    {"created_at": {"$lt": cutoff_time, "started_at": None}}
+                    {"created_at": {"$lt": cutoff_time}, "started_at": None},
+                    {"created_at": {"$lt": cutoff_time}, "started_at": {"$exists": False}},
                 ]
             }
 
-            cursor = db.analysis_tasks.find(zombie_filter).sort("created_at", -1)
-            zombie_tasks = []
+            zombie_tasks: List[Dict[str, Any]] = []
+            seen_task_ids = set()
 
-            async for doc in cursor:
-                task = {
-                    "task_id": doc.get("task_id"),
-                    "user_id": str(doc.get("user_id", doc.get("user"))),
-                    "stock_code": doc.get("stock_code"),
+            def _calc_running_hours(start_time: Any) -> Optional[float]:
+                if not start_time:
+                    return None
+                if isinstance(start_time, str):
+                    try:
+                        start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                    except Exception:
+                        return None
+                if isinstance(start_time, datetime):
+                    if start_time.tzinfo is None:
+                        start_time = start_time.replace(tzinfo=timezone.utc)
+                    else:
+                        start_time = start_time.astimezone(timezone.utc)
+                    return round((now_utc - start_time).total_seconds() / 3600, 2)
+                return None
+
+            def _iso(val: Any) -> Optional[str]:
+                if not val:
+                    return None
+                return val.isoformat() if hasattr(val, "isoformat") else str(val)
+
+            # 1) 优先查询 v2 主集合 unified_analysis_tasks
+            unified_cursor = db.unified_analysis_tasks.find(zombie_filter).sort("created_at", -1).limit(500)
+            async for doc in unified_cursor:
+                tid = doc.get("task_id")
+                if tid in seen_task_ids:
+                    continue
+                seen_task_ids.add(tid)
+                params = doc.get("task_params") or {}
+                code = doc.get("stock_code") or params.get("symbol") or params.get("stock_code")
+                start_time = doc.get("started_at") or doc.get("created_at")
+                zombie_tasks.append({
+                    "task_id": tid,
+                    "user_id": str(doc.get("user_id", doc.get("user", ""))),
+                    "stock_code": code,
+                    "stock_name": doc.get("stock_name") or params.get("stock_name"),
+                    "task_type": doc.get("task_type"),
+                    "status": doc.get("status"),
+                    "source_collection": "unified_analysis_tasks",
+                    "created_at": _iso(doc.get("created_at")),
+                    "started_at": _iso(doc.get("started_at")),
+                    "running_hours": _calc_running_hours(start_time),
+                })
+
+            # 2) 兼容查询旧集合 analysis_tasks
+            legacy_cursor = db.analysis_tasks.find(zombie_filter).sort("created_at", -1).limit(500)
+            async for doc in legacy_cursor:
+                tid = doc.get("task_id")
+                if tid in seen_task_ids:
+                    continue
+                seen_task_ids.add(tid)
+                start_time = doc.get("started_at") or doc.get("created_at")
+                zombie_tasks.append({
+                    "task_id": tid,
+                    "user_id": str(doc.get("user_id", doc.get("user", ""))),
+                    "stock_code": doc.get("stock_code") or doc.get("symbol"),
                     "stock_name": doc.get("stock_name"),
                     "status": doc.get("status"),
-                    "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
-                    "started_at": doc.get("started_at").isoformat() if doc.get("started_at") else None,
-                    "running_hours": None
-                }
-
-                # 计算运行时长
-                start_time = doc.get("started_at") or doc.get("created_at")
-                if start_time:
-                    running_seconds = (datetime.utcnow() - start_time).total_seconds()
-                    task["running_hours"] = round(running_seconds / 3600, 2)
-
-                zombie_tasks.append(task)
+                    "source_collection": "analysis_tasks",
+                    "created_at": _iso(doc.get("created_at")),
+                    "started_at": _iso(doc.get("started_at")),
+                    "running_hours": _calc_running_hours(start_time),
+                })
 
             logger.info(f"📋 查询到 {len(zombie_tasks)} 个僵尸任务")
             return zombie_tasks

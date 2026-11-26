@@ -5,6 +5,7 @@
 """
 
 from typing import List, Optional
+import re
 from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 import logging
@@ -92,8 +93,8 @@ async def get_task_list(
         items = []
         for task in tasks:
             # 从任务参数中提取显示信息
-            symbol = task.task_params.get("symbol")
-            code = task.task_params.get("code")
+            item_symbol = task.task_params.get("symbol") or task.task_params.get("stock_code")
+            code = task.task_params.get("code") or item_symbol
             market = task.task_params.get("market") or task.task_params.get("market_type")
             
             items.append(TaskListItem(
@@ -106,7 +107,7 @@ async def get_task_list(
                 completed_at=task.completed_at.isoformat() if task.completed_at else None,
                 execution_time=task.execution_time,
                 error_message=task.error_message,
-                symbol=symbol,
+                symbol=item_symbol,
                 code=code,
                 market=market
             ))
@@ -204,10 +205,28 @@ async def cancel_task(
         if task.user_id != user_id:
             raise HTTPException(status_code=403, detail="无权访问此任务")
 
-        # 取消任务
+        # 取消任务（联动 unified_analysis_tasks + Redis 队列 + 内存状态）
         success = await service.cancel_task(task_id)
 
         if success:
+            try:
+                from app.services.queue_service import get_queue_service
+                queue_service = get_queue_service()
+                await queue_service.cancel_task(task_id)
+            except Exception as queue_err:
+                logger.warning(f"⚠️ 同步清理 Redis 队列任务状态失败（已取消 DB 任务）: {task_id} - {queue_err}")
+
+            try:
+                from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
+                memory_manager = get_memory_state_manager()
+                await memory_manager.update_task_status(
+                    task_id=task_id,
+                    status=TaskStatus.CANCELLED,
+                    message="任务已取消",
+                )
+            except Exception as mem_err:
+                logger.warning(f"⚠️ 同步更新内存任务取消状态失败: {task_id} - {mem_err}")
+
             return {
                 "success": True,
                 "message": "任务已取消"
@@ -332,8 +351,8 @@ async def get_general_task_list(
 
         # 关键字搜索（匹配 task_params.symbol / stock_code）
         if keyword and keyword.strip():
-            kw = keyword.strip()
-            # 使用正则匹配分析目标
+            kw = re.escape(keyword.strip())
+            # 使用转义正则匹配分析目标，避免特殊字符触发正则错误
             query["$or"] = [
                 {"task_params.symbol": {"$regex": kw, "$options": "i"}},
                 {"task_params.stock_code": {"$regex": kw, "$options": "i"}},
