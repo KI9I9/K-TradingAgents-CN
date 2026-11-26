@@ -2115,11 +2115,12 @@ const batchAnalyze = async () => {
     const prefs = authStore.user?.preferences as Record<string, any> | undefined
     const depthIndex = Math.min(5, Math.max(1, Number(prefs?.default_depth || 2))) - 1
     const depthLabel = ['快速', '基础', '标准', '深度', '全面'][depthIndex] || '基础'
+    const aAnalysts = Array.isArray(prefs?.default_analysts) && prefs.default_analysts.length > 0
+      ? prefs.default_analysts.filter((name: string) => name !== 'ETF分析师')
+      : ['市场分析师', '基本面分析师', '新闻分析师']
     const defaultAnalysts = allEtf
       ? ['ETF分析师', '市场分析师', '新闻分析师']
-      : (Array.isArray(prefs?.default_analysts) && prefs.default_analysts.length > 0
-          ? prefs.default_analysts
-          : ['市场分析师', '基本面分析师', '新闻分析师'])
+      : (aAnalysts.length > 0 ? aAnalysts : ['市场分析师', '基本面分析师', '新闻分析师'])
 
     const res = await analysisApi.startBatchAnalysis({
       title: `选股筛选批量分析 (${codes.length}只)`,
