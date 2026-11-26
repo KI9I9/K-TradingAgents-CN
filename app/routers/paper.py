@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Body
 from pydantic import BaseModel, Field
 from typing import Literal, Optional, Dict, Any, List, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import re
 
@@ -55,12 +55,17 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
     """
     code = code.strip().upper()
 
+    # A股带交易所后缀：600519.SH / 000001.SZ / 920363.BJ 等
+    cn_suffix_match = re.match(r'^(\d{6})\.(SH|SZ|BJ|SS|XSHG|XSHE)$', code)
+    if cn_suffix_match:
+        return ('CN', cn_suffix_match.group(1))
+
     # 港股：带 .HK 后缀
     if code.endswith('.HK'):
         return ('HK', code[:-3].zfill(5))
 
-    # 美股：纯字母
-    if re.match(r'^[A-Z]+$', code):
+    # 美股：纯字母或含点/连字符（如 BRK.B / BF-B）
+    if re.match(r'^[A-Z]+(?:[.-][A-Z]+)?$', code):
         return ('US', code)
 
     # 港股：4-5位数字
@@ -76,13 +81,21 @@ def _detect_market_and_code(code: str) -> Tuple[str, str]:
 
 
 def _is_cn_etf_symbol(code: str) -> bool:
-    code_str = str(code or "").strip().upper().zfill(6)
+    code_str = str(code or "").strip().upper()
+    cn_suffix_match = re.match(r'^(\d{6})\.(SH|SZ|BJ|SS|XSHG|XSHE)$', code_str)
+    if cn_suffix_match:
+        code_str = cn_suffix_match.group(1)
+    code_str = code_str.zfill(6)
     return len(code_str) == 6 and code_str.isdigit() and code_str.startswith(ETF_CODE_PREFIXES)
 
 
 def _resolve_market_and_code(code: str, market: Optional[str] = None) -> Tuple[str, str, bool]:
     normalized_code = str(code or "").strip().upper()
     requested_market = str(market or "").strip().upper()
+
+    cn_suffix_match = re.match(r'^(\d{6})\.(SH|SZ|BJ|SS|XSHG|XSHE)$', normalized_code)
+    if cn_suffix_match:
+        normalized_code = cn_suffix_match.group(1)
 
     if requested_market == "ETF":
         normalized_code = normalized_code.zfill(6)
@@ -166,8 +179,15 @@ async def _get_market_rules(market: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _calculate_commission(market: str, side: str, amount: float, rules: Dict[str, Any]) -> float:
-    """计算手续费"""
+def _calculate_commission(
+    market: str,
+    side: str,
+    amount: float,
+    rules: Dict[str, Any],
+    is_etf: bool = False,
+    code: Optional[str] = None,
+) -> float:
+    """计算手续费（CN ETF 卖出免收印花税）"""
     if not rules or "commission" not in rules:
         return 0.0
 
@@ -179,8 +199,13 @@ def _calculate_commission(market: str, side: str, amount: float, rules: Dict[str
     comm_min = commission_config.get("min", 0.0)
     commission += max(amount * comm_rate, comm_min)
 
-    # 印花税（仅卖出）
-    if side == "sell" and "stamp_duty_rate" in commission_config:
+    # 印花税（仅卖出；CN ETF 按沪深规定免收印花税）
+    market_upper = str(market or "").strip().upper()
+    etf_stamp_exempt = market_upper == "ETF" or (
+        market_upper == "CN"
+        and (is_etf or (code is not None and _is_cn_etf_symbol(code)))
+    )
+    if side == "sell" and "stamp_duty_rate" in commission_config and not etf_stamp_exempt:
         commission += amount * commission_config["stamp_duty_rate"]
 
     # 其他费用（港股）
@@ -199,38 +224,78 @@ def _calculate_commission(market: str, side: str, amount: float, rules: Dict[str
     return round(commission, 2)
 
 
+async def _resolve_cn_t_plus() -> int:
+    """获取 A 股 T+N 规则；即使 paper_market_rules 未初始化也默认 T+1。"""
+    rules = await _get_market_rules("CN")
+    if isinstance(rules, dict) and rules.get("t_plus") is not None:
+        return int(rules["t_plus"])
+    return 1
+
+
+async def _compute_available_qty(
+    user_id: str,
+    code: str,
+    market: str,
+    total_qty: int,
+) -> int:
+    """按 CN_TZ 当日买入成交汇总动态计算可用数量（CN 默认 T+1，次日自动解冻）。"""
+    qty = max(0, int(total_qty or 0))
+    if qty <= 0:
+        return 0
+
+    market_upper = str(market or "CN").strip().upper()
+    if market_upper not in {"CN", "ETF"}:
+        return qty
+
+    t_plus = await _resolve_cn_t_plus()
+    if t_plus <= 0:
+        return qty
+
+    db = get_mongo_db()
+    if isinstance(db, dict) and "paper_trades" not in db:
+        return qty
+
+    today_cn = cn_now().astimezone(CN_TZ).date()
+    cutoff_cn_date = today_cn - timedelta(days=t_plus - 1)
+    cutoff_cn_start = datetime(
+        cutoff_cn_date.year, cutoff_cn_date.month, cutoff_cn_date.day, tzinfo=CN_TZ
+    )
+    prefilter_date = cutoff_cn_date - timedelta(days=1)
+    prefilter_dt = datetime(
+        prefilter_date.year, prefilter_date.month, prefilter_date.day, tzinfo=CN_TZ
+    )
+
+    trade_query = {
+        "user_id": user_id,
+        "code": code,
+        "side": "buy",
+        "$or": [
+            {"timestamp": {"$gte": prefilter_date.isoformat()}},
+            {"timestamp": {"$gte": prefilter_dt}},
+        ],
+    }
+    cursor = db["paper_trades"].find(trade_query, {"_id": 0, "quantity": 1, "timestamp": 1})
+    trades = await cursor.to_list(None)
+
+    locked_qty = 0
+    for trade in trades:
+        ts = parse_quote_time(trade.get("timestamp"))
+        if ts is not None and ts.astimezone(CN_TZ) >= cutoff_cn_start:
+            locked_qty += int(trade.get("quantity", 0) or 0)
+
+    return max(0, qty - locked_qty)
+
+
 async def _get_available_quantity(user_id: str, code: str, market: str) -> int:
-    """获取可用数量（考虑T+1限制）"""
+    """获取可用数量（委托给 _compute_available_qty 统一口径）。"""
     db = get_mongo_db()
     pos = await db["paper_positions"].find_one({"user_id": user_id, "code": code})
 
     if not pos:
         return 0
 
-    total_qty = pos.get("quantity", 0)
-
-    # A股T+1：今天买入的不能卖出
-    if market == "CN":
-        # 获取市场规则
-        rules = await _get_market_rules(market)
-        if rules and rules.get("t_plus", 0) > 0:
-            # 查询今天的买入数量
-            today = datetime.utcnow().date().isoformat()
-            pipeline = [
-                {"$match": {
-                    "user_id": user_id,
-                    "code": code,
-                    "side": "buy",
-                    "timestamp": {"$gte": today}
-                }},
-                {"$group": {"_id": None, "total": {"$sum": "$quantity"}}}
-            ]
-            today_buy = await db["paper_trades"].aggregate(pipeline).to_list(1)
-            today_buy_qty = today_buy[0]["total"] if today_buy else 0
-            return max(0, total_qty - today_buy_qty)
-
-    # 港股/美股T+0：全部可用
-    return total_qty
+    total_qty = int(pos.get("quantity", 0) or 0)
+    return await _compute_available_qty(user_id, code, market, total_qty)
 
 
 async def _get_stock_name(code: str, market: str) -> str:
@@ -537,12 +602,20 @@ def _zfill_code(code: str) -> str:
     return s.zfill(6)
 
 
-async def _position_valuation(position):
+async def _position_valuation(position, user_id: Optional[str] = None):
     """Read-only reference valuation; missing prices are not zero market value."""
     code = position.get('code')
     market = position.get('market', 'CN')
     qty = int(position.get('quantity', 0))
     avg_cost = float(position.get('avg_cost', 0.0))
+    compute_available = globals().get('_compute_available_qty')
+    effective_user_id = position.get('user_id') or user_id
+    if qty == 0:
+        available_qty = 0
+    elif compute_available is not None and effective_user_id:
+        available_qty = await compute_available(effective_user_id, code, market, qty)
+    else:
+        available_qty = int(position.get('available_qty', qty))
     price, basis, reason = (await _get_last_price_detail(code, market, strict=False)
                             if qty else (None, None, 'empty_position'))
     if basis:
@@ -553,7 +626,7 @@ async def _position_valuation(position):
     pnl = 0.0 if qty == 0 else None if price is None else round((price-avg_cost)*qty, 2)
     return dict(code=code, name=position.get('name', ''), market=market,
                 currency=position.get('currency', 'CNY'), quantity=qty,
-                available_qty=position.get('available_qty', qty), avg_cost=avg_cost,
+                available_qty=available_qty, avg_cost=avg_cost,
                 last_price=price, market_value=value, unrealized_pnl=pnl,
                 valuation_basis=basis,
                 valuation_status='empty' if qty == 0 else 'missing' if price is None else 'reference',
@@ -578,7 +651,7 @@ async def get_account(current_user: dict = Depends(get_current_user)):
     detailed_positions: List[Dict[str, Any]] = []
     missing_by_currency = dict.fromkeys(positions_value_by_currency, 0)
     for p in positions:
-        valued = await _position_valuation(p)
+        valued = await _position_valuation(p, user_id=current_user["id"])
         currency = valued['currency']
         if valued['market_value'] is None:
             missing_by_currency[currency] += 1
@@ -709,15 +782,22 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
     # 5. 计算金额
     notional = round(price * qty, 2)
 
-    # 6. 获取市场规则并计算手续费
+    # 6. 获取市场规则并计算手续费（CN ETF 卖出免收印花税）
     rules = await _get_market_rules(market)
-    commission = _calculate_commission(market, side, notional, rules) if rules else 0.0
-    total_cost = notional + commission
+    commission = (
+        _calculate_commission(
+            market, side, notional, rules, is_etf=is_etf, code=normalized_code
+        )
+        if rules
+        else 0.0
+    )
+    total_cost = round(notional + commission, 2)
 
     # 7. 获取持仓
     pos = await db["paper_positions"].find_one({"user_id": current_user["id"], "code": normalized_code})
 
-    now_iso = datetime.utcnow().isoformat()
+    now_iso = cn_now().isoformat()
+    gross_pnl = 0.0
     realized_pnl_delta = 0.0
 
     # 8. 执行买卖逻辑
@@ -743,6 +823,8 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
             {"$set": {f"cash.{currency}": new_cash, "updated_at": now_iso}}
         )
 
+        cn_t_plus = await _resolve_cn_t_plus() if market in {"CN", "ETF"} else 0
+
         # 更新/创建持仓：加权平均成本
         if not pos:
             # 获取股票名称（根据市场类型）
@@ -755,7 +837,7 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
                 "market": market,
                 "currency": currency,
                 "quantity": qty,
-                "available_qty": qty if market != "CN" else 0,  # A股T+1，今天买入不可用
+                "available_qty": 0 if (market in {"CN", "ETF"} and cn_t_plus > 0) else qty,
                 "frozen_qty": 0,
                 "avg_cost": price,
                 "updated_at": now_iso
@@ -767,9 +849,11 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
             new_qty = old_qty + qty
             new_avg = round((old_cost * old_qty + price * qty) / new_qty, 4) if new_qty > 0 else price
 
-            # A股T+1：新买入的不可用
-            if market == "CN":
-                new_available = pos.get("available_qty", old_qty)  # 保持原有可用数量
+            # A股T+1：动态刷新已有可用持仓，新买入部分当日锁定
+            if market in {"CN", "ETF"} and cn_t_plus > 0:
+                new_available = await _compute_available_qty(
+                    current_user["id"], normalized_code, market, old_qty
+                )
             else:
                 new_available = new_qty  # 港股/美股T+0，全部可用
 
@@ -784,22 +868,26 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
             )
 
     else:  # sell
-        # 检查可用数量（考虑T+1）
-        available_qty = await _get_available_quantity(current_user["id"], normalized_code, market)
+        old_qty = int(pos.get("quantity", 0)) if pos else 0
+        # 统一动态校验可用数量（考虑 CN 默认 T+1）
+        available_qty = (
+            await _compute_available_qty(current_user["id"], normalized_code, market, old_qty)
+            if old_qty > 0
+            else 0
+        )
         if available_qty < qty:
             raise HTTPException(
                 status_code=400,
                 detail=f"可用持仓不足：需要 {qty}，可用 {available_qty}"
             )
 
-        old_qty = int(pos.get("quantity", 0))
         avg_cost = float(pos.get("avg_cost", 0.0))
         new_qty = old_qty - qty
-        pnl = round((price - avg_cost) * qty, 2)
-        realized_pnl_delta = pnl
+        gross_pnl = round((price - avg_cost) * qty, 2)
+        realized_pnl_delta = round(gross_pnl - commission, 2)
 
         # 卖出收入（加到对应货币账户，扣除手续费）
-        net_proceeds = notional - commission
+        net_proceeds = round(notional - commission, 2)
         await db["paper_accounts"].update_one(
             {"user_id": current_user["id"]},
             {
@@ -815,7 +903,7 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
         if new_qty == 0:
             await db["paper_positions"].delete_one({"_id": pos["_id"]})
         else:
-            new_available = max(0, pos.get("available_qty", old_qty) - qty)
+            new_available = max(0, available_qty - qty)
             await db["paper_positions"].update_one(
                 {"_id": pos["_id"]},
                 {"$set": {
@@ -836,6 +924,8 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
         "price": price,
         "amount": notional,
         "commission": commission,
+        "gross_pnl": gross_pnl if side == "sell" else 0.0,
+        "pnl": realized_pnl_delta if side == "sell" else 0.0,
         "status": "filled",
         "created_at": now_iso,
         "filled_at": now_iso,
@@ -855,6 +945,7 @@ async def place_order(payload: PlaceOrderRequest, current_user: dict = Depends(g
         "price": price,
         "amount": notional,
         "commission": commission,
+        "gross_pnl": gross_pnl if side == "sell" else 0.0,
         "pnl": realized_pnl_delta if side == "sell" else 0.0,
         "timestamp": now_iso,
     }
@@ -876,7 +967,7 @@ async def list_positions(current_user: dict = Depends(get_current_user)):
     items = await db["paper_positions"].find({"user_id": current_user["id"]}).to_list(None)
     enriched: List[Dict[str, Any]] = []
     for p in items:
-        enriched.append(await _position_valuation(p))
+        enriched.append(await _position_valuation(p, user_id=current_user["id"]))
     return ok({"items": enriched})
 
 
@@ -888,6 +979,15 @@ async def list_orders(limit: int = Query(50, ge=1, le=200), current_user: dict =
     # 去除 _id
     cleaned = [{k: v for k, v in it.items() if k != "_id"} for it in items]
     return ok({"items": cleaned})
+
+
+@router.get("/supply/status", response_model=dict)
+async def get_supply_status(current_user: dict = Depends(get_current_user)):
+    """获取模拟交易盘中报价供给与许可状态（纯只读、零外部网络请求、脱敏输出）。"""
+    from app.services.paper_quote_supply import get_paper_supply_status
+
+    status_data = await get_paper_supply_status(now=cn_now())
+    return ok(status_data, message=status_data.get("message", "ok"))
 
 
 @router.get("/quote/{code}", response_model=dict)

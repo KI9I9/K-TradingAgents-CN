@@ -21,13 +21,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, date, timedelta
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+CN_TZ = timezone(timedelta(hours=8))
 REDIS_KEY = "trading_calendar:last_trade_date"
 CACHE_TTL_SECONDS = 25 * 3600  # 25 小时，保证每天启动时刷新
+TUSHARE_CALL_TIMEOUT_SECONDS = 5.0
+AKSHARE_CALENDAR_TIMEOUT_SECONDS = 8.0
+TUSHARE_STOP_MARKERS = (
+    Path("/app/runtime/tushare-egress/STOP"),
+    Path("/app/runtime/tushare-manual-daily-v1/STOP"),
+)
 
 
 class TradingCalendarService:
@@ -38,8 +47,33 @@ class TradingCalendarService:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _today_str() -> str:
-        return datetime.now().strftime("%Y-%m-%d")
+    def _now_cn() -> datetime:
+        return datetime.now(CN_TZ)
+
+    def _today_str(self) -> str:
+        return self._now_cn().strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _is_tushare_restricted() -> bool:
+        """判断当前环境是否禁用或受限 Tushare（纯只读检查，绝不触发越界请求）。"""
+        raw_enabled = os.environ.get("TUSHARE_ENABLED")
+        if raw_enabled is not None and raw_enabled.strip().lower() in ("0", "false", "no", "off"):
+            return True
+        if os.environ.get("TA_TUSHARE_ROUTE", "").strip().lower() == "mainland_unix":
+            return True
+        for marker in TUSHARE_STOP_MARKERS:
+            try:
+                if marker.exists():
+                    return True
+            except OSError:
+                continue
+        try:
+            from app.core.config import settings
+            if getattr(settings, "TUSHARE_ENABLED", True) is False:
+                return True
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def _fmt(raw: str) -> str:
@@ -54,12 +88,11 @@ class TradingCalendarService:
         error_text = str(error).lower()
         return "attached to a different loop" in error_text or "different loop" in error_text
 
-    @staticmethod
-    def _build_cache_payload(last_trade_date: str, is_today: bool, source: str) -> dict:
+    def _build_cache_payload(self, last_trade_date: str, is_today: bool, source: str) -> dict:
         return {
             "last_trade_date": last_trade_date,
             "is_today_trade_day": is_today,
-            "fetched_at": TradingCalendarService._today_str(),
+            "fetched_at": self._today_str(),
             "source": source,
         }
 
@@ -67,74 +100,98 @@ class TradingCalendarService:
     # 从外部 API 获取最后交易日                                            #
     # ------------------------------------------------------------------ #
 
-    async def _fetch_from_tushare(self) -> Optional[str]:
+    async def _fetch_from_tushare(
+        self,
+        timeout: float = TUSHARE_CALL_TIMEOUT_SECONDS,
+    ) -> Optional[str]:
         """调用 tushare daily_basic 逐日回溯，找到最近的交易日（YYYY-MM-DD）"""
+        if self._is_tushare_restricted():
+            logger.info("⏭️ [TradingCalendar] Tushare 已禁用/受限，跳过 Tushare 日历查询")
+            return None
         try:
             from tradingagents.dataflows.providers.china.tushare import get_tushare_provider
-            import asyncio
 
             provider = get_tushare_provider()
             if not provider.is_available() or provider.api is None:
                 return None
 
-            today = datetime.now()
+            today = self._now_cn()
             for delta in range(0, 10):
                 d = (today - timedelta(days=delta)).strftime("%Y%m%d")
                 try:
-                    df = await asyncio.to_thread(
-                        provider.api.daily_basic,
-                        trade_date=d,
-                        fields="ts_code",
-                        limit=1,
+                    df = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            provider.api.daily_basic,
+                            trade_date=d,
+                            fields="ts_code",
+                            limit=1,
+                        ),
+                        timeout=timeout,
                     )
                     if df is not None and not df.empty:
                         logger.info(f"📅 [TradingCalendar] Tushare 确认最新交易日: {d}")
                         return self._fmt(d)
-                except Exception:
+                except (TimeoutError, asyncio.TimeoutError):
+                    logger.warning(f"⚠️ [TradingCalendar] Tushare 查询超时 ({timeout}s): {d}")
+                    break
+                except Exception as exc:
+                    if type(exc).__name__ == "TushareEgressStopped":
+                        logger.info(f"⏭️ [TradingCalendar] Tushare 出口门禁拦截，终止回溯: {exc}")
+                        break
                     continue
         except Exception as e:
             logger.warning(f"⚠️ [TradingCalendar] Tushare 查询失败: {e}")
         return None
 
-    async def _fetch_from_akshare(self) -> Optional[str]:
-        """调用 akshare tool_trade_date_hist_sina 获取近期交易日历，取最近 ≤ 今天的交易日"""
+    async def _fetch_from_akshare(
+        self,
+        timeout: float = AKSHARE_CALENDAR_TIMEOUT_SECONDS,
+    ) -> Optional[str]:
+        """调用 akshare tool_trade_date_hist_sina 获取近期交易日历，取最近 ≤ 今天(CN_TZ)的交易日"""
         try:
             import akshare as ak
-            import asyncio
             import pandas as pd
 
-            df = await asyncio.to_thread(ak.tool_trade_date_hist_sina)
+            df = await asyncio.wait_for(
+                asyncio.to_thread(ak.tool_trade_date_hist_sina),
+                timeout=timeout,
+            )
             if df is None or df.empty:
                 return None
 
             # 列名可能是 trade_date 或第0列
             col = df.columns[0]
             dates = pd.to_datetime(df[col]).dt.date
-            today_d = date.today()
+            today_d = self._now_cn().date()
             valid = sorted([d for d in dates if d <= today_d], reverse=True)
             if valid:
                 result = valid[0].strftime("%Y-%m-%d")
                 logger.info(f"📅 [TradingCalendar] AkShare 确认最新交易日: {result}")
                 return result
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(f"⚠️ [TradingCalendar] AkShare 新浪交易日历查询超时 ({timeout}s)")
         except Exception as e:
             logger.warning(f"⚠️ [TradingCalendar] AkShare 查询失败: {e}")
         return None
 
     async def _fetch_last_trade_date(self) -> tuple[str, str]:
         """
-        按优先级（tushare → akshare → 简单回溯）获取最近交易日。
+        获取最近交易日（统一 CN_TZ）：
+        - Tushare 禁用/受限时直连公共新浪日历（akshare）
+        - 否则按 tushare → akshare → CN_TZ 工作日兜底
         Returns: (last_trade_date: YYYY-MM-DD, source: str)
         """
-        result = await self._fetch_from_tushare()
-        if result:
-            return result, "tushare"
+        if not self._is_tushare_restricted():
+            result = await self._fetch_from_tushare()
+            if result:
+                return result, "tushare"
 
         result = await self._fetch_from_akshare()
         if result:
             return result, "akshare"
 
-        # 最后兜底：从今天往前找第一个周一~周五（不保证节假日准确）
-        today = datetime.now()
+        # 最后兜底：按 CN_TZ 从今天往前找第一个周一~周五（不保证节假日准确）
+        today = self._now_cn()
         for delta in range(0, 5):
             d = today - timedelta(days=delta)
             if d.weekday() < 5:
@@ -212,7 +269,8 @@ class TradingCalendarService:
         logger.info("🚀 [TradingCalendar] 开始初始化交易日历缓存...")
         try:
             last_trade_date, source = await self._fetch_last_trade_date()
-            is_today = last_trade_date == self._today_str()
+            today_str = self._now_cn().strftime("%Y-%m-%d")
+            is_today = last_trade_date == today_str
             await self._write_cache(last_trade_date, is_today, source)
             logger.info(
                 f"✅ [TradingCalendar] 初始化完成: 最近交易日={last_trade_date}, "
@@ -226,24 +284,26 @@ class TradingCalendarService:
         获取最近一个交易日（YYYY-MM-DD）。
         优先读 Redis 缓存；缓存不存在或不是今天写入的则重新查询 API。
         """
+        today_str = self._now_cn().strftime("%Y-%m-%d")
         cache = await self._read_cache()
-        if cache and cache.get("fetched_at") == self._today_str():
+        if cache and cache.get("fetched_at") == today_str:
             return cache.get("last_trade_date")
 
         # 缓存过期，重新获取
         last_trade_date, source = await self._fetch_last_trade_date()
-        is_today = last_trade_date == self._today_str()
+        is_today = last_trade_date == today_str
         await self._write_cache(last_trade_date, is_today, source)
         return last_trade_date
 
     async def is_today_trade_day(self) -> bool:
         """判断今天是否是交易日"""
+        today_str = self._now_cn().strftime("%Y-%m-%d")
         cache = await self._read_cache()
-        if cache and cache.get("fetched_at") == self._today_str():
+        if cache and cache.get("fetched_at") == today_str:
             return bool(cache.get("is_today_trade_day", False))
 
         last = await self.get_last_trade_date()
-        return last == self._today_str()
+        return last == today_str
 
 
 # ------------------------------------------------------------------ #

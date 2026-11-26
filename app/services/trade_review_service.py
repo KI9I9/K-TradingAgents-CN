@@ -6,11 +6,92 @@
 import os
 import uuid
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List, Callable
 from bson import ObjectId
 
 from app.core.database import get_mongo_db, get_database
+
+CN_TZ = timezone(timedelta(hours=8))
+
+# 常见供应商默认模型映射（仅作为用户未指定具体模型时的回退）
+_PROVIDER_DEFAULT_MODELS: Dict[str, str] = {
+    "deepseek": "deepseek-chat",
+    "openai": "gpt-4o-mini",
+    "dashscope": "qwen-plus",
+    "google": "gemini-2.0-flash",
+    "anthropic": "claude-3-5-sonnet-latest",
+    "openrouter": "openai/gpt-4o-mini",
+    "siliconflow": "deepseek-ai/DeepSeek-V3",
+    "volcengine": "doubao-pro-32k",
+    "ark": "doubao-pro-32k",
+    "zhipu": "glm-4-plus",
+    "moonshot": "moonshot-v1-8k",
+    "ollama": "llama3",
+    "localai": "gpt-3.5-turbo",
+}
+
+_PROVIDER_DEFAULT_URLS: Dict[str, str] = {
+    "deepseek": "https://api.deepseek.com",
+    "openai": "https://api.openai.com/v1",
+    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "google": "https://generativelanguage.googleapis.com/v1beta",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+}
+
+
+def build_timestamp_range_query(
+    field: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """构建同时兼容存量 ISO String 与 BSON datetime 的时间范围查询（统一 CN_TZ 边界）。
+
+    - ISO String 分支：YYYY-MM-DDT00:00:00 ~ YYYY-MM-DDT23:59:59.999999
+    - BSON datetime 分支：带 CN_TZ (+08:00) 的 datetime 区间
+    当 start_date 与 end_date 均为空时返回空字典 {}。
+    """
+    start_clean = str(start_date).strip() if start_date else ""
+    end_clean = str(end_date).strip() if end_date else ""
+    if not start_clean and not end_clean:
+        return {}
+
+    str_cond: Dict[str, Any] = {}
+    dt_cond: Dict[str, Any] = {}
+
+    if start_clean:
+        start_str = start_clean[:10]
+        start_cn = datetime.strptime(start_str, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=CN_TZ
+        )
+        str_cond["$gte"] = f"{start_str}T00:00:00"
+        dt_cond["$gte"] = start_cn
+
+    if end_clean:
+        end_str = end_clean[:10]
+        end_cn = datetime.strptime(end_str, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=CN_TZ
+        )
+        str_cond["$lte"] = f"{end_str}T23:59:59.999999"
+        dt_cond["$lte"] = end_cn
+
+    return {"$or": [{field: str_cond}, {field: dt_cond}]}
+
+
+def _merge_timestamp_filter(query: Dict[str, Any], ts_filter: Dict[str, Any]) -> Dict[str, Any]:
+    """将时间范围过滤安全合并到 MongoDB 查询字典中，避免覆写既有 $or。"""
+    if not ts_filter:
+        return query
+    if "$or" in query and "$or" in ts_filter:
+        existing_or = query.pop("$or")
+        and_clauses = list(query.get("$and") or [])
+        and_clauses.append({"$or": existing_or})
+        and_clauses.append(ts_filter)
+        query["$and"] = and_clauses
+    else:
+        query.update(ts_filter)
+    return query
 
 # ==================== 特性开关 ====================
 # 是否使用模板系统生成提示词（默认关闭，保持向后兼容）
@@ -1280,56 +1361,31 @@ class TradeReviewService:
                 trade_info, market_snapshot, user_id, benchmark_data, trading_system
             )
 
-            # 使用统一的 LLM 适配器
-            from app.services.simple_analysis_service import get_provider_and_url_by_model_sync
-            from tradingagents.graph.trading_graph import create_llm_by_provider
+            # 解析系统/用户配置的默认 LLM（支持多 Provider 自动回退）
+            llm_cfg = await self._resolve_default_llm_config(user_id=user_id)
+            model_name = llm_cfg["model_name"]
 
-            model_name = "qwen-plus"
-            provider_info = get_provider_and_url_by_model_sync(model_name)
-
-            logger.info(f"🏭 [AI复盘] 模型供应商: {provider_info.get('provider', '未知')}")
-            logger.info(f"🔗 [AI复盘] API地址: {provider_info.get('backend_url', '未配置')}")
-            logger.info(f"🔑 [AI复盘] API Key: {'已配置' if provider_info.get('api_key') else '未配置'}")
+            logger.info(f"🏭 [AI复盘] 模型供应商: {llm_cfg.get('provider', '未知')}, 模型: {model_name}")
+            logger.info(f"🔗 [AI复盘] API地址: {llm_cfg.get('backend_url', '未配置')}")
+            logger.info(f"🔑 [AI复盘] API Key: {'已配置' if llm_cfg.get('api_key') else '未配置'}")
             logger.info(f"📝 [AI复盘] Prompt长度: {len(prompt)} 字符")
-            logger.info(f"📝 [AI复盘] Prompt前500字符:\n{prompt[:500]}")
 
-            # 使用统一的 LLM 适配器创建实例
-            logger.info(f"🔧 [AI复盘] 开始创建 LLM 实例...")
-            llm = create_llm_by_provider(
-                provider=provider_info.get("provider", "dashscope"),
-                model=model_name,
-                backend_url=provider_info.get("backend_url"),
-                temperature=0.3,
-                max_tokens=4000,
-                timeout=120,
-                api_key=provider_info.get("api_key")
-            )
-            logger.info(f"✅ [AI复盘] LLM 实例创建成功: {type(llm).__name__}")
-
-            # 异步调用 LLM
-            logger.info(f"🚀 [AI复盘] 开始调用 LLM API...")
-            response = await llm.ainvoke(prompt)
+            content, response = await self._invoke_llm_text(prompt, llm_cfg, return_response=True)
 
             # 记录 token 使用
-            try:
-                from app.services.usage_statistics_service import usage_statistics_service
-                await usage_statistics_service.record_llm_usage(
-                    response=response,
-                    session_id=user_id or "trade_review",
-                    analysis_type="trade_review",
-                    stock_code=trade_info.code
-                )
-            except Exception as e:
-                logger.warning(f"记录 token 使用失败: {e}")
+            if response is not None:
+                try:
+                    from app.services.usage_statistics_service import usage_statistics_service
+                    await usage_statistics_service.record_llm_usage(
+                        response=response,
+                        session_id=user_id or "trade_review",
+                        analysis_type="trade_review",
+                        stock_code=trade_info.code
+                    )
+                except Exception as e:
+                    logger.warning(f"记录 token 使用失败: {e}")
 
-            logger.info(f"✅ [AI复盘] LLM API 调用成功")
-            logger.info(f"📦 [AI复盘] Response 类型: {type(response).__name__}")
-            logger.info(f"📦 [AI复盘] Response 属性: {dir(response)}")
-
-            content = response.content if hasattr(response, 'content') else str(response)
-            logger.info(f"📄 [AI复盘] 返回内容长度: {len(content)} 字符")
-            logger.info(f"📄 [AI复盘] 返回内容前500字符:\n{content[:500]}")
-            logger.info(f"📄 [AI复盘] 返回内容后500字符:\n{content[-500:]}")
+            logger.info(f"✅ [AI复盘] LLM API 调用成功，返回内容长度: {len(content)} 字符")
 
             logger.info(f"🔍 [AI复盘] 开始解析 AI 响应...")
             result = self._parse_ai_trade_review(content, trade_info, market_snapshot)
@@ -1774,17 +1830,12 @@ class TradeReviewService:
         if review_type:
             query["review_type"] = review_type
 
-        # 时间段筛选
+        # 时间段筛选（同时兼容 ISO String 与 BSON datetime，统一 CN_TZ 边界）
         if start_date or end_date:
-            query["created_at"] = {}
-            if start_date:
-                from datetime import datetime
-                query["created_at"]["$gte"] = datetime.strptime(start_date, "%Y-%m-%d")
-            if end_date:
-                from datetime import datetime
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
-                query["created_at"]["$lte"] = end_dt
+            _merge_timestamp_filter(
+                query,
+                build_timestamp_range_query("created_at", start_date, end_date),
+            )
 
         # 查询交易复盘
         cursor = self.db[self.trade_reviews_collection].find(
@@ -1810,13 +1861,21 @@ class TradeReviewService:
         
         # 批量查询股票名称
         stock_names = {}
-        # A股：从 stock_basic_info 查询
-        if "CN" in codes_by_market:
-            unique_codes = list(set(codes_by_market["CN"]))
-            for code in unique_codes:
-                stock_info = await self.db["stock_basic_info"].find_one({"code": code})
-                if stock_info and stock_info.get("name"):
-                    stock_names[code] = stock_info.get("name")
+        # A股 / ETF：从 stock_basic_info 查询，缺失回退 etf_basic_info
+        cn_etf_codes = list(set(codes_by_market.get("CN", []) + codes_by_market.get("ETF", [])))
+        for code in cn_etf_codes:
+            stock_info = await self.db["stock_basic_info"].find_one({"code": code})
+            if stock_info and stock_info.get("name"):
+                stock_names[code] = stock_info.get("name")
+            else:
+                etf_info = await self.db["etf_basic_info"].find_one({"code": str(code).zfill(6)})
+                etf_name = (
+                    (etf_info.get("name") or etf_info.get("fund_name") or etf_info.get("etf_name"))
+                    if etf_info
+                    else None
+                )
+                if etf_name:
+                    stock_names[code] = etf_name
         
         # 港股/美股：从 paper_positions 或 positions 查询（这些表通常有 name 字段）
         for market in ["HK", "US"]:
@@ -2262,13 +2321,21 @@ class TradeReviewService:
         
         # 批量查询股票名称
         stock_names = {}
-        # A股：从 stock_basic_info 查询
-        if "CN" in codes_by_market:
-            unique_codes = list(set(codes_by_market["CN"]))
-            for code in unique_codes:
-                stock_info = await self.db["stock_basic_info"].find_one({"code": code})
-                if stock_info and stock_info.get("name"):
-                    stock_names[code] = stock_info.get("name")
+        # A股 / ETF：从 stock_basic_info 查询，缺失回退 etf_basic_info
+        cn_etf_codes = list(set(codes_by_market.get("CN", []) + codes_by_market.get("ETF", [])))
+        for code in cn_etf_codes:
+            stock_info = await self.db["stock_basic_info"].find_one({"code": code})
+            if stock_info and stock_info.get("name"):
+                stock_names[code] = stock_info.get("name")
+            else:
+                etf_info = await self.db["etf_basic_info"].find_one({"code": str(code).zfill(6)})
+                etf_name = (
+                    (etf_info.get("name") or etf_info.get("fund_name") or etf_info.get("etf_name"))
+                    if etf_info
+                    else None
+                )
+                if etf_name:
+                    stock_names[code] = etf_name
         
         # 港股/美股：从 paper_positions 或 positions 查询（这些表通常有 name 字段）
         for market in ["HK", "US"]:
@@ -2341,15 +2408,14 @@ class TradeReviewService:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> TradingStatistics:
-        """获取交易统计"""
-        query = {"user_id": user_id, "side": "sell"}
+        """获取交易统计（兼容 ISO String 与 BSON datetime，含 end_date 当天）"""
+        query: Dict[str, Any] = {"user_id": user_id, "side": "sell"}
 
         if start_date or end_date:
-            query["timestamp"] = {}
-            if start_date:
-                query["timestamp"]["$gte"] = start_date
-            if end_date:
-                query["timestamp"]["$lte"] = end_date
+            _merge_timestamp_filter(
+                query,
+                build_timestamp_range_query("timestamp", start_date, end_date),
+            )
 
         # 获取所有卖出交易
         cursor = self.db[self.paper_trades_collection].find(query)
@@ -2418,10 +2484,14 @@ class TradeReviewService:
         review_id = str(uuid.uuid4())
         source = getattr(request, 'source', 'paper') or 'paper'
 
-        # 解析日期
-        period_start = datetime.strptime(request.start_date, "%Y-%m-%d")
-        period_end = datetime.strptime(request.end_date, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59
+        # 解析日期（统一 CN_TZ 边界）
+        start_str = str(request.start_date).strip()[:10]
+        end_str = str(request.end_date).strip()[:10]
+        period_start = datetime.strptime(start_str, "%Y-%m-%d").replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=CN_TZ
+        )
+        period_end = datetime.strptime(end_str, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, microsecond=999999, tzinfo=CN_TZ
         )
 
         # 根据数据源选择集合和查询条件
@@ -2434,14 +2504,12 @@ class TradeReviewService:
             collection = self.paper_trades_collection
             date_field = "timestamp"
 
-        # 获取该时间段内的所有交易
-        query = {
-            "user_id": user_id,
-            date_field: {
-                "$gte": period_start,
-                "$lte": period_end
-            }
-        }
+        # 获取该时间段内的所有交易（兼容 ISO String 与 BSON datetime）
+        query: Dict[str, Any] = {"user_id": user_id}
+        _merge_timestamp_filter(
+            query,
+            build_timestamp_range_query(date_field, start_str, end_str),
+        )
         cursor = self.db[collection].find(query).sort(date_field, 1)
         trades = await cursor.to_list(None)
 
@@ -2463,7 +2531,8 @@ class TradeReviewService:
             start_date=request.start_date,
             end_date=request.end_date,
             statistics=statistics,
-            trades_summary=trades_summary
+            trades_summary=trades_summary,
+            user_id=user_id,
         )
         ai_review = self._sanitize_periodic_review_result(ai_review)
 
@@ -2667,17 +2736,310 @@ class TradeReviewService:
 
         return summary
 
+    async def _resolve_default_llm_config(
+        self,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """解析系统/用户配置的默认 LLM，并支持自动回退到首个可用 Provider。
+
+        优先级：
+        1. 用户偏好中的默认模型（如 users.preferences.default_model / deep_analysis_model）
+        2. 系统配置（system_configs / config_provider 的 default_model / deep_analysis_model / quick_analysis_model）
+        3. system_configs.llm_configs 中首个 enabled 且具备有效 API Key（或本地模型）的配置
+        4. llm_providers 中首个活跃且具备有效 API Key 的厂家
+        5. 环境变量中已配置有效 API Key 的主流 Provider
+        """
+        from app.utils.api_key_utils import get_env_api_key_for_provider, is_valid_api_key
+
+        local_providers = {"ollama", "localai"}
+
+        def _parse_model_spec(spec: Any) -> tuple[Optional[str], Optional[str]]:
+            if not isinstance(spec, str) or not spec.strip():
+                return None, None
+            text = spec.strip()
+            if "::" in text:
+                prov, mod = text.split("::", 1)
+                return prov.strip().lower() or None, mod.strip() or None
+            return None, text
+
+        # 1. 读取数据库系统配置和厂家配置（若 self.db 可用）
+        sys_cfg: Optional[Dict[str, Any]] = None
+        providers_by_name: Dict[str, Dict[str, Any]] = {}
+        try:
+            if self.db is not None:
+                sys_cfg = await self.db["system_configs"].find_one(
+                    {"is_active": True}, sort=[("version", -1)]
+                )
+        except Exception as exc:
+            logger.debug(f"[LLM解析] 读取 system_configs 跳过: {exc}")
+
+        try:
+            if self.db is not None:
+                prov_docs = await self.db["llm_providers"].find({}).to_list(None)
+                for pdoc in prov_docs or []:
+                    pname = str(pdoc.get("name") or "").strip().lower()
+                    if pname:
+                        providers_by_name[pname] = pdoc
+        except Exception as exc:
+            logger.debug(f"[LLM解析] 读取 llm_providers 跳过: {exc}")
+
+        # 2. 收集候选模型名（用户偏好 > 系统配置 > config_provider）
+        preferred_specs: List[tuple[Optional[str], str]] = []
+
+        def _push_spec(raw: Any) -> None:
+            prov, mod = _parse_model_spec(raw)
+            if mod and (prov, mod) not in preferred_specs:
+                preferred_specs.append((prov, mod))
+
+        if user_id and self.db is not None:
+            try:
+                user_queries: List[Dict[str, Any]] = [{"user_id": user_id}, {"id": user_id}]
+                try:
+                    user_queries.insert(0, {"_id": ObjectId(user_id)})
+                except Exception:
+                    user_queries.append({"_id": user_id})
+                user_doc = None
+                for uq in user_queries:
+                    user_doc = await self.db["users"].find_one(uq)
+                    if user_doc:
+                        break
+                if isinstance(user_doc, dict):
+                    prefs = user_doc.get("preferences") or {}
+                    if isinstance(prefs, dict):
+                        for key in (
+                            "default_llm_model",
+                            "default_model",
+                            "deep_analysis_model",
+                            "quick_analysis_model",
+                        ):
+                            _push_spec(prefs.get(key))
+            except Exception as exc:
+                logger.debug(f"[LLM解析] 读取用户偏好跳过: {exc}")
+
+        if isinstance(sys_cfg, dict):
+            _push_spec(sys_cfg.get("default_model"))
+            sys_settings = sys_cfg.get("system_settings") or {}
+            if isinstance(sys_settings, dict):
+                for key in ("default_model", "deep_analysis_model", "quick_analysis_model"):
+                    _push_spec(sys_settings.get(key))
+
+        try:
+            from app.services.config_provider import provider as config_provider
+
+            effective_settings = await config_provider.get_effective_system_settings()
+            if isinstance(effective_settings, dict):
+                for key in ("default_model", "deep_analysis_model", "quick_analysis_model"):
+                    _push_spec(effective_settings.get(key))
+        except Exception as exc:
+            logger.debug(f"[LLM解析] 读取 config_provider 跳过: {exc}")
+
+        def _resolve_key_and_url(
+            provider_name: str,
+            model_cfg: Optional[Dict[str, Any]] = None,
+        ) -> tuple[Optional[str], Optional[str]]:
+            pname = str(provider_name or "").strip().lower()
+            pdoc = providers_by_name.get(pname) or {}
+            api_key: Optional[str] = None
+            if is_valid_api_key(pdoc.get("api_key")):
+                api_key = str(pdoc["api_key"]).strip()
+            elif model_cfg and is_valid_api_key(model_cfg.get("api_key")):
+                api_key = str(model_cfg["api_key"]).strip()
+            else:
+                env_key = get_env_api_key_for_provider(pname) if pname else None
+                if env_key:
+                    api_key = env_key.strip()
+
+            backend_url = (
+                (model_cfg.get("api_base") if model_cfg else None)
+                or pdoc.get("default_base_url")
+                or _PROVIDER_DEFAULT_URLS.get(pname)
+            )
+            return api_key, backend_url
+
+        llm_configs = (
+            [c for c in (sys_cfg.get("llm_configs") or []) if isinstance(c, dict)]
+            if isinstance(sys_cfg, dict)
+            else []
+        )
+
+        # 3. 优先匹配候选模型（必须有可用 API Key 或属于本地模型）
+        for pref_prov, pref_model in preferred_specs:
+            for cfg in llm_configs:
+                if cfg.get("enabled", True) is False:
+                    continue
+                if cfg.get("model_name") != pref_model:
+                    continue
+                pname = str(cfg.get("provider") or "").strip().lower()
+                if pref_prov and pname != pref_prov:
+                    continue
+                api_key, backend_url = _resolve_key_and_url(pname, cfg)
+                if pname in local_providers or is_valid_api_key(api_key):
+                    return {
+                        "model_name": pref_model,
+                        "provider": pname,
+                        "backend_url": backend_url,
+                        "api_key": api_key,
+                    }
+
+        def _infer_provider_from_model(model_name: str) -> Optional[str]:
+            lower = str(model_name or "").strip().lower()
+            if not lower:
+                return None
+            if lower.startswith("deepseek"):
+                return "deepseek"
+            if lower.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
+                return "openai"
+            if lower.startswith("claude"):
+                return "anthropic"
+            if lower.startswith("gemini"):
+                return "google"
+            if lower.startswith(("qwen", "qwq")):
+                return "dashscope"
+            if lower.startswith("glm"):
+                return "zhipu"
+            if lower.startswith(("moonshot", "kimi")):
+                return "moonshot"
+            if lower.startswith("doubao"):
+                return "volcengine"
+            return None
+
+        # 4. 候选模型有明确或可推断 provider 但未登记在 llm_configs 中时，直接检查 provider / env
+        for pref_prov, pref_model in preferred_specs:
+            resolved_prov = pref_prov or _infer_provider_from_model(pref_model)
+            if not resolved_prov:
+                continue
+            api_key, backend_url = _resolve_key_and_url(resolved_prov, None)
+            if resolved_prov in local_providers or is_valid_api_key(api_key):
+                return {
+                    "model_name": pref_model,
+                    "provider": resolved_prov,
+                    "backend_url": backend_url,
+                    "api_key": api_key,
+                }
+
+        # 5. 回退到 system_configs.llm_configs 中首个 enabled 且可用的模型
+        for cfg in llm_configs:
+            if cfg.get("enabled", True) is False:
+                continue
+            model_name = str(cfg.get("model_name") or "").strip()
+            pname = str(cfg.get("provider") or "").strip().lower()
+            if not model_name or not pname:
+                continue
+            api_key, backend_url = _resolve_key_and_url(pname, cfg)
+            if pname in local_providers or is_valid_api_key(api_key):
+                return {
+                    "model_name": model_name,
+                    "provider": pname,
+                    "backend_url": backend_url,
+                    "api_key": api_key,
+                }
+
+        # 6. 回退到 llm_providers 中首个活跃且带有效 Key 的云端供应商
+        local_provider_candidates: List[tuple[str, Dict[str, Any]]] = []
+        for pname, pdoc in providers_by_name.items():
+            if pdoc.get("is_active", True) is False:
+                continue
+            if pname in local_providers:
+                local_provider_candidates.append((pname, pdoc))
+                continue
+            api_key, backend_url = _resolve_key_and_url(pname, None)
+            if is_valid_api_key(api_key):
+                default_model = (
+                    pdoc.get("default_model")
+                    or _PROVIDER_DEFAULT_MODELS.get(pname)
+                    or "gpt-4o-mini"
+                )
+                return {
+                    "model_name": str(default_model),
+                    "provider": pname,
+                    "backend_url": backend_url,
+                    "api_key": api_key,
+                }
+
+        # 7. 回退到环境变量中首个配置了有效 API Key 的主流 Provider
+        for pname, default_model in _PROVIDER_DEFAULT_MODELS.items():
+            if pname in local_providers:
+                continue
+            env_key = get_env_api_key_for_provider(pname)
+            if env_key:
+                return {
+                    "model_name": default_model,
+                    "provider": pname,
+                    "backend_url": _PROVIDER_DEFAULT_URLS.get(pname),
+                    "api_key": env_key.strip(),
+                }
+
+        # 7.5 若无可用云端 Key，回退到已激活的本地供应商（如 ollama/localai）
+        for pname, pdoc in local_provider_candidates:
+            api_key, backend_url = _resolve_key_and_url(pname, None)
+            default_model = (
+                pdoc.get("default_model")
+                or _PROVIDER_DEFAULT_MODELS.get(pname)
+                or "llama3"
+            )
+            return {
+                "model_name": str(default_model),
+                "provider": pname,
+                "backend_url": backend_url,
+                "api_key": api_key,
+            }
+
+        # 8. 兼容京东云模式或外部同步映射
+        try:
+            from app.services.simple_analysis_service import get_provider_and_url_by_model_sync
+
+            fallback_model = preferred_specs[0][1] if preferred_specs else "deepseek-chat"
+            info = get_provider_and_url_by_model_sync(fallback_model)
+            if isinstance(info, dict) and (
+                str(info.get("provider") or "").lower() in local_providers
+                or is_valid_api_key(info.get("api_key"))
+            ):
+                return {
+                    "model_name": fallback_model,
+                    "provider": str(info.get("provider") or "").lower(),
+                    "backend_url": info.get("backend_url"),
+                    "api_key": info.get("api_key"),
+                }
+        except Exception as exc:
+            logger.debug(f"[LLM解析] 同步配置回退跳过: {exc}")
+
+        raise RuntimeError("未找到可用的默认 LLM 配置，请在系统设置中配置有效的模型供应商和 API Key")
+
+    async def _invoke_llm_text(
+        self,
+        prompt: str,
+        llm_cfg: Dict[str, Any],
+        *,
+        return_response: bool = False,
+    ) -> Any:
+        """通过统一 LLM 适配器异步调用模型，返回文本内容。"""
+        from tradingagents.graph.trading_graph import create_llm_by_provider
+
+        llm = create_llm_by_provider(
+            provider=llm_cfg.get("provider", "openai"),
+            model=llm_cfg["model_name"],
+            backend_url=llm_cfg.get("backend_url"),
+            temperature=0.3,
+            max_tokens=4000,
+            timeout=120,
+            api_key=llm_cfg.get("api_key"),
+        )
+        response = await llm.ainvoke(prompt)
+        content = response.content if hasattr(response, "content") else str(response)
+        if return_response:
+            return content, response
+        return content
+
     async def _call_ai_periodic_review(
         self,
         period_type: str,
         start_date: str,
         end_date: str,
         statistics: TradingStatistics,
-        trades_summary: List[TradeSummaryItem]
+        trades_summary: List[TradeSummaryItem],
+        user_id: Optional[str] = None,
     ) -> AIPeriodicReview:
-        """调用AI进行阶段性复盘分析"""
-        from app.services.simple_analysis_service import get_provider_and_url_by_model_sync
-        import asyncio
+        """调用AI进行阶段性复盘分析（使用系统/用户配置的默认 LLM，支持多 Provider 回退）"""
 
         # 构建提示词
         period_names = {
@@ -2741,18 +3103,13 @@ class TradeReviewService:
         prompt = self._append_review_guardrails(prompt)
 
         try:
-            model_name = "qwen-plus"
-            provider_info = get_provider_and_url_by_model_sync(model_name)
-
-            # 使用同步 requests 调用，避免异步 httpx 的代理问题
-            content = await asyncio.get_event_loop().run_in_executor(
-                None,
-                self._call_llm_sync,
-                prompt,
-                model_name,
-                provider_info.get("backend_url"),
-                provider_info.get("api_key")
+            llm_cfg = await self._resolve_default_llm_config(user_id=user_id)
+            logger.info(
+                "🤖 [阶段性复盘] 使用配置模型: provider=%s, model=%s",
+                llm_cfg.get("provider"),
+                llm_cfg.get("model_name"),
             )
+            content = await self._invoke_llm_text(prompt, llm_cfg)
 
             # 解析JSON响应
             import json
@@ -3361,18 +3718,33 @@ class TradeReviewService:
                 legacy_config["llm_provider"] = "dashscope"
         except Exception as e:
             logger.error(f"❌ [工作流复盘] 从数据库获取模型配置失败: {e}", exc_info=True)
-            # 失败时使用默认配置
-            from app.services.simple_analysis_service import get_provider_and_url_by_model_sync
-            model_name = "qwen-plus"
-            provider_info = get_provider_and_url_by_model_sync(model_name)
-            legacy_config = {
-                "llm_provider": provider_info.get("provider", "dashscope"),
-                "quick_think_llm": model_name,
-                "deep_think_llm": model_name,
-                "backend_url": provider_info.get("backend_url"),
-                "api_key": provider_info.get("api_key"),
-            }
-            logger.info(f"🔧 [工作流复盘] 使用默认LLM配置: provider={legacy_config['llm_provider']}, model={model_name}")
+            # 失败时优先使用统一默认 LLM 解析器（自动回退到首个可用 Provider）
+            try:
+                llm_cfg = await self._resolve_default_llm_config(user_id=user_id)
+                legacy_config = {
+                    "llm_provider": llm_cfg.get("provider", "openai"),
+                    "quick_think_llm": llm_cfg["model_name"],
+                    "deep_think_llm": llm_cfg["model_name"],
+                    "backend_url": llm_cfg.get("backend_url"),
+                    "api_key": llm_cfg.get("api_key"),
+                }
+                logger.info(
+                    f"🔧 [工作流复盘] 使用默认LLM配置: provider={legacy_config['llm_provider']}, model={llm_cfg['model_name']}"
+                )
+            except Exception:
+                from app.services.simple_analysis_service import get_provider_and_url_by_model_sync
+                model_name = "qwen-plus"
+                provider_info = get_provider_and_url_by_model_sync(model_name)
+                legacy_config = {
+                    "llm_provider": provider_info.get("provider", "dashscope"),
+                    "quick_think_llm": model_name,
+                    "deep_think_llm": model_name,
+                    "backend_url": provider_info.get("backend_url"),
+                    "api_key": provider_info.get("api_key"),
+                }
+                logger.info(
+                    f"🔧 [工作流复盘] 使用默认LLM配置: provider={legacy_config['llm_provider']}, model={model_name}"
+                )
 
         # 5. 创建并执行工作流引擎
         engine = WorkflowEngine(legacy_config=legacy_config)

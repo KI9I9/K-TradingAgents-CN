@@ -31,6 +31,10 @@ MAX_RESPONSE_BYTES = 8192
 MAX_REQUESTS_PER_MINUTE = 20  # per backend process; not a cluster-wide quota
 MAX_IN_FLIGHT = 2
 PERMIT_MAX_SECONDS = {1: 86400, 2: 7 * 86400}
+CALENDAR_RETRY_COOLDOWN_SECONDS = 300
+CALENDAR_MAX_ATTEMPTS_PER_DAY = 3
+EXPIRY_WARNING_HOURS = 36.0
+SUPPORTED_SCOPE = "paper_execution_sh_sz"
 STATUS_CODES = {"00": "normal", **{s: "suspended" for s in ("01", "02", "03", "04", "05", "07")}}
 
 
@@ -96,6 +100,121 @@ def permit_status(now: datetime, path: Path = PERMIT_PATH) -> tuple[Optional[dic
 def read_permit(now: datetime, path: Path = PERMIT_PATH) -> Optional[dict]:
     """Compatibility reader: status reporting never changes admission policy."""
     return permit_status(now, path)[0]
+
+
+def _read_permit_raw_safe(path: Path = PERMIT_PATH) -> Optional[dict]:
+    """Read-only safe reader for non-secret timing metadata on expired/not-started permits."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+                return None
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            return None
+        doc = json.loads(raw)
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError, TypeError, OverflowError):
+        return None
+
+
+def _build_permit_summary(local_now: datetime, meta_doc: Optional[dict], status_code: str) -> dict:
+    expires_at: Optional[str] = None
+    remaining_hours: Optional[float] = None
+    scope = SUPPORTED_SCOPE
+
+    if isinstance(meta_doc, dict):
+        if isinstance(meta_doc.get("scope"), str) and meta_doc["scope"] == SUPPORTED_SCOPE:
+            scope = meta_doc["scope"]
+        end_dt = parse_quote_time(meta_doc.get("expires_at"))
+        if end_dt is not None:
+            end_cn = end_dt.astimezone(CN_TZ)
+            expires_at = end_cn.isoformat()
+            delta_hours = (end_cn - local_now).total_seconds() / 3600.0
+            remaining_hours = round(max(0.0, delta_hours), 2)
+
+    expiry_warning = (
+        status_code == "paper_supply_expired"
+        or (remaining_hours is not None and remaining_hours < EXPIRY_WARNING_HOURS)
+    )
+    return {
+        "permit_status": status_code,
+        "expires_at": expires_at,
+        "remaining_hours": remaining_hours,
+        "expiry_warning": bool(expiry_warning),
+        "supported_scope": scope,
+    }
+
+
+def read_permit_summary(now: datetime, path: Path = PERMIT_PATH) -> dict:
+    """Read-only sanitized permit summary without paths, hashes, URLs, or secrets."""
+    local_now = now.astimezone(CN_TZ)
+    doc, status_code = permit_status(local_now, path)
+    meta_doc = doc
+    if meta_doc is None and status_code in ("paper_supply_expired", "paper_supply_not_started"):
+        meta_doc = _read_permit_raw_safe(path)
+    return _build_permit_summary(local_now, meta_doc, status_code)
+
+
+_SAFE_OBSERVABILITY_KEYS = (
+    "event",
+    "code",
+    "selected",
+    "available",
+    "reason",
+    "source",
+    "quote_time",
+    "fetched_at",
+    "trading_status",
+    "trading_status_raw",
+)
+
+
+def sanitize_observability_for_api(snapshot: Optional[dict]) -> dict:
+    """Strip hashes, paths, URLs, and sensitive keys before returning over HTTP."""
+    if not isinstance(snapshot, dict):
+        return {"counts": {}, "in_flight": 0, "window_requests": 0, "last_observation": None}
+    counts = snapshot.get("counts")
+    safe_counts = {str(k): int(v) for k, v in counts.items()} if isinstance(counts, dict) else {}
+    last_obs = snapshot.get("last_observation")
+    safe_last: Optional[dict] = None
+    if isinstance(last_obs, dict):
+        safe_last = {k: last_obs[k] for k in _SAFE_OBSERVABILITY_KEYS if k in last_obs}
+    return {
+        "counts": safe_counts,
+        "in_flight": int(snapshot.get("in_flight", 0) or 0),
+        "window_requests": int(snapshot.get("window_requests", 0) or 0),
+        "last_observation": safe_last,
+    }
+
+
+def build_supply_status_message(
+    *,
+    in_session: bool,
+    permit_state: str,
+    expires_at: Optional[str],
+    remaining_hours: Optional[float],
+    expiry_warning: bool,
+) -> str:
+    """User-facing Chinese status summary for the PaperTrading banner."""
+    scope_note = "支持沪深A股与ETF（暂不支持北交所 92/83/87/43）"
+    if permit_state == "ok":
+        if in_session:
+            if expiry_warning and remaining_hours is not None:
+                return f"盘中实时成交行情正常，许可剩余约 {remaining_hours:.1f} 小时即将到期，请及时人工续期；{scope_note}。"
+            expiry_label = expires_at[:16].replace("T", " ") if expires_at else "有效期内"
+            return f"盘中实时成交行情正常（许可有效期至 {expiry_label}）；{scope_note}。"
+        if expiry_warning and remaining_hours is not None:
+            return f"当前非连续竞价时段（09:30–11:30、13:00–15:00），许可剩余约 {remaining_hours:.1f} 小时即将到期；{scope_note}。"
+        return f"当前非连续竞价时段（09:30–11:30、13:00–15:00），盘中许可正常有效；{scope_note}。"
+    if permit_state == "paper_supply_expired":
+        return f"模拟交易盘中报价许可已过期，暂不可实时下单，请联系管理员人工续期；{scope_note}。"
+    if permit_state == "paper_supply_not_started":
+        return f"模拟交易盘中报价许可尚未到达生效时间；{scope_note}。"
+    if permit_state == "paper_supply_disabled":
+        return f"模拟交易盘中报价许可尚未启用，请联系管理员配置；{scope_note}。"
+    return f"模拟交易盘中报价许可配置异常，请联系管理员核查；{scope_note}。"
 
 
 def parse_sina_quote(raw: bytes, code: str, captured_at: datetime) -> dict:
@@ -184,17 +303,49 @@ async def public_trade_date() -> Optional[str]:
 
 
 class VerifiedTradeCalendar:
-    """At most one public calendar attempt per process/day; no weekday guess.
+    """Bounded public calendar verification with failure backoff; no weekday guess.
 
     A startup Redis value alone would become stale the following morning. This
     fallback avoids requiring a backend restart to trade on a subsequent day.
-    A failed lookup remains closed until next day or an operator supplies a
-    fresh verified Redis value. It never writes that cache itself.
+    Failed lookups stay closed and may retry only after a bounded cooldown
+    (default 300s) up to a strict daily attempt cap (default 3/day). It never
+    writes Redis cache itself and never guesses based on weekday.
     """
-    def __init__(self, cached=cached_trade_day, fetch=public_trade_date):
+    def __init__(
+        self,
+        cached=cached_trade_day,
+        fetch=public_trade_date,
+        *,
+        cooldown_seconds: float = CALENDAR_RETRY_COOLDOWN_SECONDS,
+        max_attempts_per_day: int = CALENDAR_MAX_ATTEMPTS_PER_DAY,
+        monotonic: Optional[Callable[[], float]] = None,
+    ):
         self.cached, self.fetch = cached, fetch
-        self.day = None
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self.max_attempts_per_day = max(1, int(max_attempts_per_day))
+        self._monotonic = monotonic
+        self.day: Optional[str] = None
         self.verified = False
+        self.attempts = 0
+        self.last_attempt_ts: Optional[float] = None
+
+    def _clock_tick(self, now: datetime) -> float:
+        if self._monotonic is not None:
+            return float(self._monotonic())
+        return float(now.timestamp())
+
+    async def peek_verified(self, now: datetime) -> Optional[bool]:
+        """Pure read-only calendar status check; zero external network calls."""
+        try:
+            cached = await asyncio.wait_for(self.cached(now), timeout=1)
+        except Exception:
+            cached = None
+        if cached is not None:
+            return cached is True
+        today = now.astimezone(CN_TZ).date().isoformat()
+        if self.day == today and self.attempts > 0:
+            return self.verified
+        return None
 
     async def __call__(self, now: datetime) -> bool:
         try:
@@ -205,11 +356,23 @@ class VerifiedTradeCalendar:
             return cached is True
         today = now.astimezone(CN_TZ).date().isoformat()
         if self.day != today:
-            self.day, self.verified = today, False
-            try:
-                self.verified = await asyncio.wait_for(self.fetch(), timeout=5) == today
-            except Exception:
-                self.verified = False
+            self.day = today
+            self.verified = False
+            self.attempts = 0
+            self.last_attempt_ts = None
+        if self.verified:
+            return True
+        if self.attempts >= self.max_attempts_per_day:
+            return False
+        tick = self._clock_tick(now)
+        if self.last_attempt_ts is not None and (tick - self.last_attempt_ts) < self.cooldown_seconds:
+            return False
+        self.attempts += 1
+        self.last_attempt_ts = tick
+        try:
+            self.verified = await asyncio.wait_for(self.fetch(), timeout=5) == today
+        except Exception:
+            self.verified = False
         return self.verified
 
 
@@ -263,7 +426,7 @@ def summarize_quote_observability(
 
 
 class PaperQuoteSupply:
-    def __init__(self, *, clock: Callable = cn_now, permit: Callable = read_permit,
+    def __init__(self, *, clock: Callable = cn_now, permit: Callable = permit_status,
                  calendar: Optional[Callable] = None, fetch: Callable = fetch_sina,
                  monotonic: Callable = time.monotonic):
         self.clock, self.permit, self.fetch = clock, permit, fetch
@@ -273,6 +436,15 @@ class PaperQuoteSupply:
         self.in_flight = 0
         self.stats: dict[str, int] = {}
         self.last_observation: Optional[dict] = None
+
+    def _resolve_permit(self, now: datetime) -> tuple[Optional[dict], str]:
+        result = self.permit(now)
+        if isinstance(result, tuple) and len(result) == 2:
+            doc, reason = result
+            return doc, str(reason or "paper_supply_disabled")
+        if result is None:
+            return None, "paper_supply_disabled"
+        return result, "ok"
 
     def _record(
         self, code: str, selected: bool, doc: Optional[dict], reason: str
@@ -291,12 +463,43 @@ class PaperQuoteSupply:
             ),
         }
 
+    async def status_summary(self, now: Optional[datetime] = None, path: Path = PERMIT_PATH) -> dict:
+        """Pure read-only status summary for HTTP/ops inspection; zero external calls."""
+        current = (now if now is not None else self.clock()).astimezone(CN_TZ)
+        in_session = in_continuous_session(current)
+        if path != PERMIT_PATH or self.permit is permit_status:
+            permit_meta = read_permit_summary(current, path)
+        else:
+            doc, status_code = self._resolve_permit(current)
+            permit_meta = _build_permit_summary(current, doc, status_code)
+        calendar_verified: Optional[bool] = None
+        if hasattr(self.calendar, "peek_verified"):
+            calendar_verified = await self.calendar.peek_verified(current)
+        message = build_supply_status_message(
+            in_session=in_session,
+            permit_state=permit_meta["permit_status"],
+            expires_at=permit_meta["expires_at"],
+            remaining_hours=permit_meta["remaining_hours"],
+            expiry_warning=permit_meta["expiry_warning"],
+        )
+        return {
+            "in_session": in_session,
+            "permit_status": permit_meta["permit_status"],
+            "expires_at": permit_meta["expires_at"],
+            "remaining_hours": permit_meta["remaining_hours"],
+            "expiry_warning": permit_meta["expiry_warning"],
+            "calendar_verified": calendar_verified,
+            "supported_scope": permit_meta["supported_scope"],
+            "message": message,
+            "observability": sanitize_observability_for_api(self.snapshot_observability()),
+        }
+
     async def get(self, code: str) -> tuple[bool, Optional[dict], str]:
         """(selected, quote, reason); selected failures forbid database fallback."""
         now = self.clock()
-        permission = self.permit(now)
+        permission, permit_reason = self._resolve_permit(now)
         if permission is None:
-            return self._record(code, False, None, "paper_supply_disabled")
+            return self._record(code, False, None, permit_reason)
         try:
             source_symbol(code)
             if not in_continuous_session(now):
@@ -313,7 +516,7 @@ class PaperQuoteSupply:
             admission_time = self.clock()
             if not in_continuous_session(admission_time):
                 return self._record(code, True, None, "outside_continuous_session")
-            if self.permit(admission_time) != permission:
+            if self._resolve_permit(admission_time)[0] != permission:
                 return self._record(code, True, None, "paper_supply_revoked")
             self.requests.append(tick)
             self.in_flight += 1
@@ -322,7 +525,7 @@ class PaperQuoteSupply:
             finally:
                 self.in_flight -= 1
             captured_at = self.clock()
-            if self.permit(captured_at) != permission:
+            if self._resolve_permit(captured_at)[0] != permission:
                 return self._record(code, True, None, "paper_supply_revoked")
             if not in_continuous_session(captured_at):
                 return self._record(code, True, None, "outside_continuous_session")
@@ -342,3 +545,7 @@ _supply = PaperQuoteSupply()
 
 async def get_paper_quote(code: str) -> tuple[bool, Optional[dict], str]:
     return await _supply.get(code)
+
+
+async def get_paper_supply_status(now: Optional[datetime] = None, path: Path = PERMIT_PATH) -> dict:
+    return await _supply.status_summary(now=now, path=path)

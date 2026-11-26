@@ -22,6 +22,11 @@ import uuid
 CN_TZ = timezone(timedelta(hours=8))
 BACKEND = "ta-live-088a60b962bf-backend-1"
 PERMIT = "paper-quote-supply.json"
+BACKUP_PARENT = Path("/home/ubuntu/quote-guard-releases")
+
+
+def now_cn() -> datetime:
+    return datetime.now(CN_TZ)
 
 
 def digest(raw: bytes) -> str:
@@ -43,17 +48,22 @@ def run(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
     return result
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--not-before", required=True,
                         help="Future CN time, for example 2026-11-09T09:30:00+08:00")
     parser.add_argument("--expires-at", required=True,
                         help="Absolute CN expiry, for example 2026-11-11T20:00:00+08:00")
     parser.add_argument("--previous-sha256", required=True)
+    parser.add_argument(
+        "--allow-expired-previous",
+        action="store_true",
+        help="explicitly allow replacing an already-expired v2 permit during manual recovery",
+    )
     parser.add_argument("--execute", action="store_true", help="perform the atomic replacement")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    now = datetime.now(CN_TZ)
+    now = now_cn()
     start = parse_time(args.not_before)
     end = parse_time(args.expires_at)
     if len(args.previous_sha256) != 64 or any(c not in "0123456789abcdef" for c in args.previous_sha256):
@@ -84,7 +94,8 @@ def main() -> int:
     if old_doc.get("version") != 2 or old_doc.get("enabled") is not True:
         raise SystemExit("previous_permit_not_v2_active")
     old_end = parse_time(old_doc["expires_at"])
-    if old_end <= now:
+    previous_expired = old_end <= now
+    if previous_expired and not args.allow_expired_previous:
         raise SystemExit("previous_permit_expired")
 
     candidate = json.dumps({
@@ -100,15 +111,18 @@ def main() -> int:
         "mount_count": len(inspect["Mounts"]), "previous_sha256": digest(old),
         "candidate_sha256": digest(candidate), "not_before": start.isoformat(),
         "expires_at": end.isoformat(), "old_expires_at": old_end.isoformat(),
+        "previous_expired": previous_expired,
+        "allow_expired_previous": bool(args.allow_expired_previous),
     }
     if not args.execute:
         result["status"] = "ready_no_replace"
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
-    backup_root = Path("/home/ubuntu/quote-guard-releases") / (
+    backup_root = BACKUP_PARENT / (
         "paper-quote-permit-schedule-" + time.strftime("%Y%m%d-%H%M%S"))
-    backup_root.mkdir(mode=0o700)
+    backup_root.mkdir(mode=0o700, parents=True)
+    os.chmod(backup_root, 0o700)
     backup = backup_root / PERMIT
     backup.write_bytes(old)
     backup.chmod(0o600)

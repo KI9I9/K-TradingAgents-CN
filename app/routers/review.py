@@ -11,7 +11,11 @@ from app.routers.auth_db import get_current_user
 from app.core.permissions import get_license_info
 from app.core.response import ok
 from app.services.license_service import LicenseInfo, get_license_service
-from app.services.trade_review_service import get_trade_review_service
+from app.services.quote_contract import CN_TZ, parse_quote_time
+from app.services.trade_review_service import (
+    build_timestamp_range_query,
+    get_trade_review_service,
+)
 from app.models.review import (
     CreateTradeReviewRequest, CreatePeriodicReviewRequest,
     SaveAsCaseRequest, ReviewType
@@ -48,8 +52,6 @@ async def create_trade_review(
 
     参考：app/routers/portfolio.py 的 analyze_position_by_code 实现
     """
-    import asyncio
-
     import asyncio
 
     try:
@@ -118,6 +120,8 @@ async def create_trade_review(
 
         return ok(data=result, message="交易复盘任务已提交，预计需要1-3分钟完成")
 
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -150,6 +154,10 @@ async def get_review_history(
             source=source
         )
         return ok(result)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"获取复盘历史失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -207,6 +215,8 @@ async def get_review_summary(
             stock_code=code
         )
         return ok(result or {"has": False})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取复盘摘要失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -258,6 +268,8 @@ async def get_cases(
             source=source
         )
         return ok(result)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取案例库失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -324,6 +336,10 @@ async def get_trading_statistics(
             end_date=end_date
         )
         return ok(stats.model_dump())
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"获取交易统计失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -360,6 +376,8 @@ async def create_periodic_review(
             "execution_time": result.execution_time,
             "created_at": result.created_at.isoformat() if result.created_at else None
         })
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -384,6 +402,8 @@ async def get_periodic_review_history(
             source=source
         )
         return ok(result)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取阶段性复盘历史失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -450,16 +470,9 @@ async def get_reviewable_trades(
         if code:
             query["code"] = code
 
-        # 时间段筛选
+        # 时间段筛选（同时兼容 ISO String 与 BSON datetime，统一 CN_TZ 边界）
         if start_date or end_date:
-            query["timestamp"] = {}
-            if start_date:
-                query["timestamp"]["$gte"] = datetime.strptime(start_date, "%Y-%m-%d")
-            if end_date:
-                # 结束日期包含当天，所以加一天
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-                end_dt = end_dt.replace(hour=23, minute=59, second=59)
-                query["timestamp"]["$lte"] = end_dt
+            query.update(build_timestamp_range_query("timestamp", start_date, end_date))
 
         skip = (page - 1) * page_size
 
@@ -494,59 +507,89 @@ async def get_reviewable_trades(
                     "market": t.get("market", "CN"),
                     "buy_count": 0,
                     "sell_count": 0,
+                    "buy_quantity": 0,
+                    "sell_quantity": 0,
                     "total_pnl": 0,
                     "total_buy_amount": 0,
                     "total_sell_amount": 0,
                     "last_trade_time": None
                 }
+            qty_val = int(t.get("quantity", 0) or 0)
             if t.get("side") == "buy":
                 code_stats[c]["buy_count"] += 1
+                code_stats[c]["buy_quantity"] += qty_val
                 code_stats[c]["total_buy_amount"] += t.get("amount", 0)
             else:
                 code_stats[c]["sell_count"] += 1
+                code_stats[c]["sell_quantity"] += qty_val
                 code_stats[c]["total_sell_amount"] += t.get("amount", 0)
                 code_stats[c]["total_pnl"] += t.get("pnl", 0)
 
-            # 更新最后交易时间
-            trade_time = t.get("timestamp")
-            if trade_time:
-                # 🔥 处理字符串类型的日期（MongoDB可能返回字符串）
-                if isinstance(trade_time, str):
-                    trade_time = datetime.fromisoformat(trade_time.replace('Z', '+00:00'))
-                
-                # 确保 last_trade_time 也是 datetime 类型
+            # 更新最后交易时间（统一转 CN_TZ 避免 naive/aware 混比 TypeError）
+            trade_dt = parse_quote_time(t.get("timestamp"))
+            if trade_dt is not None:
+                trade_dt_cn = trade_dt.astimezone(CN_TZ)
                 last_trade_time = code_stats[c]["last_trade_time"]
-                if last_trade_time and isinstance(last_trade_time, str):
-                    last_trade_time = datetime.fromisoformat(last_trade_time.replace('Z', '+00:00'))
-                
-                if not last_trade_time or trade_time > last_trade_time:
-                    code_stats[c]["last_trade_time"] = trade_time
+                last_dt = parse_quote_time(last_trade_time) if last_trade_time is not None else None
+                last_dt_cn = last_dt.astimezone(CN_TZ) if last_dt is not None else None
+                if last_dt_cn is None or trade_dt_cn > last_dt_cn:
+                    code_stats[c]["last_trade_time"] = trade_dt_cn
 
-        # 获取股票名称（优先从 stock_basic_info，其次从 paper_positions）
+        # 获取股票/ETF 名称及当前持仓数量（stock_basic_info -> etf_basic_info -> paper_positions）
+        positions_by_code: Dict[str, Optional[Dict[str, Any]]] = {}
         for c in code_stats.keys():
-            # 1. 先从 stock_basic_info 获取（最可靠）
+            raw_code = str(c or "").strip()
+            code6 = raw_code.zfill(6) if raw_code.isdigit() else raw_code
+            pos = await db["paper_positions"].find_one({"user_id": current_user["id"], "code": c})
+            positions_by_code[c] = pos
+
+            # 1. 先从 stock_basic_info 获取
             stock_info = await db["stock_basic_info"].find_one({"code": c})
+            if not stock_info and code6 != c:
+                stock_info = await db["stock_basic_info"].find_one({"code": code6})
             if stock_info and stock_info.get("name"):
                 code_stats[c]["name"] = stock_info.get("name", "")
             else:
-                # 2. 降级：从 paper_positions 获取
-                pos = await db["paper_positions"].find_one({"user_id": current_user["id"], "code": c})
-                if pos and pos.get("name"):
+                # 2. 回退查 etf_basic_info（覆盖 510300 / 588000 / 159865 等 ETF）
+                etf_info = await db["etf_basic_info"].find_one({"code": code6})
+                if not etf_info and code6 != c:
+                    etf_info = await db["etf_basic_info"].find_one({"code": c})
+                etf_name = (
+                    (etf_info.get("name") or etf_info.get("fund_name") or etf_info.get("etf_name"))
+                    if etf_info
+                    else ""
+                )
+                if etf_name:
+                    code_stats[c]["name"] = etf_name
+                elif pos and pos.get("name"):
+                    # 3. 降级：从 paper_positions 获取
                     code_stats[c]["name"] = pos.get("name", "")
 
-        # 找出已完成交易（有买有卖）的股票
-        completed_stocks = [
-            {"code": c, **stats}
-            for c, stats in code_stats.items()
-            if stats["buy_count"] > 0 and stats["sell_count"] > 0
-        ]
+            remaining_pos_qty = int(pos.get("quantity", 0) or 0) if pos else 0
+            net_qty = max(0, code_stats[c]["buy_quantity"] - code_stats[c]["sell_quantity"])
+            code_stats[c]["remaining_quantity"] = remaining_pos_qty if pos is not None else net_qty
 
-        # 所有有交易的股票（包括只买入还没卖出的）
-        # status判断：只有当卖出数量 >= 买入数量时，才算已完全平仓
-        all_stocks = [
-            {"code": c, "status": "completed" if stats["sell_count"] >= stats["buy_count"] and stats["sell_count"] > 0 else "holding", **stats}
-            for c, stats in code_stats.items()
-            if stats["buy_count"] > 0
+        # 所有有交易的股票（按净股数与当前持仓判定 completed / holding，而非按笔数）
+        all_stocks = []
+        for c, stats in code_stats.items():
+            if stats["buy_count"] <= 0:
+                continue
+            pos = positions_by_code.get(c)
+            pos_qty = int(pos.get("quantity", 0) or 0) if pos else 0
+            is_completed = (
+                stats["sell_quantity"] > 0
+                and stats["sell_quantity"] >= stats["buy_quantity"]
+                and pos_qty <= 0
+            )
+            all_stocks.append({
+                "code": c,
+                "status": "completed" if is_completed else "holding",
+                **stats,
+            })
+
+        # 找出已完全平仓（按净股数与当前持仓口径与 all_stocks 保持一致）的股票
+        completed_stocks = [
+            item for item in all_stocks if item["status"] == "completed"
         ]
 
         return ok({
@@ -558,6 +601,10 @@ async def get_reviewable_trades(
             "all_stocks": all_stocks  # 新增：所有有交易的股票
         })
 
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"获取可复盘交易失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -682,6 +729,8 @@ async def get_trades_by_code(
             }
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取股票交易记录失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

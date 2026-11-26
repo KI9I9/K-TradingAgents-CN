@@ -9,9 +9,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-sys.path.insert(0, ".")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.services import paper_quote_supply as supply
 from app.services.quote_contract import CN_TZ, quote_price_and_basis
+import test_paper_pricing
+test_paper_pricing.PAPER = REPO_ROOT / "app/routers/paper.py"
 from test_paper_pricing import load_paper_functions, quote_doc, bar_doc
 
 NOW = datetime(2026, 11, 2, 14, 0, tzinfo=CN_TZ)
@@ -392,6 +398,361 @@ class P2HardeningAndObservabilityTests(unittest.IsolatedAsyncioTestCase):
         for bse in ("920363", "830799", "870001", "430001"):
             with self.assertRaisesRegex(ValueError, "^symbol_unsupported$"):
                 supply.source_symbol(bse)
+
+
+class SchedulePermitRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _load_scheduler_module():
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[2]
+        spec = importlib.util.spec_from_file_location(
+            "schedule_paper_quote_permit_mod",
+            repo_root / "deploy" / "schedule_paper_quote_permit.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _setup_permit_env(self, root: Path, permit_doc: dict):
+        runtime_dir = root / "runtime"
+        runtime_dir.mkdir(mode=0o700)
+        backup_dir = root / "backups"
+        permit_path = runtime_dir / "paper-quote-supply.json"
+        raw = json.dumps(permit_doc, sort_keys=True, separators=(",", ":")).encode()
+        permit_path.write_bytes(raw)
+        permit_path.chmod(0o600)
+        return runtime_dir, backup_dir, permit_path, raw
+
+    def _fake_run(self, runtime_dir: Path, permit_path: Path):
+        inspect_payload = json.dumps([
+            {
+                "Id": "backend-test-id",
+                "Image": "img:test",
+                "State": {"Running": True, "Health": {"Status": "healthy"}},
+                "Mounts": [{"Destination": "/app/runtime", "Type": "bind", "RW": True, "Source": str(runtime_dir)}],
+            }
+        ])
+
+        def runner(args, *, check=True):
+            if args[:2] == ["docker", "inspect"]:
+                return types.SimpleNamespace(returncode=0, stdout=inspect_payload, stderr="")
+            if args[:2] == ["docker", "exec"]:
+                doc = json.loads(permit_path.read_bytes())
+                verify_out = json.dumps({
+                    "sha256": __import__("hashlib").sha256(permit_path.read_bytes()).hexdigest(),
+                    "status": "paper_supply_not_started",
+                    "not_before": doc["not_before"],
+                    "expires_at": doc["expires_at"],
+                })
+                return types.SimpleNamespace(returncode=0, stdout=verify_out, stderr="")
+            raise AssertionError(f"unexpected command: {args}")
+
+        return runner
+
+    def test_expired_previous_refused_without_explicit_flag(self):
+        mod = self._load_scheduler_module()
+        now = datetime(2026, 11, 22, 12, 0, tzinfo=CN_TZ)  # Sunday
+        expired_doc = {
+            "version": 2,
+            "enabled": True,
+            "source": "sina_l1",
+            "scope": "paper_execution_sh_sz",
+            "not_before": "2026-11-10T09:30:00+08:00",
+            "expires_at": "2026-11-16T20:00:00+08:00",
+            "renewal_of_sha256": "a" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir, backup_dir, permit_path, raw = self._setup_permit_env(Path(tmp), expired_doc)
+            argv = [
+                "--not-before", "2026-11-23T09:30:00+08:00",
+                "--expires-at", "2026-11-27T20:00:00+08:00",
+                "--previous-sha256", mod.digest(raw),
+                "--execute",
+            ]
+            with patch.object(mod, "now_cn", return_value=now), \
+                 patch.object(mod, "BACKUP_PARENT", backup_dir), \
+                 patch.object(mod, "run", side_effect=self._fake_run(runtime_dir, permit_path)):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main(argv)
+            self.assertEqual(str(ctx.exception), "previous_permit_expired")
+            self.assertEqual(permit_path.read_bytes(), raw)
+
+    def test_allow_expired_previous_recovers_atomically_and_preserves_guards(self):
+        mod = self._load_scheduler_module()
+        now = datetime(2026, 11, 22, 12, 0, tzinfo=CN_TZ)  # Sunday
+        expired_doc = {
+            "version": 2,
+            "enabled": True,
+            "source": "sina_l1",
+            "scope": "paper_execution_sh_sz",
+            "not_before": "2026-11-10T09:30:00+08:00",
+            "expires_at": "2026-11-16T20:00:00+08:00",
+            "renewal_of_sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir, backup_dir, permit_path, raw = self._setup_permit_env(Path(tmp), expired_doc)
+            # 1) Wrong sha256 still rejected even with --allow-expired-previous
+            with patch.object(mod, "now_cn", return_value=now), \
+                 patch.object(mod, "BACKUP_PARENT", backup_dir), \
+                 patch.object(mod, "run", side_effect=self._fake_run(runtime_dir, permit_path)):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main([
+                        "--not-before", "2026-11-23T09:30:00+08:00",
+                        "--expires-at", "2026-11-27T20:00:00+08:00",
+                        "--previous-sha256", "0" * 64,
+                        "--allow-expired-previous",
+                    ])
+                self.assertEqual(str(ctx.exception), "previous_permit_changed")
+
+                # 2) Window > 7d still rejected
+                with self.assertRaises(SystemExit) as ctx2:
+                    mod.main([
+                        "--not-before", "2026-11-23T09:30:00+08:00",
+                        "--expires-at", "2026-12-01T09:30:00+08:00",
+                        "--previous-sha256", mod.digest(raw),
+                        "--allow-expired-previous",
+                    ])
+                self.assertEqual(str(ctx2.exception), "permit_window_invalid")
+
+                # 3) Explicit manual recovery succeeds with backup and atomic replace
+                import io, contextlib
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = mod.main([
+                        "--not-before", "2026-11-23T09:30:00+08:00",
+                        "--expires-at", "2026-11-27T20:00:00+08:00",
+                        "--previous-sha256", mod.digest(raw),
+                        "--allow-expired-previous",
+                        "--execute",
+                    ])
+                self.assertEqual(rc, 0)
+                out = json.loads(buf.getvalue().strip())
+                self.assertTrue(out["ok"])
+                self.assertTrue(out["previous_expired"])
+                self.assertTrue(out["allow_expired_previous"])
+                new_doc = json.loads(permit_path.read_bytes())
+                self.assertEqual(new_doc["version"], 2)
+                self.assertEqual(new_doc["renewal_of_sha256"], mod.digest(raw))
+                self.assertEqual(new_doc["not_before"], "2026-11-23T09:30:00+08:00")
+                self.assertEqual(new_doc["expires_at"], "2026-11-27T20:00:00+08:00")
+                backup_root = Path(out["backup"])
+                self.assertEqual((backup_root / "paper-quote-supply.json").read_bytes(), raw)
+                self.assertTrue((backup_root / "completion.json").is_file())
+
+    def test_allow_expired_previous_still_rejects_v1_permit(self):
+        mod = self._load_scheduler_module()
+        now = datetime(2026, 11, 22, 12, 0, tzinfo=CN_TZ)
+        v1_doc = {
+            "version": 1,
+            "enabled": True,
+            "source": "sina_l1",
+            "scope": "paper_execution_sh_sz",
+            "not_before": "2026-11-10T09:30:00+08:00",
+            "expires_at": "2026-11-11T09:30:00+08:00",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir, backup_dir, permit_path, raw = self._setup_permit_env(Path(tmp), v1_doc)
+            with patch.object(mod, "now_cn", return_value=now), \
+                 patch.object(mod, "BACKUP_PARENT", backup_dir), \
+                 patch.object(mod, "run", side_effect=self._fake_run(runtime_dir, permit_path)):
+                with self.assertRaises(SystemExit) as ctx:
+                    mod.main([
+                        "--not-before", "2026-11-23T09:30:00+08:00",
+                        "--expires-at", "2026-11-27T20:00:00+08:00",
+                        "--previous-sha256", mod.digest(raw),
+                        "--allow-expired-previous",
+                    ])
+            self.assertEqual(str(ctx.exception), "previous_permit_not_v2_active")
+
+
+class CalendarRetryAndTradingCalendarTests(unittest.IsolatedAsyncioTestCase):
+    async def test_calendar_retries_after_300s_cooldown_and_caps_at_3_per_day(self):
+        # First call times out; within <300s no retry; at 300s retries and recovers
+        fetch = AsyncMock(side_effect=[TimeoutError("transient"), NOW.date().isoformat()])
+        calendar = supply.VerifiedTradeCalendar(AsyncMock(return_value=None), fetch)
+        self.assertFalse(await calendar(NOW))
+        self.assertEqual(fetch.await_count, 1)
+        self.assertFalse(await calendar(NOW + timedelta(seconds=299)))
+        self.assertEqual(fetch.await_count, 1)
+        self.assertTrue(await calendar(NOW + timedelta(seconds=300)))
+        self.assertEqual(fetch.await_count, 2)
+        # Once verified for today, no further fetches today
+        self.assertTrue(await calendar(NOW + timedelta(seconds=1000)))
+        self.assertEqual(fetch.await_count, 2)
+
+        # Persistent failure capped at 3 attempts/day, resets next CN day
+        always_fail = AsyncMock(side_effect=RuntimeError("down"))
+        cal2 = supply.VerifiedTradeCalendar(AsyncMock(return_value=None), always_fail)
+        for step in (0, 150, 300, 600, 900, 1500):
+            self.assertFalse(await cal2(NOW + timedelta(seconds=step)))
+        self.assertEqual(always_fail.await_count, 3)
+        # Next day resets quota
+        self.assertFalse(await cal2(NOW + timedelta(days=1)))
+        self.assertEqual(always_fail.await_count, 4)
+
+    async def test_trading_calendar_bypasses_tushare_when_restricted_and_uses_cn_tz(self):
+        from app.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService()
+        # Simulate UTC midnight crossing where CN_TZ is already 2026-11-26 01:00
+        cn_early = datetime(2026, 11, 26, 1, 0, tzinfo=CN_TZ)
+        with patch.dict("os.environ", {"TA_TUSHARE_ROUTE": "mainland_unix"}, clear=False), \
+             patch.object(TradingCalendarService, "_now_cn", return_value=cn_early), \
+             patch.object(svc, "_fetch_from_tushare", new=AsyncMock(return_value="2026-11-25")) as ts_mock, \
+             patch.object(svc, "_fetch_from_akshare", new=AsyncMock(return_value="2026-11-25")) as ak_mock:
+            self.assertTrue(svc._is_tushare_restricted())
+            self.assertEqual(svc._today_str(), "2026-11-26")
+            trade_date, source = await svc._fetch_last_trade_date()
+            ts_mock.assert_not_awaited()
+            ak_mock.assert_awaited_once()
+            self.assertEqual((trade_date, source), ("2026-11-25", "akshare"))
+
+    async def test_trading_calendar_akshare_enforces_explicit_timeout(self):
+        import time as _time
+        from app.services.trading_calendar_service import TradingCalendarService
+
+        svc = TradingCalendarService()
+        fake_ak = types.SimpleNamespace(tool_trade_date_hist_sina=lambda: _time.sleep(0.3))
+        fake_pd = types.SimpleNamespace()
+        with patch.dict(sys.modules, {"akshare": fake_ak, "pandas": fake_pd}):
+            result = await svc._fetch_from_akshare(timeout=0.05)
+        self.assertIsNone(result)
+
+
+class GranularPermitAndSupplyStatusApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_supply_get_records_exact_permit_failure_reasons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "permit.json"
+            service = supply.PaperQuoteSupply(
+                clock=lambda: NOW,
+                permit=lambda now: supply.permit_status(now, path),
+                calendar=AsyncMock(return_value=True),
+                fetch=AsyncMock(return_value=packet()),
+            )
+            # 1) Missing file -> paper_supply_disabled
+            self.assertEqual(await service.get("600000"), (False, None, "paper_supply_disabled"))
+
+            # 2) Expired permit -> paper_supply_expired
+            path.write_text(json.dumps(permission(expires_at=(NOW - timedelta(minutes=1)).isoformat())))
+            path.chmod(0o600)
+            self.assertEqual(await service.get("600000"), (False, None, "paper_supply_expired"))
+
+            # 3) Not started -> paper_supply_not_started
+            path.write_text(json.dumps(permission(
+                not_before=(NOW + timedelta(hours=1)).isoformat(),
+                expires_at=(NOW + timedelta(hours=5)).isoformat(),
+            )))
+            self.assertEqual(await service.get("600000"), (False, None, "paper_supply_not_started"))
+
+            # 4) Corrupt file -> paper_supply_invalid
+            path.write_bytes(b"{broken")
+            self.assertEqual(await service.get("600000"), (False, None, "paper_supply_invalid"))
+
+            obs = service.snapshot_observability()
+            self.assertEqual(obs["counts"], {
+                "paper_supply_disabled": 1,
+                "paper_supply_expired": 1,
+                "paper_supply_not_started": 1,
+                "paper_supply_invalid": 1,
+            })
+            self.assertEqual(obs["last_observation"]["reason"], "paper_supply_invalid")
+            service.fetch.assert_not_called()
+
+    async def test_supply_status_endpoint_contract_warning_and_redaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "permit.json"
+            # Active permit with 12h remaining (<36h -> expiry_warning=True)
+            doc = permission(
+                version=2,
+                renewal_of_sha256="f" * 64,
+                not_before=(NOW - timedelta(hours=2)).isoformat(),
+                expires_at=(NOW + timedelta(hours=12)).isoformat(),
+            )
+            path.write_text(json.dumps(doc))
+            path.chmod(0o600)
+
+            cal_fetch = AsyncMock(return_value=NOW.date().isoformat())
+            quote_fetch = AsyncMock(return_value=packet("600000"))
+            service = supply.PaperQuoteSupply(
+                clock=lambda: NOW,
+                permit=lambda now: supply.permit_status(now, path),
+                calendar=supply.VerifiedTradeCalendar(AsyncMock(return_value=True), cal_fetch),
+                fetch=quote_fetch,
+            )
+            # Populate last_observation containing payload_sha256 internally
+            self.assertEqual((await service.get("600000"))[2], "ok")
+            self.assertEqual(quote_fetch.await_count, 1)
+
+            # Call real get_supply_status from app/routers/paper.py
+            extra = {
+                "router": types.SimpleNamespace(get=lambda *a, **k: lambda fn: fn),
+                "Depends": lambda *a, **k: None,
+                "get_current_user": None,
+                "ok": lambda data=None, message="ok": {"success": True, "data": data, "message": message},
+            }
+            ns = load_paper_functions(("get_supply_status",), {}, NOW, extra)
+
+            async def _status(now=None, **_kw):
+                return await service.status_summary(now=now, path=path)
+
+            with patch.object(supply, "get_paper_supply_status", side_effect=_status):
+                envelope = await ns["get_supply_status"]({"id": "user-1"})
+
+            # Zero additional network calls from status endpoint
+            self.assertEqual(quote_fetch.await_count, 1)
+            cal_fetch.assert_not_called()
+
+            # Verify locked envelope schema
+            self.assertTrue(envelope["success"])
+            self.assertIsInstance(envelope["message"], str)
+            data = envelope["data"]
+            expected_keys = {
+                "in_session", "permit_status", "expires_at", "remaining_hours",
+                "expiry_warning", "calendar_verified", "supported_scope",
+                "message", "observability",
+            }
+            self.assertEqual(set(data.keys()), expected_keys)
+            self.assertTrue(data["in_session"])
+            self.assertEqual(data["permit_status"], "ok")
+            self.assertEqual(data["remaining_hours"], 12.0)
+            self.assertTrue(data["expiry_warning"])
+            self.assertTrue(data["calendar_verified"])
+            self.assertEqual(data["supported_scope"], "paper_execution_sh_sz")
+            self.assertIn("92/83/87/43", data["message"])
+
+            # Verify zero leakage of paths, hashes, URLs, or secrets
+            serialized = json.dumps(envelope, ensure_ascii=False)
+            self.assertNotIn("payload_sha256", serialized)
+            self.assertNotIn("f" * 64, serialized)
+            self.assertNotIn(str(path), serialized)
+            self.assertNotIn("hq.sinajs.cn", serialized)
+
+            # >36h remaining -> expiry_warning=False
+            doc_long = permission(
+                version=2,
+                renewal_of_sha256="e" * 64,
+                not_before=(NOW - timedelta(hours=1)).isoformat(),
+                expires_at=(NOW + timedelta(hours=48)).isoformat(),
+            )
+            path.write_text(json.dumps(doc_long))
+            summary_long = await service.status_summary(now=NOW, path=path)
+            self.assertEqual(summary_long["remaining_hours"], 48.0)
+            self.assertFalse(summary_long["expiry_warning"])
+
+            # Expired -> remaining_hours=0.0, expiry_warning=True
+            doc_exp = permission(
+                version=2,
+                renewal_of_sha256="d" * 64,
+                not_before=(NOW - timedelta(hours=48)).isoformat(),
+                expires_at=(NOW - timedelta(hours=1)).isoformat(),
+            )
+            path.write_text(json.dumps(doc_exp))
+            summary_exp = await service.status_summary(now=NOW, path=path)
+            self.assertEqual(summary_exp["permit_status"], "paper_supply_expired")
+            self.assertEqual(summary_exp["remaining_hours"], 0.0)
+            self.assertTrue(summary_exp["expiry_warning"])
 
 
 if __name__ == "__main__":
