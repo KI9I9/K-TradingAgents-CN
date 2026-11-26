@@ -27,7 +27,11 @@ export interface PaperAccountSummary {
 
 export interface PaperPositionItem {
   code: string
+  name?: string
+  market?: string
+  currency?: string
   quantity: number
+  available_qty?: number
   avg_cost: number
   last_price?: number | null
   market_value?: number | null
@@ -39,13 +43,29 @@ export interface PaperPositionItem {
 export interface PaperOrderItem {
   user_id?: string
   code: string
+  name?: string
+  market?: string
   side: 'buy' | 'sell'
   quantity: number
   price: number
   amount: number
+  commission?: number
   status: 'filled' | 'rejected' | string
+  analysis_id?: string
   created_at: string
   filled_at?: string
+}
+
+export interface PaperSupplyStatus {
+  in_session: boolean
+  permit_status: string
+  expires_at: string | null
+  remaining_hours: number | null
+  expiry_warning: boolean
+  calendar_verified: boolean | null
+  supported_scope: string
+  message: string
+  observability?: Record<string, any> | null
 }
 
 export interface GetAccountResponse {
@@ -86,7 +106,7 @@ export const paperApi = {
     return ApiClient.get<GetAccountResponse>('/api/paper/account')
   },
   async placeOrder(data: PlaceOrderPayload) {
-    return ApiClient.post<{ order: PaperOrderItem }>('/api/paper/order', data, { showLoading: true })
+    return ApiClient.post<{ order: PaperOrderItem; pricing_notice?: string }>('/api/paper/order', data, { showLoading: true })
   },
   async getPositions() {
     return ApiClient.get<{ items: PaperPositionItem[] }>('/api/paper/positions')
@@ -118,5 +138,12 @@ export const paperApi = {
   },
   async getQuote(code: string, market?: string) {
     return ApiClient.get<QuoteInfo>(`/api/paper/quote/${code}`, { market })
+  },
+  async getPaperSupplyStatus() {
+    return ApiClient.get<PaperSupplyStatus>('/api/paper/supply/status', undefined, { skipErrorHandler: true })
   }
+}
+
+export async function getPaperSupplyStatus() {
+  return paperApi.getPaperSupplyStatus()
 }

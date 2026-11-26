@@ -85,7 +85,7 @@
               </template>
 
               <!-- 按市场分组展示 -->
-              <div v-if="paperSelectedMarket === 'all'" class="market-groups">
+              <div v-if="selectedMarket === 'all'" class="market-groups">
                 <template v-for="market in ['CN']" :key="market">
                   <div v-if="getPositionsByMarket(realPositions, market).length > 0" class="market-group">
                     <div class="market-group-header">

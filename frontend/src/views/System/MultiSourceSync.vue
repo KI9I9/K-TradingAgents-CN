@@ -49,12 +49,15 @@
         <el-col :lg="12" :md="24" :sm="24">
           <!-- 同步控制 -->
           <div class="content-section">
-            <SyncControl @sync-completed="handleSyncCompleted" />
+            <SyncControl
+              @sync-completed="handleSyncCompleted"
+              @test-sources="runFullTest"
+            />
           </div>
           
           <!-- 同步历史 -->
           <div class="content-section">
-            <SyncHistory />
+            <SyncHistory ref="syncHistoryRef" />
           </div>
         </el-col>
       </el-row>
@@ -141,7 +144,8 @@ import { isJdyunMode } from '@/utils/config'
 const testing = ref(false)
 const testDialogVisible = ref(false)
 const testResults = ref<DataSourceTestResult[] | null>(null)
-const dataSourceStatusRef = ref()
+const dataSourceStatusRef = ref<any>(null)
+const syncHistoryRef = ref<any>(null)
 
 // 京东云版只展示 Tushare 和 AKShare
 const JDYUN_ALLOWED_SOURCES = new Set(['tushare', 'akshare'])
@@ -211,12 +215,23 @@ const exportTestResults = () => {
   ElMessage.success('测试结果已导出')
 }
 
-// 处理同步完成事件
-const handleSyncCompleted = (status: string) => {
+// 处理同步完成事件，联动刷新同步历史与数据源状态
+const handleSyncCompleted = async (status: string) => {
   console.log('🎉 收到同步完成事件，状态:', status)
-  // 这里可以触发历史记录刷新
-  // 由于我们使用了组件引用，可以直接调用子组件的刷新方法
-  // 或者发射一个全局事件让历史组件监听
+  const tasks: Promise<any>[] = []
+  if (syncHistoryRef.value && typeof syncHistoryRef.value.fetchHistory === 'function') {
+    tasks.push(syncHistoryRef.value.fetchHistory(1))
+  } else if (syncHistoryRef.value && typeof syncHistoryRef.value.refreshHistory === 'function') {
+    tasks.push(syncHistoryRef.value.refreshHistory())
+  }
+  if (dataSourceStatusRef.value && typeof dataSourceStatusRef.value.fetchDataSourcesStatus === 'function') {
+    tasks.push(dataSourceStatusRef.value.fetchDataSourcesStatus())
+  } else if (dataSourceStatusRef.value && typeof dataSourceStatusRef.value.refreshStatus === 'function') {
+    tasks.push(dataSourceStatusRef.value.refreshStatus())
+  }
+  if (tasks.length > 0) {
+    await Promise.allSettled(tasks)
+  }
 }
 
 // 🔥 处理任务触发事件，刷新数据源状态
